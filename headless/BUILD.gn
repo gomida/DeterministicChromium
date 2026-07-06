@@ -401,6 +401,7 @@ source_set("headless_browser") {
     "//services/device/public/cpp/geolocation",
     "//services/service_manager/public/cpp",
     "//third_party/inspector_protocol:crdtp",
+    "//third_party/libyuv",
     "//third_party/re2",
     "//ui/base",
     "//ui/compositor",
