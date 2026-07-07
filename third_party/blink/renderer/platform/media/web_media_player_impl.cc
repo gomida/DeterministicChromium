@@ -934,6 +934,12 @@ void WebMediaPlayerImpl::DoLoad(LoadType load_type,
 
   // Note: `url` may be very large, take care when making copies.
   demuxer_manager_->SetLoadedUrl(GURL(url));
+  PostCrossThreadTask(
+      *vfc_task_runner_, FROM_HERE,
+      CrossThreadBindOnce(
+          &VideoFrameCompositor::SetDeterministicVideoSourceUrl,
+          CrossThreadUnretained(compositor_.get()), GURL(url).spec(),
+          client_->IsLooping()));
   load_type_ = load_type;
 
   ReportMetrics(load_type, url, media_log_.get());

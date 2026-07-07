@@ -5,6 +5,7 @@
 #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_MEDIA_VIDEO_FRAME_COMPOSITOR_H_
 #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_MEDIA_VIDEO_FRAME_COMPOSITOR_H_
 
+#include <string>
 #include <utility>
 
 #include "base/functional/callback.h"
@@ -125,6 +126,11 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
   void PaintSingleFrame(scoped_refptr<media::VideoFrame> frame,
                         bool repaint_duplicate_frame = false) override;
 
+  // Experimental headless-only deterministic video hook. The DOM <video>
+  // element remains intact; only compositor-supplied VideoFrame pixels may be
+  // replaced when explicit beginFrame timing is available.
+  void SetDeterministicVideoSourceUrl(std::string source_url, bool is_looping);
+
   // If |client_| is not set, |callback_| is set, and |is_background_rendering_|
   // is true, it requests a new frame from |callback_|. Uses the elapsed time
   // between calls to this function as the render interval, defaulting to 16.6ms
@@ -230,6 +236,9 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
   // Can only be called from the compositor thread.
   base::TimeDelta GetLastIntervalWithoutLock();
 
+  scoped_refptr<media::VideoFrame> GetDeterministicVideoFrameIfNeeded(
+      scoped_refptr<media::VideoFrame> frame);
+
   // This will run tasks on the compositor thread. If
   // kEnableSurfaceLayerForVideo is enabled, it will instead run tasks on the
   // media thread.
@@ -267,6 +276,11 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
   // not used when reading |current_frame_| on the compositor thread.
   base::Lock current_frame_lock_;
   scoped_refptr<media::VideoFrame> current_frame_;
+
+  std::string deterministic_video_source_url_;
+  bool deterministic_video_is_looping_ = false;
+  base::TimeTicks deterministic_video_last_begin_frame_time_;
+  base::TimeTicks deterministic_video_epoch_;
 
   // Used to fulfill video.requestVideoFrameCallback() calls.
   // See https://wicg.github.io/video-rvfc/.

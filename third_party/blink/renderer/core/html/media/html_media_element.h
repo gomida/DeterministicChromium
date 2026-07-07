@@ -597,6 +597,7 @@ class CORE_EXPORT HTMLMediaElement
                     size_t bytes_to_first_frame) override {}
 
   int GetElementId() override { return GetDomNodeId(); }
+  bool IsLooping() const override { return Loop(); }
 
   void SetCcLayer(cc::Layer*) override;
 

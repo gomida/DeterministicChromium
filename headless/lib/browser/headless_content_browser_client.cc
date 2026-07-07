@@ -302,6 +302,10 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
 
     // Please keep this in alphabetical order.
     static const char* const kForwardSwitches[] = {
+        // The renderer owns VideoFrameCompositor, where deterministic native
+        // video substitution happens for headless capture.
+        "deterministic-video-ffmpeg",
+        "deterministic-video-fps",
         embedder_support::kOriginTrialDisabledFeatures,
         embedder_support::kOriginTrialPublicKey,
         switches::kAllowVideoCodecs,

@@ -8,6 +8,7 @@
 #include <optional>
 #include <utility>
 
+#include "base/command_line.h"
 #include "base/feature_list.h"
 #include "base/functional/bind.h"
 #include "base/memory/weak_ptr.h"
@@ -55,6 +56,14 @@ BASE_FEATURE(kUseVideoFrameSinkBundle, base::FEATURE_ENABLED_BY_DEFAULT);
 // trigger a clean of recycled video frames.
 BASE_FEATURE(kClearVideoFrameResourcesInBackground,
              base::FEATURE_ENABLED_BY_DEFAULT);
+
+constexpr char kDeterministicVideoFfmpegSwitch[] =
+    "deterministic-video-ffmpeg";
+
+bool IsDeterministicVideoEnabled() {
+  return base::CommandLine::ForCurrentProcess()->HasSwitch(
+      kDeterministicVideoFfmpegSwitch);
+}
 
 // Builds a cc::FrameInfo representing a video frame, which is considered
 // Compositor-only.
@@ -811,7 +820,10 @@ bool VideoFrameSubmitter::SubmitFrame(
 
   // We can't delay frame size changes even if we have a pending compositor ACK
   // because a relayout signal is already in flight on the main thread.
-  if (waiting_for_compositor_ack_ > 0 && !frame_size_changed) {
+  // Deterministic headless capture may request a video commit immediately
+  // before readback; waiting for the previous ack leaves the old child surface.
+  if (waiting_for_compositor_ack_ > 0 && !frame_size_changed &&
+      !IsDeterministicVideoEnabled()) {
     return false;
   }
 
