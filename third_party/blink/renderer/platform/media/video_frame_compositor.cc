@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,7 +20,7 @@
 #include "base/files/file.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
-#include "base/files/scoped_temp_dir.h"
+#include "base/hash/sha1.h"
 #include "base/logging.h"
 #include "base/no_destructor.h"
 #include "base/process/launch.h"
@@ -28,6 +29,7 @@
 #include "base/synchronization/waitable_event.h"
 #include "base/task/bind_post_task.h"
 #include "base/task/single_thread_task_runner.h"
+#include "base/threading/platform_thread.h"
 #include "base/time/default_tick_clock.h"
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
@@ -105,6 +107,63 @@ std::string DeterministicVideoCacheKey(const std::string& source_url,
                             size.height(), fps);
 }
 
+int64_t DeterministicVideoFrameBytes(const gfx::Size& size) {
+  return static_cast<int64_t>(size.width()) * size.height() * 3 / 2;
+}
+
+base::FilePath DeterministicVideoSharedCacheRoot() {
+  base::FilePath temp_dir;
+  if (!base::GetTempDir(&temp_dir)) {
+    DeterministicVideoFatal("failed to resolve temp dir for shared cache");
+  }
+  base::FilePath cache_root =
+      temp_dir.AppendASCII("deterministic-video-cache");
+  if (!base::CreateDirectory(cache_root)) {
+    DeterministicVideoFatal("failed to create shared cache dir: " +
+                            cache_root.AsUTF8Unsafe());
+  }
+  return cache_root;
+}
+
+base::FilePath DeterministicVideoSharedRawPath(const std::string& key,
+                                               const gfx::Size& size,
+                                               int fps) {
+  std::string digest = base::HexEncode(base::SHA1HashString(key));
+  return DeterministicVideoSharedCacheRoot().AppendASCII(base::StringPrintf(
+      "video_%s_%dx%d_%dfps.nv12", digest.c_str(), size.width(), size.height(),
+      fps));
+}
+
+DeterministicVideoCacheEntry MakeDeterministicVideoCacheEntry(
+    const base::FilePath& raw_path,
+    const gfx::Size& size,
+    int fps) {
+  std::optional<int64_t> raw_size = base::GetFileSize(raw_path);
+  if (!raw_size || *raw_size <= 0) {
+    DeterministicVideoFatal("ffmpeg produced empty raw output: " +
+                            raw_path.AsUTF8Unsafe());
+  }
+
+  const int64_t frame_bytes = DeterministicVideoFrameBytes(size);
+  if (*raw_size % frame_bytes != 0) {
+    DeterministicVideoFatal(base::StringPrintf(
+        "raw NV12 size is not frame-aligned: path=%s size=%" PRId64
+        " frame_bytes=%" PRId64,
+        raw_path.AsUTF8Unsafe().c_str(), *raw_size, frame_bytes));
+  }
+
+  DeterministicVideoCacheEntry entry;
+  entry.raw_path = raw_path;
+  entry.size = size;
+  entry.fps = fps;
+  entry.frame_bytes = frame_bytes;
+  entry.frame_count = *raw_size / frame_bytes;
+  if (entry.frame_count <= 0) {
+    DeterministicVideoFatal("decoded video contains no deterministic frames");
+  }
+  return entry;
+}
+
 class DeterministicVideoCache {
  public:
   DeterministicVideoCacheEntry GetOrCreate(const std::string& source_url,
@@ -123,12 +182,6 @@ class DeterministicVideoCache {
                               size.ToString());
     }
 
-    if (!temp_dir_.IsValid() &&
-        !temp_dir_.CreateUniqueTempDir(
-            FILE_PATH_LITERAL("deterministic-video"))) {
-      DeterministicVideoFatal("failed to create deterministic video temp dir");
-    }
-
     GURL url(source_url);
     base::FilePath input_path;
     if (!net::FileURLToFilePath(url, &input_path)) {
@@ -140,9 +193,44 @@ class DeterministicVideoCache {
                               input_path.AsUTF8Unsafe());
     }
 
-    base::FilePath raw_path = temp_dir_.GetPath().AppendASCII(
-        base::StringPrintf("video_%d_%dx%d_%dfps.nv12", next_cache_id_++,
-                           size.width(), size.height(), fps));
+    base::FilePath raw_path = DeterministicVideoSharedRawPath(key, size, fps);
+    base::FilePath ready_path = raw_path.AddExtensionASCII("ready");
+    base::FilePath lock_path = raw_path.AddExtensionASCII("lock");
+    base::FilePath tmp_path = raw_path.AddExtensionASCII("tmp");
+
+    if (base::PathExists(ready_path)) {
+      DeterministicVideoCacheEntry entry =
+          MakeDeterministicVideoCacheEntry(raw_path, size, fps);
+      entries_.emplace(key, entry);
+      return entry;
+    }
+
+    base::File lock_file(lock_path,
+                         base::File::FLAG_CREATE | base::File::FLAG_WRITE);
+    if (!lock_file.IsValid()) {
+      if (lock_file.error_details() != base::File::FILE_ERROR_EXISTS) {
+        DeterministicVideoFatal("failed to create deterministic cache lock: " +
+                                lock_path.AsUTF8Unsafe());
+      }
+      // Parallel chunk renderers must share one browser-owned decode artifact.
+      // Wait for the lock owner instead of creating another per-process cache.
+      base::TimeTicks deadline = base::TimeTicks::Now() + base::Minutes(10);
+      while (base::TimeTicks::Now() < deadline) {
+        if (base::PathExists(ready_path)) {
+          DeterministicVideoCacheEntry entry =
+              MakeDeterministicVideoCacheEntry(raw_path, size, fps);
+          entries_.emplace(key, entry);
+          return entry;
+        }
+        base::PlatformThread::Sleep(base::Milliseconds(100));
+      }
+      DeterministicVideoFatal("timed out waiting for deterministic cache: " +
+                              raw_path.AsUTF8Unsafe());
+    }
+
+    base::DeleteFile(tmp_path);
+    base::DeleteFile(raw_path);
+    base::DeleteFile(ready_path);
 
     base::CommandLine ffmpeg(DeterministicVideoFfmpegPath());
     ffmpeg.AppendArg("-v");
@@ -155,7 +243,7 @@ class DeterministicVideoCache {
                                         size.width(), size.height()));
     ffmpeg.AppendArg("-f");
     ffmpeg.AppendArg("rawvideo");
-    ffmpeg.AppendArgPath(raw_path);
+    ffmpeg.AppendArgPath(tmp_path);
 
     std::string output;
     if (!base::GetAppOutputAndError(ffmpeg, &output)) {
@@ -163,38 +251,26 @@ class DeterministicVideoCache {
                               input_path.AsUTF8Unsafe() + ": " + output);
     }
 
-    std::optional<int64_t> raw_size = base::GetFileSize(raw_path);
-    if (!raw_size || *raw_size <= 0) {
-      DeterministicVideoFatal("ffmpeg produced empty raw output: " +
+    DeterministicVideoCacheEntry entry =
+        MakeDeterministicVideoCacheEntry(tmp_path, size, fps);
+    if (!base::Move(tmp_path, raw_path)) {
+      DeterministicVideoFatal("failed to publish deterministic raw cache: " +
                               raw_path.AsUTF8Unsafe());
     }
-
-    const int64_t frame_bytes =
-        static_cast<int64_t>(size.width()) * size.height() * 3 / 2;
-    if (*raw_size % frame_bytes != 0) {
-      DeterministicVideoFatal(base::StringPrintf(
-          "raw NV12 size is not frame-aligned: path=%s size=%" PRId64
-          " frame_bytes=%" PRId64,
-          raw_path.AsUTF8Unsafe().c_str(), *raw_size, frame_bytes));
-    }
-
-    DeterministicVideoCacheEntry entry;
     entry.raw_path = raw_path;
-    entry.size = size;
-    entry.fps = fps;
-    entry.frame_bytes = frame_bytes;
-    entry.frame_count = *raw_size / frame_bytes;
-    if (entry.frame_count <= 0) {
-      DeterministicVideoFatal("decoded video contains no deterministic frames");
+    if (!base::WriteFile(ready_path, "ready")) {
+      DeterministicVideoFatal("failed to publish deterministic cache marker: " +
+                              ready_path.AsUTF8Unsafe());
     }
+    lock_file.Close();
+    base::DeleteFile(lock_path);
+
     entries_.emplace(key, entry);
     return entry;
   }
 
  private:
   base::Lock lock_;
-  base::ScopedTempDir temp_dir_;
-  int next_cache_id_ = 0;
   std::map<std::string, DeterministicVideoCacheEntry> entries_
       ALLOW_DISCOURAGED_TYPE("Experimental deterministic-video cache");
 };
