@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -14,13 +15,14 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include "base/check.h"
 #include "base/command_line.h"
 #include "base/containers/span.h"
 #include "base/files/file.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
-#include "base/hash/sha1.h"
 #include "base/logging.h"
 #include "base/no_destructor.h"
 #include "base/process/launch.h"
@@ -37,6 +39,7 @@
 #include "media/base/media_switches.h"
 #include "media/base/timestamp_constants.h"
 #include "media/base/video_frame.h"
+#include "media/ffmpeg/ffmpeg_common.h"
 #include "net/base/filename_util.h"
 #include "third_party/blink/renderer/platform/allow_discouraged_type.h"
 #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
@@ -56,6 +59,9 @@ const int kForceBeginFramesTimeoutMs = 1000;
 constexpr char kDeterministicVideoFfmpegSwitch[] =
     "deterministic-video-ffmpeg";
 constexpr char kDeterministicVideoFpsSwitch[] = "deterministic-video-fps";
+constexpr double kDeterministicVideoQueueAheadSeconds = 0.5;
+constexpr double kDeterministicVideoQueueBehindSeconds = 0.25;
+constexpr double kDeterministicVideoSequentialGapSeconds = 1.0;
 
 [[noreturn]] void DeterministicVideoFatal(const std::string& message) {
   LOG(FATAL) << "Deterministic video substitution failed: " << message;
@@ -92,12 +98,26 @@ base::FilePath DeterministicVideoFfmpegPath() {
   return ffmpeg;
 }
 
-struct DeterministicVideoCacheEntry {
-  base::FilePath raw_path;
-  gfx::Size size;
-  int fps = 0;
-  int64_t frame_count = 0;
-  int64_t frame_bytes = 0;
+struct AVFormatContextDeleter {
+  void operator()(AVFormatContext* context) const {
+    if (context) {
+      avformat_close_input(&context);
+    }
+  }
+};
+
+struct AVIOContextDeleter {
+  void operator()(AVIOContext* context) const {
+    if (context) {
+      av_free(context->buffer);
+      av_free(context);
+    }
+  }
+};
+
+struct DeterministicQueuedFrame {
+  int64_t output_index = 0;
+  scoped_refptr<media::VideoFrame> frame;
 };
 
 std::string DeterministicVideoCacheKey(const std::string& source_url,
@@ -107,236 +127,487 @@ std::string DeterministicVideoCacheKey(const std::string& source_url,
                             size.height(), fps);
 }
 
-int64_t DeterministicVideoFrameBytes(const gfx::Size& size) {
-  return static_cast<int64_t>(size.width()) * size.height() * 3 / 2;
-}
-
-base::FilePath DeterministicVideoSharedCacheRoot() {
-  base::FilePath temp_dir;
-  if (!base::GetTempDir(&temp_dir)) {
-    DeterministicVideoFatal("failed to resolve temp dir for shared cache");
-  }
-  base::FilePath cache_root =
-      temp_dir.AppendASCII("deterministic-video-cache");
-  if (!base::CreateDirectory(cache_root)) {
-    DeterministicVideoFatal("failed to create shared cache dir: " +
-                            cache_root.AsUTF8Unsafe());
-  }
-  return cache_root;
-}
-
-base::FilePath DeterministicVideoSharedRawPath(const std::string& key,
-                                               const gfx::Size& size,
-                                               int fps) {
-  std::string digest = base::HexEncode(base::SHA1HashString(key));
-  return DeterministicVideoSharedCacheRoot().AppendASCII(base::StringPrintf(
-      "video_%s_%dx%d_%dfps.nv12", digest.c_str(), size.width(), size.height(),
-      fps));
-}
-
-DeterministicVideoCacheEntry MakeDeterministicVideoCacheEntry(
-    const base::FilePath& raw_path,
-    const gfx::Size& size,
-    int fps) {
-  std::optional<int64_t> raw_size = base::GetFileSize(raw_path);
-  if (!raw_size || *raw_size <= 0) {
-    DeterministicVideoFatal("ffmpeg produced empty raw output: " +
-                            raw_path.AsUTF8Unsafe());
-  }
-
-  const int64_t frame_bytes = DeterministicVideoFrameBytes(size);
-  if (*raw_size % frame_bytes != 0) {
+base::TimeDelta DeterministicVideoFrameTime(int64_t frame_index, int fps) {
+  if (frame_index < 0) {
     DeterministicVideoFatal(base::StringPrintf(
-        "raw NV12 size is not frame-aligned: path=%s size=%" PRId64
-        " frame_bytes=%" PRId64,
-        raw_path.AsUTF8Unsafe().c_str(), *raw_size, frame_bytes));
+        "negative deterministic frame index: %" PRId64, frame_index));
   }
-
-  DeterministicVideoCacheEntry entry;
-  entry.raw_path = raw_path;
-  entry.size = size;
-  entry.fps = fps;
-  entry.frame_bytes = frame_bytes;
-  entry.frame_count = *raw_size / frame_bytes;
-  if (entry.frame_count <= 0) {
-    DeterministicVideoFatal("decoded video contains no deterministic frames");
-  }
-  return entry;
+  return base::Microseconds(frame_index * base::Time::kMicrosecondsPerSecond /
+                            fps);
 }
 
-class DeterministicVideoCache {
+int64_t DeterministicVideoFrameIndex(base::TimeDelta media_time, int fps) {
+  if (media_time < base::TimeDelta()) {
+    DeterministicVideoFatal(base::StringPrintf(
+        "negative deterministic media time: us=%" PRId64,
+        media_time.InMicroseconds()));
+  }
+  return media_time.InMicroseconds() * static_cast<int64_t>(fps) /
+         base::Time::kMicrosecondsPerSecond;
+}
+
+int64_t DeterministicVideoQueueFrames(double seconds, int fps) {
+  return static_cast<int64_t>(std::ceil(seconds * fps));
+}
+
+class DeterministicVideoFileAvio {
  public:
-  DeterministicVideoCacheEntry GetOrCreate(const std::string& source_url,
-                                           const gfx::Size& size,
-                                           int fps) {
-    const std::string key = DeterministicVideoCacheKey(source_url, size, fps);
-    base::AutoLock lock(lock_);
-    auto existing = entries_.find(key);
-    if (existing != entries_.end()) {
-      return existing->second;
-    }
-
-    if (size.IsEmpty() || size.width() % 2 != 0 || size.height() % 2 != 0) {
-      DeterministicVideoFatal("NV12 substitution requires non-empty even video "
-                              "dimensions: " +
-                              size.ToString());
-    }
-
-    GURL url(source_url);
-    base::FilePath input_path;
-    if (!net::FileURLToFilePath(url, &input_path)) {
-      DeterministicVideoFatal("only file:// video URLs are supported: " +
-                              source_url);
-    }
-    if (!base::PathExists(input_path)) {
-      DeterministicVideoFatal("video source does not exist: " +
+  explicit DeterministicVideoFileAvio(const base::FilePath& input_path)
+      : input_file_(input_path,
+                    base::File::FLAG_OPEN | base::File::FLAG_READ) {
+    if (!input_file_.IsValid()) {
+      DeterministicVideoFatal("failed to open deterministic video file: " +
                               input_path.AsUTF8Unsafe());
     }
 
-    base::FilePath raw_path = DeterministicVideoSharedRawPath(key, size, fps);
-    base::FilePath ready_path = raw_path.AddExtensionASCII("ready");
-    base::FilePath lock_path = raw_path.AddExtensionASCII("lock");
-    base::FilePath tmp_path = raw_path.AddExtensionASCII("tmp");
-
-    if (base::PathExists(ready_path)) {
-      DeterministicVideoCacheEntry entry =
-          MakeDeterministicVideoCacheEntry(raw_path, size, fps);
-      entries_.emplace(key, entry);
-      return entry;
+    constexpr int kAvioBufferSize = 64 * 1024;
+    auto* buffer = static_cast<unsigned char*>(av_malloc(kAvioBufferSize));
+    if (!buffer) {
+      DeterministicVideoFatal("failed to allocate deterministic AVIO buffer");
     }
 
-    base::File lock_file(lock_path,
-                         base::File::FLAG_CREATE | base::File::FLAG_WRITE);
-    if (!lock_file.IsValid()) {
-      if (lock_file.error_details() != base::File::FILE_ERROR_EXISTS) {
-        DeterministicVideoFatal("failed to create deterministic cache lock: " +
-                                lock_path.AsUTF8Unsafe());
-      }
-      // Parallel chunk renderers must share one browser-owned decode artifact.
-      // Wait for the lock owner instead of creating another per-process cache.
-      base::TimeTicks deadline = base::TimeTicks::Now() + base::Minutes(10);
-      while (base::TimeTicks::Now() < deadline) {
-        if (base::PathExists(ready_path)) {
-          DeterministicVideoCacheEntry entry =
-              MakeDeterministicVideoCacheEntry(raw_path, size, fps);
-          entries_.emplace(key, entry);
-          return entry;
-        }
-        base::PlatformThread::Sleep(base::Milliseconds(100));
-      }
-      DeterministicVideoFatal("timed out waiting for deterministic cache: " +
-                              raw_path.AsUTF8Unsafe());
+    avio_context_.reset(
+        avio_alloc_context(buffer, kAvioBufferSize, 0, this, &ReadPacket,
+                           nullptr, &Seek));
+    if (!avio_context_) {
+      av_free(buffer);
+      DeterministicVideoFatal("failed to allocate deterministic AVIO context");
+    }
+    avio_context_->seekable = AVIO_SEEKABLE_NORMAL;
+    avio_context_->write_flag = 0;
+  }
+
+  AVIOContext* context() const { return avio_context_.get(); }
+
+ private:
+  static int ReadPacket(void* opaque, uint8_t* buffer, int buffer_size) {
+    if (buffer_size < 0) {
+      return AVERROR(EIO);
+    }
+    auto* self = static_cast<DeterministicVideoFileAvio*>(opaque);
+    std::optional<size_t> read = self->input_file_.ReadAtCurrentPos(
+        UNSAFE_BUFFERS(base::span(buffer,
+                                  static_cast<size_t>(buffer_size))));
+    if (!read) {
+      return AVERROR(EIO);
+    }
+    if (*read == 0) {
+      return AVERROR_EOF;
+    }
+    return static_cast<int>(*read);
+  }
+
+  static int64_t Seek(void* opaque, int64_t offset, int whence) {
+    auto* self = static_cast<DeterministicVideoFileAvio*>(opaque);
+    if (whence == AVSEEK_SIZE) {
+      const int64_t length = self->input_file_.GetLength();
+      return length >= 0 ? length : AVERROR(EIO);
     }
 
-    base::DeleteFile(tmp_path);
-    base::DeleteFile(raw_path);
-    base::DeleteFile(ready_path);
+    base::File::Whence origin;
+    switch (whence) {
+      case SEEK_SET:
+        origin = base::File::FROM_BEGIN;
+        break;
+      case SEEK_CUR:
+        origin = base::File::FROM_CURRENT;
+        break;
+      case SEEK_END:
+        origin = base::File::FROM_END;
+        break;
+      default:
+        return AVERROR(EIO);
+    }
+    const int64_t position = self->input_file_.Seek(origin, offset);
+    return position >= 0 ? position : AVERROR(EIO);
+  }
 
+  base::File input_file_;
+  std::unique_ptr<AVIOContext, AVIOContextDeleter> avio_context_;
+};
+
+class DeterministicVideoFfmpegStream {
+ public:
+  DeterministicVideoFfmpegStream(const base::FilePath& input_path,
+                                 const gfx::Size& output_size,
+                                 int fps)
+      : input_path_(input_path),
+        output_size_(output_size),
+        fps_(fps),
+        frame_bytes_(static_cast<size_t>(output_size.width()) *
+                     output_size.height() * 3 / 2) {}
+
+  ~DeterministicVideoFfmpegStream() { Stop(); }
+
+  std::vector<uint8_t> ReadFrame(int64_t output_index) {
+    if (!process_.IsValid() || output_index != next_output_index_) {
+      Start(output_index);
+    }
+
+    std::vector<uint8_t> raw_frame(frame_bytes_);
+    std::optional<size_t> read =
+        stdout_pipe_.ReadAtCurrentPos(base::span(raw_frame));
+    if (read != raw_frame.size()) {
+      int exit_code = 0;
+      const bool exited =
+          process_.WaitForExitWithTimeout(base::Milliseconds(0), &exit_code);
+      DeterministicVideoFatal(base::StringPrintf(
+          "ffmpeg deterministic stream ended early: path=%s index=%" PRId64
+          " read=%zu expected=%zu exited=%d exit_code=%d",
+          input_path_.AsUTF8Unsafe().c_str(), output_index,
+          read.value_or(0), raw_frame.size(), exited, exit_code));
+    }
+
+    ++next_output_index_;
+    return raw_frame;
+  }
+
+  void Stop() {
+    stdout_pipe_.Close();
+    if (process_.IsValid()) {
+      process_.Terminate(1, true);
+      process_.Close();
+    }
+    next_output_index_ = -1;
+  }
+
+ private:
+  void Start(int64_t output_index) {
+    Stop();
+
+    base::ScopedFD read_fd;
+    base::ScopedFD write_fd;
+    if (!base::CreatePipe(&read_fd, &write_fd, false)) {
+      DeterministicVideoFatal("failed to create deterministic ffmpeg pipe");
+    }
+
+    base::File dev_null(base::FilePath("/dev/null"),
+                        base::File::FLAG_OPEN | base::File::FLAG_WRITE);
+    if (!dev_null.IsValid()) {
+      DeterministicVideoFatal("failed to open /dev/null for ffmpeg stderr");
+    }
+
+    const base::TimeDelta start_time =
+        DeterministicVideoFrameTime(output_index, fps_);
+    // Decode through a Chromium-owned ffmpeg stdout stream. The capture harness
+    // supplies only the common clock; it never prepares per-video frame files.
     base::CommandLine ffmpeg(DeterministicVideoFfmpegPath());
     ffmpeg.AppendArg("-v");
     ffmpeg.AppendArg("error");
-    ffmpeg.AppendArg("-y");
+    ffmpeg.AppendArg("-nostdin");
+    ffmpeg.AppendArg("-ss");
+    ffmpeg.AppendArg(base::StringPrintf("%.6f", start_time.InSecondsF()));
     ffmpeg.AppendArg("-i");
-    ffmpeg.AppendArgPath(input_path);
+    ffmpeg.AppendArgPath(input_path_);
+    ffmpeg.AppendArg("-an");
+    ffmpeg.AppendArg("-sn");
+    ffmpeg.AppendArg("-dn");
     ffmpeg.AppendArg("-vf");
-    ffmpeg.AppendArg(base::StringPrintf("fps=%d,scale=%d:%d,format=nv12", fps,
-                                        size.width(), size.height()));
+    ffmpeg.AppendArg(base::StringPrintf("fps=%d,scale=%d:%d,format=nv12",
+                                        fps_, output_size_.width(),
+                                        output_size_.height()));
     ffmpeg.AppendArg("-f");
     ffmpeg.AppendArg("rawvideo");
-    ffmpeg.AppendArgPath(tmp_path);
+    ffmpeg.AppendArg("pipe:1");
 
-    std::string output;
-    if (!base::GetAppOutputAndError(ffmpeg, &output)) {
-      DeterministicVideoFatal("ffmpeg raw decode failed for " +
-                              input_path.AsUTF8Unsafe() + ": " + output);
+    base::LaunchOptions options;
+    options.fds_to_remap.emplace_back(write_fd.get(), STDOUT_FILENO);
+    options.fds_to_remap.emplace_back(dev_null.GetPlatformFile(),
+                                      STDERR_FILENO);
+    process_ = base::LaunchProcess(ffmpeg, options);
+    write_fd.reset();
+    dev_null.Close();
+    if (!process_.IsValid()) {
+      DeterministicVideoFatal("failed to launch deterministic ffmpeg stream: " +
+                              ffmpeg.GetCommandLineString());
     }
 
-    DeterministicVideoCacheEntry entry =
-        MakeDeterministicVideoCacheEntry(tmp_path, size, fps);
-    if (!base::Move(tmp_path, raw_path)) {
-      DeterministicVideoFatal("failed to publish deterministic raw cache: " +
-                              raw_path.AsUTF8Unsafe());
-    }
-    entry.raw_path = raw_path;
-    if (!base::WriteFile(ready_path, "ready")) {
-      DeterministicVideoFatal("failed to publish deterministic cache marker: " +
-                              ready_path.AsUTF8Unsafe());
-    }
-    lock_file.Close();
-    base::DeleteFile(lock_path);
+    stdout_pipe_ = base::File(read_fd.release());
+    next_output_index_ = output_index;
+  }
 
-    entries_.emplace(key, entry);
-    return entry;
+  const base::FilePath input_path_;
+  const gfx::Size output_size_;
+  const int fps_;
+  const size_t frame_bytes_;
+  base::File stdout_pipe_;
+  base::Process process_;
+  int64_t next_output_index_ = -1;
+};
+
+class DeterministicVideoFrameQueue {
+ public:
+  DeterministicVideoFrameQueue(std::string source_url,
+                               const gfx::Size& output_size,
+                               int fps)
+      : source_url_(std::move(source_url)),
+        output_size_(output_size),
+        fps_(fps) {
+    InitializeDecoder();
+  }
+
+  scoped_refptr<media::VideoFrame> GetFrame(
+      base::TimeDelta media_time,
+      bool is_looping,
+      const media::VideoFrame& reference_frame) {
+    base::AutoLock lock(lock_);
+    base::TimeDelta content_time = NormalizeMediaTime(media_time, is_looping);
+    const int64_t target_index = DeterministicVideoFrameIndex(content_time,
+                                                              fps_);
+    EnsureFrameReady(target_index, reference_frame);
+    for (const DeterministicQueuedFrame& queued_frame : output_frames_) {
+      if (queued_frame.output_index == target_index) {
+        return queued_frame.frame;
+      }
+    }
+    DeterministicVideoFatal(base::StringPrintf(
+        "deterministic queue failed to produce target frame: index=%" PRId64
+        " source=%s",
+        target_index, source_url_.c_str()));
+  }
+
+ private:
+  void InitializeDecoder() {
+    if (output_size_.IsEmpty() || output_size_.width() % 2 != 0 ||
+        output_size_.height() % 2 != 0) {
+      DeterministicVideoFatal("NV12 substitution requires non-empty even video "
+                              "dimensions: " +
+                              output_size_.ToString());
+    }
+
+    GURL url(source_url_);
+    if (!net::FileURLToFilePath(url, &input_path_)) {
+      DeterministicVideoFatal("only file:// video URLs are supported: " +
+                              source_url_);
+    }
+    if (!base::PathExists(input_path_)) {
+      DeterministicVideoFatal("video source does not exist: " +
+                              input_path_.AsUTF8Unsafe());
+    }
+
+    AVFormatContext* raw_format_context = avformat_alloc_context();
+    if (!raw_format_context) {
+      DeterministicVideoFatal(
+          "failed to allocate deterministic format context");
+    }
+    file_avio_ = std::make_unique<DeterministicVideoFileAvio>(input_path_);
+    // Chromium's bundled FFmpeg may not expose file/url protocols. Feed the
+    // browser-selected local file through AVIO so demuxing uses Chromium I/O.
+    raw_format_context->flags |= AVFMT_FLAG_CUSTOM_IO;
+    raw_format_context->pb = file_avio_->context();
+    int result = avformat_open_input(&raw_format_context, nullptr, nullptr,
+                                     nullptr);
+    if (result < 0) {
+      if (raw_format_context) {
+        avformat_free_context(raw_format_context);
+      }
+      DeterministicVideoFatal("failed to open deterministic video source: " +
+                              input_path_.AsUTF8Unsafe() + " url=" +
+                              source_url_ + ": " +
+                              media::AVErrorToString(result));
+    }
+    format_context_.reset(raw_format_context);
+
+    result = avformat_find_stream_info(format_context_.get(), nullptr);
+    if (result < 0) {
+      DeterministicVideoFatal("failed to read deterministic video stream info: " +
+                              input_path_.AsUTF8Unsafe() + ": " +
+                              media::AVErrorToString(result));
+    }
+
+    auto streams = media::AVFormatContextToSpan(format_context_.get());
+    for (AVStream* stream : streams) {
+      if (stream && stream->codecpar &&
+          stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        video_stream_ = stream;
+        break;
+      }
+    }
+    if (!video_stream_) {
+      DeterministicVideoFatal("deterministic video source has no video stream: " +
+                              input_path_.AsUTF8Unsafe());
+    }
+
+    if (video_stream_->duration != media::kNoFFmpegTimestamp &&
+        video_stream_->duration > 0) {
+      duration_ = media::ConvertFromTimeBase(video_stream_->time_base,
+                                             video_stream_->duration);
+    } else if (format_context_->duration != media::kNoFFmpegTimestamp &&
+               format_context_->duration > 0) {
+      duration_ = base::Microseconds(format_context_->duration);
+    }
+    if (duration_ <= base::TimeDelta()) {
+      DeterministicVideoFatal("deterministic video duration is unavailable: " +
+                              input_path_.AsUTF8Unsafe());
+    }
+    ffmpeg_stream_ = std::make_unique<DeterministicVideoFfmpegStream>(
+        input_path_, output_size_, fps_);
+  }
+
+  base::TimeDelta NormalizeMediaTime(base::TimeDelta media_time,
+                                     bool is_looping) const {
+    if (media_time < base::TimeDelta()) {
+      DeterministicVideoFatal(base::StringPrintf(
+          "negative deterministic video media time: us=%" PRId64 " source=%s",
+          media_time.InMicroseconds(), source_url_.c_str()));
+    }
+    if (media_time < duration_) {
+      return media_time;
+    }
+    if (!is_looping) {
+      DeterministicVideoFatal(base::StringPrintf(
+          "non-looping video reached deterministic end: us=%" PRId64
+          " duration_us=%" PRId64 " source=%s",
+          media_time.InMicroseconds(), duration_.InMicroseconds(),
+          source_url_.c_str()));
+    }
+    const int64_t duration_us = duration_.InMicroseconds();
+    if (duration_us <= 0) {
+      DeterministicVideoFatal("looping video has invalid duration: " +
+                              source_url_);
+    }
+    return base::Microseconds(media_time.InMicroseconds() % duration_us);
+  }
+
+  void EnsureFrameReady(int64_t target_index,
+                        const media::VideoFrame& reference_frame) {
+    if (!output_frames_.empty()) {
+      for (const DeterministicQueuedFrame& queued_frame : output_frames_) {
+        if (queued_frame.output_index == target_index) {
+          return;
+        }
+      }
+    }
+
+    const int64_t max_sequential_gap = DeterministicVideoQueueFrames(
+        kDeterministicVideoSequentialGapSeconds, fps_);
+    if (output_frames_.empty() || target_index < next_output_index_ ||
+        target_index > next_output_index_ + max_sequential_gap) {
+      SeekToOutputFrame(target_index);
+    }
+
+    const int64_t last_needed =
+        target_index + DeterministicVideoQueueFrames(
+                           kDeterministicVideoQueueAheadSeconds, fps_);
+    while (next_output_index_ <= last_needed) {
+      GenerateOutputFrame(next_output_index_, reference_frame);
+      ++next_output_index_;
+    }
+    Prune(target_index);
+  }
+
+  void SeekToOutputFrame(int64_t output_index) {
+    ffmpeg_stream_->Stop();
+    output_frames_.clear();
+    next_output_index_ = output_index;
+  }
+
+  void GenerateOutputFrame(int64_t output_index,
+                           const media::VideoFrame& reference_frame) {
+    const base::TimeDelta target_time =
+        DeterministicVideoFrameTime(output_index, fps_);
+
+    std::vector<uint8_t> raw_frame = ffmpeg_stream_->ReadFrame(output_index);
+    scoped_refptr<media::VideoFrame> frame = CreateOutputFrameFromRaw(
+        raw_frame, target_time, reference_frame);
+    output_frames_.push_back({output_index, std::move(frame)});
+  }
+
+  scoped_refptr<media::VideoFrame> CreateOutputFrameFromRaw(
+      const std::vector<uint8_t>& raw_frame,
+      base::TimeDelta timestamp,
+      const media::VideoFrame& reference_frame) {
+    scoped_refptr<media::VideoFrame> frame = media::VideoFrame::CreateFrame(
+        media::PIXEL_FORMAT_NV12, output_size_, gfx::Rect(output_size_),
+        output_size_, timestamp);
+    if (!frame) {
+      DeterministicVideoFatal("failed to allocate deterministic NV12 frame");
+    }
+
+    frame->set_color_space(reference_frame.ColorSpace());
+    frame->metadata().transformation = reference_frame.metadata().transformation;
+    frame->metadata().frame_duration = base::Seconds(1.0 / fps_);
+    frame->metadata().frame_rate = fps_;
+
+    const size_t y_bytes =
+        static_cast<size_t>(output_size_.width()) * output_size_.height();
+    if (raw_frame.size() != y_bytes * 3 / 2) {
+      DeterministicVideoFatal("deterministic raw frame size changed");
+    }
+
+    const uint8_t* src_y = raw_frame.data();
+    const uint8_t* src_uv = UNSAFE_BUFFERS(raw_frame.data() + y_bytes);
+    uint8_t* dst_y = frame->writable_data(media::VideoFrame::Plane::kY);
+    uint8_t* dst_uv = frame->writable_data(media::VideoFrame::Plane::kUV);
+    const size_t dst_y_stride = frame->stride(media::VideoFrame::Plane::kY);
+    const size_t dst_uv_stride = frame->stride(media::VideoFrame::Plane::kUV);
+    const size_t row_bytes = static_cast<size_t>(output_size_.width());
+    for (int y = 0; y < output_size_.height(); ++y) {
+      UNSAFE_BUFFERS(
+          std::memcpy(dst_y + y * dst_y_stride, src_y + y * row_bytes,
+                      row_bytes));
+    }
+    for (int y = 0; y < output_size_.height() / 2; ++y) {
+      UNSAFE_BUFFERS(
+          std::memcpy(dst_uv + y * dst_uv_stride, src_uv + y * row_bytes,
+                      row_bytes));
+    }
+    return frame;
+  }
+
+  void Prune(int64_t target_index) {
+    const int64_t keep_before = DeterministicVideoQueueFrames(
+        kDeterministicVideoQueueBehindSeconds, fps_);
+    while (!output_frames_.empty() &&
+           output_frames_.front().output_index < target_index - keep_before) {
+      output_frames_.pop_front();
+    }
+  }
+
+  base::Lock lock_;
+  const std::string source_url_;
+  const gfx::Size output_size_;
+  const int fps_;
+  base::FilePath input_path_;
+  std::unique_ptr<DeterministicVideoFileAvio> file_avio_;
+  std::unique_ptr<DeterministicVideoFfmpegStream> ffmpeg_stream_;
+  std::unique_ptr<AVFormatContext, AVFormatContextDeleter> format_context_;
+  AVStream* video_stream_ = nullptr;
+  base::TimeDelta duration_;
+  int64_t next_output_index_ = 0;
+  std::deque<DeterministicQueuedFrame> output_frames_
+      ALLOW_DISCOURAGED_TYPE("Small FIFO queue for deterministic video frames");
+};
+
+class DeterministicVideoFrameQueues {
+ public:
+  DeterministicVideoFrameQueue& GetOrCreate(const std::string& source_url,
+                                            const gfx::Size& output_size,
+                                            int fps) {
+    const std::string key = DeterministicVideoCacheKey(source_url, output_size,
+                                                       fps);
+    base::AutoLock lock(lock_);
+    auto existing = queues_.find(key);
+    if (existing != queues_.end()) {
+      return *existing->second;
+    }
+    auto queue = std::make_unique<DeterministicVideoFrameQueue>(source_url,
+                                                               output_size,
+                                                               fps);
+    DeterministicVideoFrameQueue& result = *queue;
+    queues_.emplace(key, std::move(queue));
+    return result;
   }
 
  private:
   base::Lock lock_;
-  std::map<std::string, DeterministicVideoCacheEntry> entries_
-      ALLOW_DISCOURAGED_TYPE("Experimental deterministic-video cache");
+  std::map<std::string, std::unique_ptr<DeterministicVideoFrameQueue>> queues_
+      ALLOW_DISCOURAGED_TYPE("Experimental deterministic-video queues");
 };
 
-DeterministicVideoCache& GetDeterministicVideoCache() {
-  static base::NoDestructor<DeterministicVideoCache> cache;
-  return *cache;
-}
-
-scoped_refptr<media::VideoFrame> ReadDeterministicVideoFrame(
-    const DeterministicVideoCacheEntry& entry,
-    int64_t frame_index,
-    base::TimeDelta timestamp,
-    const media::VideoFrame& source_frame) {
-  if (frame_index < 0 || frame_index >= entry.frame_count) {
-    DeterministicVideoFatal(base::StringPrintf(
-        "deterministic frame index out of range: index=%" PRId64
-        " frame_count=%" PRId64,
-        frame_index, entry.frame_count));
-  }
-
-  std::vector<uint8_t> raw_frame(entry.frame_bytes);
-  base::File raw_file(entry.raw_path,
-                      base::File::FLAG_OPEN | base::File::FLAG_READ);
-  if (!raw_file.IsValid()) {
-    DeterministicVideoFatal("failed to open deterministic raw cache: " +
-                            entry.raw_path.AsUTF8Unsafe());
-  }
-  std::optional<size_t> read =
-      raw_file.Read(frame_index * entry.frame_bytes, base::span(raw_frame));
-  if (read != raw_frame.size()) {
-    DeterministicVideoFatal(base::StringPrintf(
-        "failed to read deterministic frame: index=%" PRId64 " read=%zu "
-        "expected=%zu",
-        frame_index, read.value_or(0), raw_frame.size()));
-  }
-
-  scoped_refptr<media::VideoFrame> frame = media::VideoFrame::CreateFrame(
-      media::PIXEL_FORMAT_NV12, entry.size, gfx::Rect(entry.size), entry.size,
-      timestamp);
-  if (!frame) {
-    DeterministicVideoFatal("failed to allocate deterministic NV12 VideoFrame");
-  }
-  frame->set_color_space(source_frame.ColorSpace());
-  frame->metadata().transformation = source_frame.metadata().transformation;
-  frame->metadata().frame_duration = base::Seconds(1.0 / entry.fps);
-  frame->metadata().frame_rate = entry.fps;
-
-  const uint8_t* src_y = raw_frame.data();
-  const uint8_t* src_uv =
-      raw_frame.data() + static_cast<size_t>(entry.size.width()) *
-                             entry.size.height();
-  uint8_t* dst_y = frame->writable_data(media::VideoFrame::Plane::kY);
-  uint8_t* dst_uv = frame->writable_data(media::VideoFrame::Plane::kUV);
-  const size_t dst_y_stride =
-      frame->stride(media::VideoFrame::Plane::kY);
-  const size_t dst_uv_stride =
-      frame->stride(media::VideoFrame::Plane::kUV);
-  const size_t row_bytes = static_cast<size_t>(entry.size.width());
-  for (int y = 0; y < entry.size.height(); ++y) {
-    std::memcpy(dst_y + y * dst_y_stride, src_y + y * row_bytes, row_bytes);
-  }
-  for (int y = 0; y < entry.size.height() / 2; ++y) {
-    std::memcpy(dst_uv + y * dst_uv_stride, src_uv + y * row_bytes, row_bytes);
-  }
-  return frame;
+DeterministicVideoFrameQueues& GetDeterministicVideoFrameQueues() {
+  static base::NoDestructor<DeterministicVideoFrameQueues> queues;
+  return *queues;
 }
 
 // static
@@ -562,10 +833,11 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
     if (deterministic_video_source_url_.empty()) {
       return frame;
     }
-    // Manual startup submissions do not carry BeginFrame timing. Drop them
-    // rather than exposing native pixels; visible capture draws set timing via
-    // WillDrawCurrentFrame() immediately before GetCurrentFrame().
-    return nullptr;
+    // Pre-draw availability checks can ask for the current frame before cc
+    // supplies a BeginFrame deadline. Return the native frame only for that
+    // untimed startup path so drawing is not suppressed; timed capture calls
+    // below still require the single media-time state and substitute pixels.
+    return frame;
   }
 
   if (!frame) {
@@ -581,25 +853,10 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
   // Use WebMediaPlayerImpl::GetCurrentTimeInternal() as the single media-time
   // source. Do not fall back to frame timestamps or source-load epochs.
   const base::TimeDelta local_time = GetDeterministicVideoMediaTime();
-  int64_t frame_index =
-      local_time.InMicroseconds() * static_cast<int64_t>(fps) /
-      base::Time::kMicrosecondsPerSecond;
-  DeterministicVideoCacheEntry entry =
-      GetDeterministicVideoCache().GetOrCreate(deterministic_video_source_url_,
-                                               frame->natural_size(), fps);
-  if (frame_index >= entry.frame_count) {
-    if (!deterministic_video_is_looping_) {
-      DeterministicVideoFatal(base::StringPrintf(
-          "non-looping video reached end of deterministic cache: index=%" PRId64
-          " frame_count=%" PRId64 " source=%s",
-          frame_index, entry.frame_count,
-          deterministic_video_source_url_.c_str()));
-    }
-    // HTML <video loop> repeats from the beginning. Keep non-looping media
-    // fatal above so an ended video is never silently repeated.
-    frame_index %= entry.frame_count;
-  }
-  return ReadDeterministicVideoFrame(entry, frame_index, local_time, *frame);
+  DeterministicVideoFrameQueue& queue =
+      GetDeterministicVideoFrameQueues().GetOrCreate(
+          deterministic_video_source_url_, frame->natural_size(), fps);
+  return queue.GetFrame(local_time, deterministic_video_is_looping_, *frame);
 }
 
 base::TimeDelta VideoFrameCompositor::GetDeterministicVideoMediaTime() {
@@ -635,7 +892,10 @@ base::TimeDelta VideoFrameCompositor::GetDeterministicVideoMediaTime() {
 
 bool VideoFrameCompositor::HasCurrentFrame() {
   DCHECK(task_runner_->BelongsToCurrentThread());
-  return static_cast<bool>(GetCurrentFrame());
+  // Availability probes run before cc has supplied the BeginFrame deadline via
+  // WillDrawCurrentFrame(). They must see the native frame so drawing is not
+  // skipped; deterministic substitution happens only when pixels are fetched.
+  return static_cast<bool>(current_frame_);
 }
 
 base::TimeDelta VideoFrameCompositor::GetPreferredRenderInterval() {
@@ -801,8 +1061,10 @@ bool VideoFrameCompositor::ProcessNewFrame(
     bool repaint_duplicate_frame) {
   DCHECK(task_runner_->BelongsToCurrentThread());
 
-  if (!frame || (GetCurrentFrame() && !repaint_duplicate_frame &&
-                 frame->unique_id() == GetCurrentFrame()->unique_id())) {
+  // Duplicate detection is an internal media-pipeline decision. Compare against
+  // the native frame, not the deterministic replacement frame.
+  if (!frame || (current_frame_ && !repaint_duplicate_frame &&
+                 frame->unique_id() == current_frame_->unique_id())) {
     return false;
   }
 

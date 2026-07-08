@@ -105,6 +105,8 @@ component("media") {
     "//components/viz/common",
     "//media:media_buildflags",
     "//net",
+    "//third_party/ffmpeg",
+    "//third_party/ffmpeg:ffmpeg_features",
     "//services/network/public/cpp",
     "//third_party/blink/public/common",
     "//third_party/blink/public/mojom:mojom_platform",
