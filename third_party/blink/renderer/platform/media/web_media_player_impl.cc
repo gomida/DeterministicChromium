@@ -940,6 +940,7 @@ void WebMediaPlayerImpl::DoLoad(LoadType load_type,
           &VideoFrameCompositor::SetDeterministicVideoSourceUrl,
           CrossThreadUnretained(compositor_.get()), GURL(url).spec(),
           client_->IsLooping()));
+  UpdateDeterministicVideoMediaTimeState();
   load_type_ = load_type;
 
   ReportMetrics(load_type, url, media_log_.get());
@@ -1445,6 +1446,25 @@ base::TimeDelta WebMediaPlayerImpl::GetCurrentTimeInternal() const {
   // seeks to kInfiniteDuration (2**64 - 1) when Duration() is infinite.
   DCHECK_GE(current_time, base::TimeDelta());
   return current_time;
+}
+
+void WebMediaPlayerImpl::UpdateDeterministicVideoMediaTimeState() {
+  DCHECK(main_task_runner_->BelongsToCurrentThread());
+
+  const double effective_playback_rate =
+      paused_ || seeking_ || ready_state_ < kReadyStateHaveFutureData
+          ? 0.0
+          : playback_rate_;
+  // Sample the same media time exposed to HTMLMediaElement::currentTime on the
+  // main thread, then let the compositor advance that one clock by beginFrame
+  // time. This avoids a compositor->main-thread sync read during screenshot
+  // capture and keeps deterministic-video frame selection on a single source.
+  PostCrossThreadTask(
+      *vfc_task_runner_, FROM_HERE,
+      CrossThreadBindOnce(
+          &VideoFrameCompositor::SetDeterministicVideoMediaTimeState,
+          CrossThreadUnretained(compositor_.get()), GetCurrentTimeInternal(),
+          base::TimeTicks::Now(), effective_playback_rate));
 }
 
 double WebMediaPlayerImpl::CurrentTime() const {
@@ -3201,6 +3221,7 @@ void WebMediaPlayerImpl::UpdatePlayState() {
         !paused_ && !seeking_ && !IsPageHidden() && !state.is_suspended &&
         ready_state_ == kReadyStateHaveEnoughData);
   }
+  UpdateDeterministicVideoMediaTimeState();
 }
 
 void WebMediaPlayerImpl::OnTimeUpdate() {

@@ -695,6 +695,7 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
   // negative or kInfiniteDuration value. See http://crbug.com/40382058,
   // http://crbug.com/41274857, and http://crbug.com/40533294 for reasons why.
   base::TimeDelta GetCurrentTimeInternal() const;
+  void UpdateDeterministicVideoMediaTimeState();
 
   // Called by the compositor the very first time a frame is received.
   void OnFirstFrame(base::TimeTicks frame_time, bool is_frame_readable);

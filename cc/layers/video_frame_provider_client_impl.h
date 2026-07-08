@@ -47,7 +47,9 @@ class CC_EXPORT VideoFrameProviderClientImpl
   // Must be called on the impl thread while the main thread is blocked.
   void Stop();
 
-  scoped_refptr<media::VideoFrame> AcquireLockAndCurrentFrame()
+  scoped_refptr<media::VideoFrame> AcquireLockAndCurrentFrame(
+      base::TimeTicks deadline_min,
+      base::TimeTicks deadline_max)
       EXCLUSIVE_LOCK_FUNCTION(provider_lock_);
   void PutCurrentFrame() EXCLUSIVE_LOCKS_REQUIRED(provider_lock_);
   void ReleaseLock() UNLOCK_FUNCTION(provider_lock_);

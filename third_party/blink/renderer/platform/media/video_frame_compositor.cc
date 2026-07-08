@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "base/check.h"
@@ -32,6 +33,7 @@
 #include "base/trace_event/trace_event.h"
 #include "components/viz/common/frame_sinks/begin_frame_args.h"
 #include "media/base/media_switches.h"
+#include "media/base/timestamp_constants.h"
 #include "media/base/video_frame.h"
 #include "net/base/filename_util.h"
 #include "third_party/blink/renderer/platform/allow_discouraged_type.h"
@@ -426,9 +428,16 @@ void VideoFrameCompositor::SetDeterministicVideoSourceUrl(
   deterministic_video_source_url_ = std::move(source_url);
   deterministic_video_is_looping_ = is_looping;
   deterministic_video_last_begin_frame_time_ = base::TimeTicks();
-  // Use the native source-load time as the media epoch so virtual-time
-  // warm-forward before a chunk is reflected in deterministic frame selection.
-  deterministic_video_epoch_ = base::TimeTicks::Now();
+}
+
+void VideoFrameCompositor::SetDeterministicVideoMediaTimeState(
+    base::TimeDelta media_time,
+    base::TimeTicks sample_ticks,
+    double playback_rate) {
+  DCHECK(task_runner_->BelongsToCurrentThread());
+  deterministic_video_media_time_ = media_time;
+  deterministic_video_media_time_sample_ticks_ = sample_ticks;
+  deterministic_video_playback_rate_ = playback_rate;
 }
 
 void VideoFrameCompositor::PutCurrentFrame() {
@@ -451,6 +460,21 @@ bool VideoFrameCompositor::UpdateCurrentFrame(base::TimeTicks deadline_min,
   return CallRender(deadline_min, deadline_max, RenderingMode::kNormal);
 }
 
+void VideoFrameCompositor::WillDrawCurrentFrame(base::TimeTicks deadline_min,
+                                                base::TimeTicks deadline_max) {
+  DCHECK(task_runner_->BelongsToCurrentThread());
+  if (!IsDeterministicVideoEnabled()) {
+    return;
+  }
+  base::TimeDelta interval = deadline_max - deadline_min;
+  if (interval.is_positive()) {
+    // The visible <video> layer can draw a previously decoded frame without the
+    // VideoFrameSubmitter path. Capture must still use the current BeginFrame
+    // deadline so native pixels never leak into the recorded surface.
+    deterministic_video_last_begin_frame_time_ = deadline_min;
+  }
+}
+
 scoped_refptr<media::VideoFrame>
 VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
     scoped_refptr<media::VideoFrame> frame) {
@@ -458,11 +482,14 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
     return frame;
   }
 
-  // Manual startup submissions do not carry external beginFrame timing. Native
-  // substitution starts only once capture beginFrame timing reaches this
-  // provider; capture frames must never fall back after that point.
   if (deterministic_video_last_begin_frame_time_.is_null()) {
-    return frame;
+    if (deterministic_video_source_url_.empty()) {
+      return frame;
+    }
+    // Manual startup submissions do not carry BeginFrame timing. Drop them
+    // rather than exposing native pixels; visible capture draws set timing via
+    // WillDrawCurrentFrame() immediately before GetCurrentFrame().
+    return nullptr;
   }
 
   if (!frame) {
@@ -474,18 +501,10 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
                             "deterministic source URL");
   }
 
-  if (deterministic_video_epoch_.is_null()) {
-    DeterministicVideoFatal("deterministic video epoch was not initialized");
-  }
-  if (deterministic_video_last_begin_frame_time_ < deterministic_video_epoch_) {
-    DeterministicVideoFatal("beginFrame time moved backwards for deterministic "
-                            "video source: " +
-                            deterministic_video_source_url_);
-  }
-
   const int fps = DeterministicVideoFps();
-  const base::TimeDelta local_time =
-      deterministic_video_last_begin_frame_time_ - deterministic_video_epoch_;
+  // Use WebMediaPlayerImpl::GetCurrentTimeInternal() as the single media-time
+  // source. Do not fall back to frame timestamps or source-load epochs.
+  const base::TimeDelta local_time = GetDeterministicVideoMediaTime();
   int64_t frame_index =
       local_time.InMicroseconds() * static_cast<int64_t>(fps) /
       base::Time::kMicrosecondsPerSecond;
@@ -505,6 +524,37 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
     frame_index %= entry.frame_count;
   }
   return ReadDeterministicVideoFrame(entry, frame_index, local_time, *frame);
+}
+
+base::TimeDelta VideoFrameCompositor::GetDeterministicVideoMediaTime() {
+  DCHECK(task_runner_->BelongsToCurrentThread());
+  if (deterministic_video_media_time_ == media::kNoTimestamp ||
+      deterministic_video_media_time_sample_ticks_.is_null()) {
+    DeterministicVideoFatal("deterministic video media-time state is missing");
+  }
+  base::TimeDelta media_time = deterministic_video_media_time_;
+  if (deterministic_video_playback_rate_ != 0.0) {
+    if (deterministic_video_last_begin_frame_time_ <
+        deterministic_video_media_time_sample_ticks_) {
+      DeterministicVideoFatal("deterministic video beginFrame moved before "
+                              "the media-time sample");
+    }
+    // The media-time sample comes from WebMediaPlayerImpl::GetCurrentTimeInternal()
+    // on the main thread. Advance that single media clock by the same
+    // beginFrame timeline used for capture, instead of reading another video
+    // timestamp or falling back to source-load time.
+    media_time +=
+        (deterministic_video_last_begin_frame_time_ -
+         deterministic_video_media_time_sample_ticks_) *
+        deterministic_video_playback_rate_;
+  }
+  if (media_time == media::kNoTimestamp || media_time < base::TimeDelta() ||
+      media_time.is_inf()) {
+    DeterministicVideoFatal(base::StringPrintf(
+        "deterministic video media time is invalid: us=%" PRId64 " source=%s",
+        media_time.InMicroseconds(), deterministic_video_source_url_.c_str()));
+  }
+  return media_time;
 }
 
 bool VideoFrameCompositor::HasCurrentFrame() {

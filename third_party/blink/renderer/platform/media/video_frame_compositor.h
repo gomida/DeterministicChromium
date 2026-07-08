@@ -8,7 +8,6 @@
 #include <string>
 #include <utility>
 
-#include "base/functional/callback.h"
 #include "base/memory/raw_ptr.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/synchronization/lock.h"
@@ -19,6 +18,7 @@
 #include "base/timer/timer.h"
 #include "cc/layers/surface_layer.h"
 #include "cc/layers/video_frame_provider.h"
+#include "media/base/timestamp_constants.h"
 #include "media/base/video_renderer_sink.h"
 #include "third_party/blink/public/platform/web_media_player.h"
 #include "third_party/blink/public/platform/web_video_frame_submitter.h"
@@ -107,6 +107,8 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
       cc::VideoFrameProvider::Client* client) override;
   bool UpdateCurrentFrame(base::TimeTicks deadline_min,
                           base::TimeTicks deadline_max) override;
+  void WillDrawCurrentFrame(base::TimeTicks deadline_min,
+                            base::TimeTicks deadline_max) override;
   bool HasCurrentFrame() override;
   scoped_refptr<media::VideoFrame> GetCurrentFrame() override;
   void PutCurrentFrame() override;
@@ -130,6 +132,9 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
   // element remains intact; only compositor-supplied VideoFrame pixels may be
   // replaced when explicit beginFrame timing is available.
   void SetDeterministicVideoSourceUrl(std::string source_url, bool is_looping);
+  void SetDeterministicVideoMediaTimeState(base::TimeDelta media_time,
+                                           base::TimeTicks sample_ticks,
+                                           double playback_rate);
 
   // If |client_| is not set, |callback_| is set, and |is_background_rendering_|
   // is true, it requests a new frame from |callback_|. Uses the elapsed time
@@ -238,6 +243,7 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
 
   scoped_refptr<media::VideoFrame> GetDeterministicVideoFrameIfNeeded(
       scoped_refptr<media::VideoFrame> frame);
+  base::TimeDelta GetDeterministicVideoMediaTime();
 
   // This will run tasks on the compositor thread. If
   // kEnableSurfaceLayerForVideo is enabled, it will instead run tasks on the
@@ -280,7 +286,9 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
   std::string deterministic_video_source_url_;
   bool deterministic_video_is_looping_ = false;
   base::TimeTicks deterministic_video_last_begin_frame_time_;
-  base::TimeTicks deterministic_video_epoch_;
+  base::TimeDelta deterministic_video_media_time_ = media::kNoTimestamp;
+  base::TimeTicks deterministic_video_media_time_sample_ticks_;
+  double deterministic_video_playback_rate_ = 0.0;
 
   // Used to fulfill video.requestVideoFrameCallback() calls.
   // See https://wicg.github.io/video-rvfc/.

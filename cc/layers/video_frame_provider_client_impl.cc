@@ -74,12 +74,15 @@ bool VideoFrameProviderClientImpl::Stopped() const {
 }
 
 scoped_refptr<media::VideoFrame>
-VideoFrameProviderClientImpl::AcquireLockAndCurrentFrame() {
+VideoFrameProviderClientImpl::AcquireLockAndCurrentFrame(
+    base::TimeTicks deadline_min,
+    base::TimeTicks deadline_max) {
   DCHECK(thread_checker_.CalledOnValidThread());
   provider_lock_.Acquire();  // Balanced by call to ReleaseLock().
   if (!provider_)
     return nullptr;
 
+  provider_->WillDrawCurrentFrame(deadline_min, deadline_max);
   return provider_->GetCurrentFrame();
 }
 

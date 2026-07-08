@@ -89,7 +89,10 @@ bool VideoLayerImpl::WillDraw(DrawMode draw_mode,
   // is the GPU process locking it. As the GPU process can't cause the
   // destruction of the provider (calling StopUsingProvider), holding this
   // lock should not cause a deadlock.
-  frame_ = provider_client_impl_->AcquireLockAndCurrentFrame();
+  const auto& begin_frame_args = layer_tree_impl()->CurrentBeginFrameArgs();
+  frame_ = provider_client_impl_->AcquireLockAndCurrentFrame(
+      begin_frame_args.frame_time + begin_frame_args.interval,
+      begin_frame_args.frame_time + 2 * begin_frame_args.interval);
 
   if (!frame_.get()) {
     // Drop any resources used by the updater if there is no frame to display.

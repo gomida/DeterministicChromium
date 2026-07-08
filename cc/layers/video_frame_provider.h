@@ -77,6 +77,12 @@ class CC_EXPORT VideoFrameProvider {
   // otherwise. Aside from thread locks, the state won't change.
   virtual bool HasCurrentFrame() = 0;
 
+  // Called immediately before a layer draw consumes GetCurrentFrame(). Most
+  // providers do not need this hook; deterministic capture providers use the
+  // draw BeginFrame deadline as the single frame-selection clock.
+  virtual void WillDrawCurrentFrame(base::TimeTicks deadline_min,
+                                    base::TimeTicks deadline_max) {}
+
   // Returns the current frame, which may have been updated by a recent call to
   // UpdateCurrentFrame(). A call to this method does not ensure that the frame
   // will be rendered. A subsequent call to PutCurrentFrame() must be made if
