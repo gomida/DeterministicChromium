@@ -274,9 +274,16 @@ original build-output executable had the same SHA-256
 reruns represent both paths. A resident `VLLM::EngineCore` process occupied
 about 87,998 MiB of GPU memory during the pre-run samples; those samples showed
 0% GPU utilization, but `nvidia-smi pmon` showed the VLLM process active after
-the measurement sequence. Treat these numbers as shared-GPU measurements. The
-reruns kept the deterministic WAV and frame timeline, but observed slower
-end-to-end times than the initial build output run:
+the measurement sequence. A follow-up diagnostic 4K run in the same slow range
+(`83.329s` instrumented end-to-end) logged `nvidia-smi dmon` and `pmon` during
+capture: VLLM samples averaged 75.6% SM utilization with a 99% maximum, while
+ffmpeg samples averaged 0.58% encoder utilization. A separate `/dev/zero` 4K
+NV12 input to the same `h264_nvenc` settings encoded 469 frames in `4.08s`, so
+the observed slowdown is attributed to shared GPU compute contention in the
+browser frame-production path, not to the NVENC encoder alone. Treat these
+numbers as shared-GPU measurements. The reruns kept the deterministic WAV and
+frame timeline, but observed slower end-to-end times than the initial build
+output run:
 
 | run | resolution / encoder | plan | audio | capture + mux | end-to-end | external wall | peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
