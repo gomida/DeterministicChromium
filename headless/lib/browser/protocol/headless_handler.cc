@@ -414,6 +414,7 @@ void OnBeginFrameFinished(
     BitmapEncoder encoder,
     base::TimeTicks frame_time_ticks,
     base::TimeDelta interval,
+    bool capture_audio,
     std::unique_ptr<HeadlessHandler::BeginFrameCallback> callback,
     bool has_damage,
     std::unique_ptr<SkBitmap> bitmap,
@@ -422,7 +423,7 @@ void OnBeginFrameFinished(
     callback->sendFailure(Response::ServerError(std::move(error_message)));
     return;
   }
-  if (!encoder.is_null()) {
+  if (capture_audio) {
     if (auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled()) {
       std::optional<std::string> error =
           audio_dump->CaptureInterval(frame_time_ticks, interval);
@@ -497,6 +498,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
                                  std::optional<double> in_interval,
                                  std::optional<bool> in_no_display_updates,
                                  std::optional<bool> in_audio_only,
+                                 std::optional<bool> in_capture_audio,
                                  std::unique_ptr<ScreenshotParams> screenshot,
                                  std::unique_ptr<BeginFrameCallback> callback) {
   auto& headless_contents =
@@ -520,6 +522,8 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
   base::TimeDelta interval;
   bool no_display_updates = in_no_display_updates.value_or(false);
   bool audio_only = in_audio_only.value_or(false);
+  bool capture_audio =
+      in_capture_audio.value_or(!audio_only && screenshot != nullptr);
 
   if (audio_only && screenshot) {
     callback->sendFailure(Response::InvalidParams(
@@ -549,9 +553,9 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
   base::TimeTicks deadline = frame_time_ticks + interval;
 
   auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled();
-  if (audio_only && !audio_dump) {
+  if ((audio_only || capture_audio) && !audio_dump) {
     callback->sendFailure(Response::ServerError(
-        "audioOnly beginFrame requires --headless-raw-audio-dump"));
+        "Deterministic audio beginFrame requires --headless-raw-audio-dump"));
     return;
   }
   if (audio_dump) {
@@ -580,6 +584,13 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
       return;
     }
     if (audio_only) {
+      if (capture_audio) {
+        error = audio_dump->CaptureInterval(frame_time_ticks, interval);
+        if (error.has_value()) {
+          callback->sendFailure(Response::ServerError(std::move(*error)));
+          return;
+        }
+      }
       callback->sendSuccess(false, std::nullopt);
       return;
     }
@@ -605,6 +616,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
       capture_screenshot,
       base::BindOnce(&OnBeginFrameFinished, std::move(encoder),
                      frame_time_ticks, interval,
+                     capture_audio,
                      std::move(callback)));
 }
 

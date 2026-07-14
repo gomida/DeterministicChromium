@@ -41,6 +41,10 @@ experimental domain HeadlessExperimental
       # Advances deterministic native audio without sending a renderer BeginFrame. False by
       # default. Requires --headless-raw-audio-dump and cannot be combined with a screenshot.
       optional boolean audioOnly
+      # Records deterministic native audio for this interval. Defaults to true for screenshot
+      # BeginFrames and false otherwise. May be combined with audioOnly to record without a
+      # renderer BeginFrame.
+      optional boolean captureAudio
       # If set, a screenshot of the frame will be captured and returned in the response. Otherwise,
       # no screenshot will be captured. Note that capturing a screenshot can fail, for example,
       # during renderer initialization. In such a case, no screenshot data will be returned.
