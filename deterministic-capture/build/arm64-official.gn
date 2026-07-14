@@ -1,0 +1,15 @@
+target_cpu = "arm64"
+is_debug = false
+is_component_build = false
+is_official_build = true
+dcheck_always_on = false
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+rtc_use_h264 = true
+use_sysroot = true
+use_remoteexec = false
+treat_warnings_as_errors = false
+chrome_pgo_phase = 0
