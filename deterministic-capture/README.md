@@ -146,6 +146,15 @@ value is `is_cfi=false`. Cross-built output must be staged with `icudtl.dat`,
 V8 snapshots, headless resource pak files, and the selected EGL/Vulkan runtime
 before it is tested on an arm64 host.
 
+The validated arm64 cross-build completed on 2026-07-14 in `3:26:40` using CPU
+cores 0-13 on the x64 build host. It produced a 275 MiB AArch64
+`headless_shell` with build ID `aee473581bfa93a401851b5b47425facf249ab21`.
+Effective values were `target_cpu="arm64"`, `is_debug=false`,
+`is_official_build=true`, `dcheck_always_on=false`, `use_thin_lto=true`, and
+`is_cfi=false`. The arm64 archive was extracted on an aarch64 host where
+`headless_shell --version`, the internal `SHA256SUMS`, and a small DOM dump
+smoke test passed.
+
 ## Page and runtime contract
 
 `CAPTURE_URL` must point to the published `index.html`. The same directory must
@@ -233,36 +242,74 @@ parallel video capture plus mux, and total end-to-end wall time. The
 end-to-end value starts before the manifest fetch and ends after the final MP4
 has been muxed.
 
-## Official x64 validation
+## Release validation and performance
 
-The final-page fixture was validated with the official x64 build at 60 fps on
-CPU cores 0-13. The native timeline was `[803, 1741]` with 2,669 total video
-frames (44.483333 seconds). The browser-generated 24 kHz mono WAV contained
-1,067,600 sample frames and had SHA-256
+The final-page fixture was validated at 60 fps. All successful runs measured
+2,669 total video frames (44.483333 seconds) with chunk sizes
+`[401, 402, 469, 469, 464, 464]`. The page transition boundaries were frames
+`[803, 1741]`. The browser-generated 24 kHz mono WAV contained 1,067,600
+sample frames and had SHA-256
 `47ed1c80268143d9c1ab450a13e184f70800eda3532e318c0eb6f35d0c0c051c`.
+Each output directory contained only `audio.wav` as a WAV file; no worker
+`.discard_audio_XX.wav` files remained.
 
-Two independent 320x180 runs produced the same timeline, chunk sizes
-`[401, 402, 469, 469, 464, 464]`, and byte-identical `audio.wav`. The first run
-reported `35.860s` instrumented end-to-end time and `35.98s` external wall
-time; the second reported `34.869s` instrumented end-to-end time and `34.97s`
-external wall time. Each output directory contained only `audio.wav` as a WAV
-file; no worker `.discard_audio_XX.wav` files remained.
+Initial x64 validation used the official build output on the GPU server with
+CPU cores 0-13 and `h264_nvenc`. Two independent 320x180 runs produced the same
+timeline and byte-identical `audio.wav`. The first run reported `35.860s`
+instrumented end-to-end time and `35.98s` external wall time; the second
+reported `34.869s` instrumented end-to-end time and `34.97s` external wall
+time.
 
-The selected six-chunk, six-way 3840x2160 run recorded:
-
-- plan and manifest loading: `0.206s`
-- browser audio capture: `9.427s`
-- parallel video capture, encoding, concatenation, and mux: `40.572s`
-- instrumented end-to-end wall time: `50.205s`
-- external `/usr/bin/time` wall time: `50.31s`
-- peak parent-process RSS reported by `/usr/bin/time`: `388,904 KiB`
-
-The timed 4K `final.mp4` is 20,153,968 bytes with SHA-256
+The initial six-chunk, six-way 3840x2160 x64 run from the build output recorded
+`0.206s` plan loading, `9.427s` browser audio capture, `40.572s` parallel video
+capture plus mux, `50.205s` instrumented end-to-end wall time, `50.31s`
+external wall time, and `388,904 KiB` peak parent-process RSS. Its `final.mp4`
+was 20,153,968 bytes with SHA-256
 `095d9756dac9cb8d56da647781803555a9d11904c52f7e08460ab1be42eca39c`.
-The corresponding `video.mp4` is 19,581,478 bytes with SHA-256
-`e1e506bd4a06d6ef3ac8ae7f77b0e091b157a4ea8229cfac7b34b4f82ada7350`.
+
+The published x64 release archive was then re-extracted and benchmarked twice on
+2026-07-15 KST on the same GPU server. These reruns kept the deterministic WAV
+and frame timeline, but observed slower end-to-end times than the initial build
+output run:
+
+| run | resolution / encoder | plan | audio | capture + mux | end-to-end | external wall | peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| x64 release A | 3840x2160 / `h264_nvenc` | `0.828s` | `12.554s` | `76.907s` | `90.290s` | `90.44s` | `400,256 KiB` |
+| x64 release B | 3840x2160 / `h264_nvenc` | `0.783s` | `10.509s` | `70.803s` | `82.095s` | `82.21s` | `389,196 KiB` |
+
+The two release reruns produced `final.mp4` files of 20,067,683 bytes and
+20,136,100 bytes with SHA-256
+`90631996096c742f5da32b6214f2940df94bc433670f1fe41657cc7c54159fad` and
+`b0a5da8022cb277f6b6ffb275a2cef99023b5ce92a315ad129bb88ce89a70c6a`.
 Repeated NVENC MP4 files are not byte-identical; deterministic checks apply to
 the browser WAV and measured frame timeline before AAC encoding.
+
+The published arm64 release archive was tested on an Ubuntu 24.04 aarch64 host
+with 8 Neoverse-V2 cores, Python 3.12.3, Playwright 1.61.0, and Ubuntu ffmpeg
+6.1.1. The host exposed `h264_nvenc` in ffmpeg's encoder list, but the default
+NVENC path could not be benchmarked because ffmpeg failed to load
+`libcuda.so.1`.
+
+A local arm64 320x180 run used the bundled SwiftShader Vulkan ICD and
+`CAPTURE_VIDEO_ENCODER=libx264` to exercise the arm64 browser, deterministic
+audio pass, warm-forward video chunks, and final mux. This is a functional
+arm64 performance sample rather than a GPU/NVENC comparison with the x64 4K
+baseline:
+
+| run | resolution / encoder | plan | audio | capture + mux | end-to-end | external wall | peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| arm64 local | 320x180 / SwiftShader + `libx264` | `0.122s` | `6.803s` | `20.792s` | `27.717s` | `27.82s` | `185,728 KiB` |
+
+The arm64 local run produced the same 2,669-frame timeline and byte-identical
+`audio.wav`. Its `final.mp4` was 2,886,193 bytes with SHA-256
+`a0b0cec53c16db305e660dc19526a6237c4cbcfe33af9805187f749df8cf7c43`.
+
+The release tag is `deterministic-capture-v0.22` and points at Chromium commit
+`291e6fd347310dd910adc74d73435af83ce995c9`. Its x64 archive is 90,091,601
+bytes with SHA-256
+`1df973bb306d7fbd4bd8a4df17c9794a7116d209963a2cf03eb107cfee2e029e`. Its arm64
+archive is 86,648,416 bytes with SHA-256
+`e8e65a8b7a9aca111f5b2bee59f889ac478e045de4988af0755865ad87016c43`.
 
 ## Historical V0.21 parity sweep
 
