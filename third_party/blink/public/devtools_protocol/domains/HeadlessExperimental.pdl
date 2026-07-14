@@ -38,6 +38,9 @@ experimental domain HeadlessExperimental
       # true, only side effects of the BeginFrame will be run, such as layout and animations, but
       # any visual updates may not be visible on the display or in screenshots.
       optional boolean noDisplayUpdates
+      # Advances deterministic native audio without sending a renderer BeginFrame. False by
+      # default. Requires --headless-raw-audio-dump and cannot be combined with a screenshot.
+      optional boolean audioOnly
       # If set, a screenshot of the frame will be captured and returned in the response. Otherwise,
       # no screenshot will be captured. Note that capturing a screenshot can fail, for example,
       # during renderer initialization. In such a case, no screenshot data will be returned.

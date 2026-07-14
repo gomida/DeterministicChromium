@@ -40,6 +40,7 @@ class HeadlessHandler : public DomainHandler,
       std::optional<double> in_frame_time_ticks,
       std::optional<double> in_interval,
       std::optional<bool> no_display_updates,
+      std::optional<bool> audio_only,
       std::unique_ptr<HeadlessExperimental::ScreenshotParams> screenshot,
       std::unique_ptr<BeginFrameCallback> callback) override;
 

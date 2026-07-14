@@ -6,8 +6,11 @@
 #define MEDIA_AUDIO_FAKE_AUDIO_OUTPUT_STREAM_H_
 
 #include <memory>
+#include <vector>
 
 #include "base/memory/raw_ptr.h"
+#include "base/memory/scoped_refptr.h"
+#include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
 #include "media/audio/android/muteable_audio_output_stream.h"
 #include "media/audio/audio_io.h"
@@ -17,6 +20,7 @@
 namespace media {
 
 class AudioManagerBase;
+class DeterministicAudioPump;
 
 // A fake implementation of AudioOutputStream.  Used for testing and when a real
 // audio output device is unavailable or refusing output (e.g. remote desktop).
@@ -39,6 +43,9 @@ class MEDIA_EXPORT FakeAudioOutputStream : public MuteableAudioOutputStream {
   void Flush() override;
   void SetMute(bool muted) override;
 
+  // Called by DeterministicAudioPump on the audio worker sequence.
+  void PumpForDeterministicCapture(std::vector<int16_t>* samples);
+
  private:
   FakeAudioOutputStream(AudioManagerBase* manager,
                         const AudioParameters& params);
@@ -48,6 +55,9 @@ class MEDIA_EXPORT FakeAudioOutputStream : public MuteableAudioOutputStream {
   void CallOnMoreData(base::TimeTicks ideal_time, base::TimeTicks now);
 
   const raw_ptr<AudioManagerBase> audio_manager_;
+  const AudioParameters params_;
+  const scoped_refptr<base::SequencedTaskRunner> worker_task_runner_;
+  const scoped_refptr<DeterministicAudioPump> deterministic_audio_pump_;
   const base::TimeDelta fixed_data_delay_;
   raw_ptr<AudioSourceCallback> callback_;
   FakeAudioWorker fake_worker_;

@@ -23,6 +23,7 @@
 #include "base/base_switches.h"
 #include "base/check_deref.h"
 #include "base/command_line.h"
+#include "base/feature_list.h"
 #include "base/files/file_path.h"
 #include "base/functional/bind.h"
 #include "base/posix/eintr_wrapper.h"
@@ -32,8 +33,11 @@
 #include "components/viz/common/frame_sinks/begin_frame_args.h"
 #include "components/viz/common/switches.h"
 #include "content/public/common/content_switches.h"
+#include "content/public/common/content_features.h"
 #include "headless/lib/browser/headless_browser_impl.h"
 #include "headless/lib/browser/headless_web_contents_impl.h"  // nogncheck http://crbug.com/1227378
+#include "media/audio/deterministic_audio_dump.h"
+#include "media/base/media_switches.h"
 #include "third_party/libyuv/include/libyuv/convert_from_argb.h"
 #include "third_party/skia/include/core/SkBitmap.h"
 #include "third_party/skia/include/core/SkImageInfo.h"
@@ -408,6 +412,8 @@ GetEncoder(const std::string& format, int quality, bool optimize_for_speed) {
 
 void OnBeginFrameFinished(
     BitmapEncoder encoder,
+    base::TimeTicks frame_time_ticks,
+    base::TimeDelta interval,
     std::unique_ptr<HeadlessHandler::BeginFrameCallback> callback,
     bool has_damage,
     std::unique_ptr<SkBitmap> bitmap,
@@ -415,6 +421,16 @@ void OnBeginFrameFinished(
   if (!error_message.empty()) {
     callback->sendFailure(Response::ServerError(std::move(error_message)));
     return;
+  }
+  if (!encoder.is_null()) {
+    if (auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled()) {
+      std::optional<std::string> error =
+          audio_dump->CaptureInterval(frame_time_ticks, interval);
+      if (error.has_value()) {
+        callback->sendFailure(Response::ServerError(std::move(*error)));
+        return;
+      }
+    }
   }
   if (encoder.is_null()) {
     callback->sendSuccess(has_damage, std::nullopt);
@@ -480,6 +496,7 @@ Response HeadlessHandler::Disable() {
 void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
                                  std::optional<double> in_interval,
                                  std::optional<bool> in_no_display_updates,
+                                 std::optional<bool> in_audio_only,
                                  std::unique_ptr<ScreenshotParams> screenshot,
                                  std::unique_ptr<BeginFrameCallback> callback) {
   auto& headless_contents =
@@ -502,6 +519,13 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
   base::TimeTicks frame_time_ticks;
   base::TimeDelta interval;
   bool no_display_updates = in_no_display_updates.value_or(false);
+  bool audio_only = in_audio_only.value_or(false);
+
+  if (audio_only && screenshot) {
+    callback->sendFailure(Response::InvalidParams(
+        "audioOnly beginFrame cannot capture a screenshot"));
+    return;
+  }
 
   if (in_frame_time_ticks.has_value()) {
     frame_time_ticks =
@@ -524,6 +548,43 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
 
   base::TimeTicks deadline = frame_time_ticks + interval;
 
+  auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled();
+  if (audio_only && !audio_dump) {
+    callback->sendFailure(Response::ServerError(
+        "audioOnly beginFrame requires --headless-raw-audio-dump"));
+    return;
+  }
+  if (audio_dump) {
+    const base::CommandLine* command_line =
+        base::CommandLine::ForCurrentProcess();
+    if (!command_line->HasSwitch(::switches::kDisableAudioOutput)) {
+      callback->sendFailure(Response::ServerError(
+          "Deterministic audio requires --disable-audio-output"));
+      return;
+    }
+    if (command_line->HasSwitch(::switches::kMuteAudio)) {
+      callback->sendFailure(Response::ServerError(
+          "Deterministic audio cannot be used with --mute-audio"));
+      return;
+    }
+    if (base::FeatureList::IsEnabled(features::kAudioServiceOutOfProcess)) {
+      callback->sendFailure(Response::ServerError(
+          "Deterministic audio requires "
+          "--disable-features=AudioServiceOutOfProcess"));
+      return;
+    }
+    std::optional<std::string> error =
+        audio_dump->AdvanceTo(frame_time_ticks);
+    if (error.has_value()) {
+      callback->sendFailure(Response::ServerError(std::move(*error)));
+      return;
+    }
+    if (audio_only) {
+      callback->sendSuccess(false, std::nullopt);
+      return;
+    }
+  }
+
   BitmapEncoder encoder;
   if (screenshot) {
     ScreenshotParams& params = *screenshot;
@@ -543,6 +604,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
       frame_time_ticks, deadline, interval, no_display_updates,
       capture_screenshot,
       base::BindOnce(&OnBeginFrameFinished, std::move(encoder),
+                     frame_time_ticks, interval,
                      std::move(callback)));
 }
 

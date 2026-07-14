@@ -396,6 +396,7 @@ source_set("headless_browser") {
     "//content/public/app",
     "//content/public/browser",
     "//content/public/common",
+    "//media",
     "//printing/buildflags",
     "//services/cert_verifier/public/mojom",
     "//services/device/public/cpp/geolocation",

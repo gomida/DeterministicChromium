@@ -111,6 +111,8 @@ source_set("audio") {
     "audio_thread_impl.h",
     "clockless_audio_sink.cc",
     "clockless_audio_sink.h",
+    "deterministic_audio_dump.cc",
+    "deterministic_audio_dump.h",
     "fake_audio_input_stream.cc",
     "fake_audio_input_stream.h",
     "fake_audio_log_factory.cc",
