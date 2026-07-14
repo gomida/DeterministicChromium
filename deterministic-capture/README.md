@@ -313,6 +313,18 @@ first video segment. The 4K path therefore still relies on a raw-frame consumer
 fast enough for this pipe contract; the slowdown above is not attributed to
 NVENC encoding throughput.
 
+Software-rendering control runs forced the x64 release bundle to use its bundled
+SwiftShader Vulkan ICD with `VK_ICD_FILENAMES` and `LD_LIBRARY_PATH`, matching
+the arm64 local host's no-NVIDIA-rendering setup. On the x64 GPU server this did
+not produce a successful timing sample: 320x180 `SwiftShader + libx264`
+six-way, 320x180 `SwiftShader + h264_nvenc` six-way, and 320x180
+`SwiftShader + h264_nvenc` one-way all failed with
+`Failed to write async raw frame pixels: errno 32`. The failures occurred at
+chunk/frame `1/507`, `0/292`, and `3/1414` respectively. This separates the
+arm64 local success from the x64 server: forcing software Vulkan on the x64
+release binary currently breaks the deterministic raw-frame pipe before 4K
+performance can be measured.
+
 The published arm64 release archive was tested on an Ubuntu 24.04 aarch64 host
 with 8 Neoverse-V2 cores, Python 3.12.3, Playwright 1.61.0, and Ubuntu ffmpeg
 6.1.1. The host exposed `h264_nvenc` in ffmpeg's encoder list, but the default
