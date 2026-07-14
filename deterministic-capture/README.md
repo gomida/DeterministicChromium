@@ -300,6 +300,19 @@ bytes, 20,110,394 bytes, and 20,073,642 bytes with SHA-256
 Repeated NVENC MP4 files are not byte-identical; deterministic checks apply to
 the browser WAV and measured frame timeline before AAC encoding.
 
+An encoder-control run on the x64 GPU server replaced `h264_nvenc` with
+`libx264` while keeping the NVIDIA Vulkan browser path. At 320x180 it succeeded
+with `0.811s` plan loading, `11.072s` browser audio capture, `22.331s` capture
+plus mux, `34.213s` instrumented end-to-end time, and `34.32s` external wall
+time. This was close to the x64 320x180 NVENC runs, so the encoder alone does
+not explain the slower shared-GPU 4K measurements. At 3840x2160, `libx264` was
+not a stable drop-in replacement for the current async raw-frame pipe:
+`medium` six-way, `ultrafast` six-way, and `ultrafast` one-way runs all failed
+with `Failed to write async raw frame pixels: errno 32` before completing the
+first video segment. The 4K path therefore still relies on a raw-frame consumer
+fast enough for this pipe contract; the slowdown above is not attributed to
+NVENC encoding throughput.
+
 The published arm64 release archive was tested on an Ubuntu 24.04 aarch64 host
 with 8 Neoverse-V2 cores, Python 3.12.3, Playwright 1.61.0, and Ubuntu ffmpeg
 6.1.1. The host exposed `h264_nvenc` in ffmpeg's encoder list, but the default
