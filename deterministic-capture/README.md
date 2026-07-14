@@ -267,20 +267,29 @@ external wall time, and `388,904 KiB` peak parent-process RSS. Its `final.mp4`
 was 20,153,968 bytes with SHA-256
 `095d9756dac9cb8d56da647781803555a9d11904c52f7e08460ab1be42eca39c`.
 
-The published x64 release archive was then re-extracted and benchmarked twice on
-2026-07-15 KST on the same GPU server. These reruns kept the deterministic WAV
-and frame timeline, but observed slower end-to-end times than the initial build
-output run:
+The published x64 release archive was then re-extracted and benchmarked three
+times on 2026-07-15 KST on the same GPU server. The release executable and the
+original build-output executable had the same SHA-256
+`06f0518adb97c6b122e2a862583fb6cba2f0946aab0fef1b3c6f6e26dc768042`, so these
+reruns represent both paths. A resident `VLLM::EngineCore` process occupied
+about 87,998 MiB of GPU memory during the pre-run samples; those samples showed
+0% GPU utilization, but `nvidia-smi pmon` showed the VLLM process active after
+the measurement sequence. Treat these numbers as shared-GPU measurements. The
+reruns kept the deterministic WAV and frame timeline, but observed slower
+end-to-end times than the initial build output run:
 
 | run | resolution / encoder | plan | audio | capture + mux | end-to-end | external wall | peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| x64 release A | 3840x2160 / `h264_nvenc` | `0.828s` | `12.554s` | `76.907s` | `90.290s` | `90.44s` | `400,256 KiB` |
-| x64 release B | 3840x2160 / `h264_nvenc` | `0.783s` | `10.509s` | `70.803s` | `82.095s` | `82.21s` | `389,196 KiB` |
+| x64 GPU remeasure A | 3840x2160 / `h264_nvenc` | `0.801s` | `11.116s` | `70.109s` | `82.026s` | `82.13s` | `389,364 KiB` |
+| x64 GPU remeasure B | 3840x2160 / `h264_nvenc` | `0.793s` | `10.024s` | `70.231s` | `81.048s` | `81.15s` | `389,476 KiB` |
+| x64 GPU remeasure C | 3840x2160 / `h264_nvenc` | `0.792s` | `9.237s` | `74.243s` | `84.271s` | `84.38s` | `378,520 KiB` |
 
-The two release reruns produced `final.mp4` files of 20,067,683 bytes and
-20,136,100 bytes with SHA-256
-`90631996096c742f5da32b6214f2940df94bc433670f1fe41657cc7c54159fad` and
-`b0a5da8022cb277f6b6ffb275a2cef99023b5ce92a315ad129bb88ce89a70c6a`.
+The three GPU remeasurement runs averaged `82.449s` instrumented end-to-end time
+and `82.55s` external wall time. They produced `final.mp4` files of 20,190,551
+bytes, 20,110,394 bytes, and 20,073,642 bytes with SHA-256
+`830db66810562992a7fde590ed0b57c46fe195e44bac5c5735a5ce658b7b7f91`,
+`a8fabbc688943ec7e0a7c461121a1d8ea7b72adc6dc8593061f7feb5d632f162`, and
+`12b2eeaa06b82dd08d83e98a7a6bea4dde89dd3de700582c8d73fb684cdf4eb0`.
 Repeated NVENC MP4 files are not byte-identical; deterministic checks apply to
 the browser WAV and measured frame timeline before AAC encoding.
 
