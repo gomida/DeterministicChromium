@@ -131,6 +131,7 @@ source_set("blink_headers") {
     "platform/interface_registry.h",
     "platform/media/key_system_config_selector.h",
     "platform/media/video_capture.h",
+    "platform/media/web_capture_media_registry.h",
     "platform/media/web_encrypted_media_client_impl.h",
     "platform/media/web_media_player_builder.h",
     "platform/media/web_media_player_delegate.h",

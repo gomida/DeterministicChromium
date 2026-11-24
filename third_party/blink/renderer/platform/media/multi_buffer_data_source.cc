@@ -9,6 +9,8 @@
 #include <ranges>
 #include <utility>
 
+#include "media/base/deterministic_capture.h"
+
 #include "base/functional/callback_helpers.h"
 #include "base/location.h"
 #include "base/memory/raw_span.h"
@@ -424,7 +426,10 @@ void MultiBufferDataSource::Read(int64_t position,
               *render_task_runner_, FROM_HERE,
               CrossThreadBindOnce(&MultiBufferDataSource::SeekTask,
                                   weak_factory_.GetWeakPtr()),
-              kSeekDelay);
+              // DeterministicChromium: a delayed task is gated by virtual
+              // time, which a pending media transition holds; seek at once.
+              media::IsDeterministicCaptureMode() ? base::TimeDelta()
+                                                  : kSeekDelay);
         }
 
         std::move(read_cb).Run(static_cast<int>(bytes_read));

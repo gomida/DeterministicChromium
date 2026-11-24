@@ -10,6 +10,7 @@
 
 #include "base/feature_list.h"
 #include "base/functional/bind.h"
+#include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
 #include "base/functional/callback.h"
 #include "base/functional/callback_helpers.h"
 #include "base/location.h"
@@ -20,8 +21,10 @@
 #include "base/task/single_thread_task_runner.h"
 #include "base/time/default_tick_clock.h"
 #include "base/time/time.h"
+#include "base/time/time_override.h"
 #include "base/trace_event/trace_event.h"
 #include "media/base/media_log.h"
+#include "media/base/deterministic_capture.h"
 #include "media/base/media_switches.h"
 #include "media/base/pipeline_status.h"
 #include "media/base/renderer_client.h"
@@ -79,7 +82,9 @@ VideoRendererImpl::VideoRendererImpl(
       last_frame_opaque_(false),
       painted_first_frame_(false),
       min_buffered_frames_(initial_buffering_size_.value()),
-      max_buffered_frames_(initial_buffering_size_.value()) {
+      max_buffered_frames_(initial_buffering_size_.value()),
+      capture_mode_(IsDeterministicCaptureMode()),
+      capture_frames_cv_(&lock_) {
   DCHECK(create_video_decoders_cb_);
 }
 
@@ -248,6 +253,9 @@ scoped_refptr<VideoFrame> VideoRendererImpl::Render(
                                last_frame_ready_time_ >= last_render_time_);
 
   last_render_time_ = tick_clock_->NowTicks();
+
+  if (capture_mode_)
+    WaitForCoveringFrames_Locked(deadline_min, deadline_max);
 
   size_t frames_dropped = 0;
   scoped_refptr<VideoFrame> result =
@@ -587,6 +595,12 @@ void VideoRendererImpl::FrameReady(VideoDecoderStream::ReadResult result) {
   DCHECK_EQ(state_, kPlaying);
   CHECK(pending_read_);
   pending_read_ = false;
+  // Whatever this read produced (a frame, end of stream or an error), a
+  // capture-mode Render() waiting on the compositor thread must re-evaluate.
+  absl::Cleanup wake_capture_wait = [this] {
+    if (capture_mode_)
+      capture_frames_cv_.Broadcast();
+  };
 
   // Can happen when demuxers are preparing for a new Seek().
   if (!result.has_value()) {
@@ -813,6 +827,51 @@ void VideoRendererImpl::AddReadyFrame_Locked(scoped_refptr<VideoFrame> frame) {
   algorithm_->EnqueueFrame(std::move(frame));
 }
 
+void VideoRendererImpl::AttemptReadForCapture() {
+  DCHECK(task_runner_->RunsTasksInCurrentSequence());
+  base::AutoLock auto_lock(lock_);
+  AttemptRead_Locked();
+}
+
+void VideoRendererImpl::WaitForCoveringFrames_Locked(
+    base::TimeTicks deadline_min,
+    base::TimeTicks deadline_max) {
+  lock_.AssertAcquired();
+  // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
+  // time.
+  constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
+  const base::TimeTicks give_up =
+      base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
+  while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
+         state_ == kPlaying) {
+    if (algorithm_->frames_queued() > 0 &&
+        algorithm_->last_frame_end_time() >= deadline_max) {
+      return;
+    }
+    // Frames that ended before this interval still count against the
+    // buffering cap and would stop AttemptRead_Locked() from reading further.
+    if (algorithm_->frames_queued() > 0 &&
+        (algorithm_->effective_frames_queued() >= max_buffered_frames_ ||
+         algorithm_->frames_queued() >= kAbsoluteMaxFrames)) {
+      algorithm_->RemoveExpiredFrames(deadline_min);
+    }
+    if (!pending_read_ && capture_weak_this_) {
+      task_runner_->PostTask(
+          FROM_HERE, base::BindOnce(&VideoRendererImpl::AttemptReadForCapture,
+                                    capture_weak_this_));
+    }
+    capture_frames_cv_.TimedWait(base::Milliseconds(1));
+    if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {
+      ++capture_wait_timeouts_;
+      MEDIA_LOG(INFO, media_log_)
+          << "deterministic capture: video frames did not cover the render "
+             "deadline within 10 s (queued "
+          << algorithm_->frames_queued() << ")";
+      return;
+    }
+  }
+}
+
 void VideoRendererImpl::AttemptRead_Locked() {
   DCHECK(task_runner_->RunsTasksInCurrentSequence());
   lock_.AssertAcquired();
@@ -913,11 +972,23 @@ void VideoRendererImpl::StartSink() {
   DCHECK_GT(algorithm_->frames_queued(), 0u);
   sink_started_ = true;
   was_background_rendering_ = false;
+  if (capture_mode_) {
+    base::AutoLock auto_lock(lock_);
+    capture_wait_cancelled_ = false;
+    capture_weak_this_ = weak_factory_.GetWeakPtr();
+  }
   sink_->Start(this);
 }
 
 void VideoRendererImpl::StopSink() {
   DCHECK(task_runner_->RunsTasksInCurrentSequence());
+  if (capture_mode_) {
+    // sink_->Stop() blocks on the compositor's callback lock, which a
+    // Render() waiting for frames holds; release that wait first.
+    base::AutoLock auto_lock(lock_);
+    capture_wait_cancelled_ = true;
+    capture_frames_cv_.Broadcast();
+  }
   sink_->Stop();
   algorithm_->set_time_stopped();
   sink_started_ = false;

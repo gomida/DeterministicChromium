@@ -10,6 +10,8 @@ blink_platform_sources("media") {
     "buffered_data_source_host_impl.h",
     "cache_util.cc",
     "cache_util.h",
+    "capture_media_registry.cc",
+    "capture_media_registry.h",
     "cdm_result_promise.h",
     "cdm_result_promise_helper.cc",
     "cdm_result_promise_helper.h",

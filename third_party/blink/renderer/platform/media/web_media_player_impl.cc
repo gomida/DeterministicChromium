@@ -4,6 +4,10 @@
 
 #include "third_party/blink/renderer/platform/media/web_media_player_impl.h"
 
+#include "base/threading/platform_thread.h"
+#include "third_party/blink/public/platform/scheduler/web_scoped_virtual_time_pauser.h"
+#include "third_party/blink/renderer/platform/media/capture_media_registry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -637,11 +641,116 @@ WebMediaPlayerImpl::WebMediaPlayerImpl(
       base::BindPostTaskToCurrentDefault(blink::BindRepeating(
           &WebMediaPlayerImpl::OnRemotePlayStateChange, weak_this_)));
 #endif  // defined (IS_ANDROID)
+  if (CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled()) {
+    registry->Register(this);
+  }
 }
 
 WebMediaPlayerImpl::~WebMediaPlayerImpl() {
   // Ensure Shutdown() has been called.
   CHECK(!client_);
+  if (CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled()) {
+    registry->Unregister(this);
+  }
+}
+
+bool WebMediaPlayerImpl::CaptureIsStable() const {
+  if (pipeline_controller_->HasPendingOperation() || seeking_ ||
+      pending_suspend_resume_cycle_ || is_pipeline_resuming_) {
+    return false;
+  }
+  // A running, unsuspended pipeline that has not reached HAVE_FUTURE_DATA is
+  // still prerolling (after a start, seek or resume) or waiting for data. The
+  // readyState change, canplay and the autoplay play() it triggers must land
+  // at the virtual time of the request, not at a time that depends on decoder
+  // speed, so hold until the renderers report enough data. A pipeline that
+  // suspended after metadata (preload=metadata without autoplay) or was never
+  // started has nothing to wait for.
+  if (!ended_ && ready_state_ < WebMediaPlayer::kReadyStateHaveFutureData &&
+      pipeline_controller_->IsPipelineRunning() &&
+      !pipeline_controller_->IsPipelineSuspended()) {
+    return false;
+  }
+  return true;
+}
+
+void WebMediaPlayerImpl::CaptureNoteTransition() {
+  CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled();
+  if (!registry) {
+    return;
+  }
+  registry->NoteTransition();
+  // Hold renderer virtual time until the media thread has absorbed the
+  // transition and no pipeline operation is pending. The completion then
+  // lands at the virtual time of the request instead of at a time that
+  // depends on decoder speed (deterministic-capture/DESIGN.md 4.3 step 3).
+  if (!capture_pauser_held_) {
+    if (!frame_scheduler_) {
+      return;
+    }
+    capture_pauser_ = frame_scheduler_->CreateWebScopedVirtualTimePauser(
+        "DeterministicCaptureMedia",
+        WebScopedVirtualTimePauser::VirtualTaskDuration::kInstant);
+    capture_pauser_.PauseVirtualTime();
+    capture_pauser_held_ = true;
+  }
+  capture_settle_rounds_ = 0;
+  if (!capture_settle_probe_in_flight_) {
+    CapturePostSettleProbe();
+  }
+}
+
+void WebMediaPlayerImpl::CapturePostSettleProbe() {
+  capture_settle_probe_in_flight_ = true;
+  // The media thread processes posted work in order, so when this task runs
+  // every operation posted before it has been handled there. The short sleep
+  // keeps the probe from spinning while a decoder initializes on a pool
+  // thread; it cannot be a delayed task, which virtual time would gate.
+  media_task_runner_->PostTaskAndReply(
+      FROM_HERE,
+      base::BindOnce([] { base::PlatformThread::Sleep(base::Microseconds(200)); }),
+      base::BindOnce(&WebMediaPlayerImpl::CaptureSettleStep, weak_this_));
+}
+
+void WebMediaPlayerImpl::CaptureSettleStep() {
+  DCHECK(main_task_runner_->BelongsToCurrentThread());
+  capture_settle_probe_in_flight_ = false;
+  if (!capture_pauser_held_) {
+    return;
+  }
+  if (CaptureIsStable()) {
+    if (++capture_settle_rounds_ >= 2) {
+      capture_pauser_.UnpauseVirtualTime();
+      capture_pauser_held_ = false;
+      return;
+    }
+  } else {
+    capture_settle_rounds_ = 0;
+  }
+  CapturePostSettleProbe();
+}
+
+void WebMediaPlayerImpl::CaptureState(WebCaptureMediaState* out) const {
+  DCHECK(main_task_runner_->BelongsToCurrentThread());
+  out->player_id = player_id_;
+  out->media_time_ms = GetCurrentTimeInternal().InMillisecondsF();
+  out->has_video = HasVideo();
+  out->has_audio = HasAudio();
+  const bool pipeline_busy = pipeline_controller_->HasPendingOperation();
+  out->stable = CaptureIsStable();
+  if (ended_) {
+    out->state = "ended";
+  } else if (seeking_) {
+    out->state = "seeking";
+  } else if (pipeline_busy) {
+    out->state = ready_state_ < WebMediaPlayer::kReadyStateHaveMetadata
+                     ? "starting"
+                     : "transition";
+  } else if (!pipeline_controller_->IsPipelineRunning()) {
+    out->state = "idle";
+  } else {
+    out->state = paused_ ? "paused" : "playing";
+  }
 }
 
 void WebMediaPlayerImpl::Shutdown() {
@@ -1017,6 +1126,7 @@ void WebMediaPlayerImpl::UnlockBackgroundPlayback() {
 void WebMediaPlayerImpl::Play() {
   DVLOG(1) << __func__;
   DCHECK(main_task_runner_->BelongsToCurrentThread());
+  CaptureNoteTransition();
 
   // User initiated play unlocks background video playback.
   if (has_transient_user_activation_cb_.Run()) {
@@ -1058,6 +1168,7 @@ void WebMediaPlayerImpl::Play() {
 void WebMediaPlayerImpl::Pause(PauseReason pause_reason) {
   DVLOG(1) << __func__;
   DCHECK(main_task_runner_->BelongsToCurrentThread());
+  CaptureNoteTransition();
 
   // We update the paused state even when casting, since we expect pause() to be
   // called when casting begins, and when we exit casting we should end up in a
@@ -1128,6 +1239,7 @@ void WebMediaPlayerImpl::Seek(double seconds) {
 
 void WebMediaPlayerImpl::DoSeek(base::TimeDelta time, bool time_updated) {
   DCHECK(main_task_runner_->BelongsToCurrentThread());
+  CaptureNoteTransition();
   TRACE_EVENT2("media", "WebMediaPlayerImpl::DoSeek", "target",
                time.InSecondsF(), "id", media_player_id_);
 
@@ -1224,6 +1336,7 @@ void WebMediaPlayerImpl::DoSeek(base::TimeDelta time, bool time_updated) {
 void WebMediaPlayerImpl::SetRate(double rate) {
   DVLOG(1) << __func__ << "(" << rate << ")";
   DCHECK(main_task_runner_->BelongsToCurrentThread());
+  CaptureNoteTransition();
 
   if (rate != playback_rate_) {
     LIMITED_MEDIA_LOG(INFO, media_log_.get(), num_playback_rate_logs_,
@@ -3059,6 +3172,7 @@ media::PipelineStatus WebMediaPlayerImpl::OnDemuxerCreated(
     bool is_static) {
   CHECK_NE(demuxer, nullptr);
   seeking_ = true;
+  CaptureNoteTransition();
 
   if (start_type != media::Pipeline::StartType::kNormal) {
     attempting_suspended_start_ = true;
@@ -3274,6 +3388,7 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
       preroll_attempt_pending_ = true;
       preroll_attempt_start_time_ = base::TimeTicks();
     }
+    CaptureNoteTransition();
     pipeline_controller_->Suspend();
   } else {
     // When resuming, start the preroll attempt clock.
@@ -3281,6 +3396,7 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
       preroll_attempt_pending_ = false;
       preroll_attempt_start_time_ = tick_clock_->NowTicks();
     }
+    CaptureNoteTransition();
     pipeline_controller_->Resume();
   }
 }

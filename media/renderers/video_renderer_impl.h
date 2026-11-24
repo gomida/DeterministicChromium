@@ -133,6 +133,11 @@ class MEDIA_EXPORT VideoRendererImpl
   // capacity.
   void AttemptRead_Locked();
 
+  // Capture mode: issues a read from the media thread while a Render() waits.
+  void AttemptReadForCapture();
+  void WaitForCoveringFrames_Locked(base::TimeTicks deadline_min,
+                                    base::TimeTicks deadline_max);
+
   // Called when VideoDecoderStream::Reset() completes.
   void OnVideoDecoderStreamResetDone();
 
@@ -236,6 +241,17 @@ class MEDIA_EXPORT VideoRendererImpl
 
   // Used for accessing data members.
   base::Lock lock_;
+
+  // DeterministicChromium (deterministic-capture/DESIGN.md 4.5): in capture
+  // mode Render() waits, with |lock_| released, until the queued frames cover
+  // the render deadline or end of stream, so the selected frame does not
+  // depend on decode speed. FrameReady() signals; StopSink() cancels before
+  // the sink takes its callback lock so the two threads cannot deadlock.
+  const bool capture_mode_;
+  base::ConditionVariable capture_frames_cv_;
+  bool capture_wait_cancelled_ = false;
+  int capture_wait_timeouts_ = 0;
+  base::WeakPtr<VideoRendererImpl> capture_weak_this_;
 
   raw_ptr<RendererClient> client_;
 

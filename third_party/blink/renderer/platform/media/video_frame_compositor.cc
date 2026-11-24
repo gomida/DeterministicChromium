@@ -13,6 +13,7 @@
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
 #include "components/viz/common/frame_sinks/begin_frame_args.h"
+#include "media/base/deterministic_capture.h"
 #include "media/base/media_switches.h"
 #include "media/base/video_frame.h"
 #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
@@ -50,6 +51,12 @@ VideoFrameCompositor::VideoFrameCompositor(
               &VideoFrameCompositor::StopForceBeginFrames,
               CrossThreadUnretained(this)))),
       submitter_(std::move(submitter)) {
+  // DeterministicChromium: the 250 ms background render would call Render()
+  // at a real-time-dependent virtual time; frames are selected only by
+  // BeginFrames in capture mode (deterministic-capture/DESIGN.md 4.5).
+  if (media::IsDeterministicCaptureMode()) {
+    background_rendering_enabled_ = false;
+  }
   if (submitter_) {
     PostCrossThreadTask(
         *task_runner_, FROM_HERE,

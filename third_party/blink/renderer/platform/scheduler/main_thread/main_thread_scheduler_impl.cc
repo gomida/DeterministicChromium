@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "base/check_op.h"
+#include "base/command_line.h"
 #include "base/feature_list.h"
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
@@ -249,6 +250,23 @@ BASE_FEATURE(kLoadingModeFromPerformanceScenario,
 }  // namespace
 
 
+
+namespace {
+
+// DeterministicChromium: under --deterministic-capture, pausing virtual time
+// stops the clock but not the main thread. Media pipeline transitions hold a
+// virtual-time pauser until the media thread has settled; their completion
+// callbacks run on fenced queues, so the fence would deadlock the grant.
+// Delayed tasks remain gated by virtual time either way
+// (deterministic-capture/DESIGN.md 4.3 steps 1 and 3). Applies to the fences
+// inserted when virtual time stops and to queues created while it is stopped.
+bool FenceQueuesWhileVirtualTimePaused() {
+  static const bool capture =
+      base::CommandLine::ForCurrentProcess()->HasSwitch("deterministic-capture");
+  return !capture;
+}
+
+}  // namespace
 
 MainThreadSchedulerImpl::MainThreadSchedulerImpl(
     std::unique_ptr<base::sequence_manager::SequenceManager> sequence_manager)
@@ -826,7 +844,8 @@ scoped_refptr<MainThreadTaskQueue> MainThreadSchedulerImpl::NewTaskQueue(
   // be suspended by adding a fence to prevent immediate tasks from running when
   // they're not supposed to.
   if (!VirtualTimeAllowedToAdvance() &&
-      !task_queue->CanRunWhenVirtualTimePaused()) {
+      !task_queue->CanRunWhenVirtualTimePaused() &&
+      FenceQueuesWhileVirtualTimePaused()) {
     task_queue->GetTaskQueue()->InsertFence(
         TaskQueue::InsertFencePosition::kNow);
   }
@@ -2013,6 +2032,9 @@ void MainThreadSchedulerImpl::OnVirtualTimeDisabled() {
 }
 
 void MainThreadSchedulerImpl::OnVirtualTimePaused() {
+  if (!FenceQueuesWhileVirtualTimePaused()) {
+    return;
+  }
   for (const auto& pair : task_runners_) {
     if (pair.first->CanRunWhenVirtualTimePaused())
       continue;
@@ -2023,6 +2045,9 @@ void MainThreadSchedulerImpl::OnVirtualTimePaused() {
 }
 
 void MainThreadSchedulerImpl::OnVirtualTimeResumed() {
+  if (!FenceQueuesWhileVirtualTimePaused()) {
+    return;
+  }
   for (const auto& pair : task_runners_) {
     if (pair.first->CanRunWhenVirtualTimePaused())
       continue;

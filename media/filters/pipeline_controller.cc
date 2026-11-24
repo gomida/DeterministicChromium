@@ -146,6 +146,26 @@ bool PipelineController::IsStable() {
   return state_ == State::PLAYING;
 }
 
+bool PipelineController::HasPendingOperation() {
+  DCHECK(thread_checker_.CalledOnValidThread());
+  switch (state_) {
+    case State::STARTING:
+    case State::SEEKING:
+    case State::SWITCHING_TRACKS:
+    case State::SUSPENDING:
+    case State::RESUMING:
+      return true;
+    case State::STOPPED:
+    case State::PLAYING:
+    case State::PLAYING_OR_SUSPENDED:
+    case State::SUSPENDED:
+      break;
+  }
+  return pending_seek_ || pending_suspend_ || pending_resume_ ||
+         pending_audio_track_change_ || pending_video_track_change_ ||
+         pending_seeked_cb_;
+}
+
 bool PipelineController::IsPendingSeek() {
   DCHECK(thread_checker_.CalledOnValidThread());
   return pending_seek_except_start_;

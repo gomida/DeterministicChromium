@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "base/feature_list.h"
+#include "media/base/deterministic_capture.h"
 #include "base/functional/bind.h"
 #include "base/memory/weak_ptr.h"
 #include "base/metrics/histogram_functions.h"
@@ -500,6 +501,13 @@ void VideoFrameSubmitter::OnBeginFrame(
   base::TimeTicks deadline_min = args.frame_time + vsync_interval;
   base::TimeTicks deadline_max =
       args.frame_time + args.interval + vsync_interval;
+  if (media::IsDeterministicCaptureMode()) {
+    // DeterministicChromium: the captured frame for BeginFrame(T) is frame T
+    // itself, not the frame displayed one vsync later, so render for
+    // [T, T + interval] (deterministic-capture/DESIGN.md 4.3 step 6).
+    deadline_min = args.frame_time;
+    deadline_max = args.frame_time + args.interval;
+  }
   // Default expected display time for tracing: the end of the BeginFrame
   // deadline window (two intervals after frame_time). This is unrelated to how
   // |average_delta_between_receive_and_present_| is computed: that EMA is built

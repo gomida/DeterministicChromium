@@ -46,6 +46,8 @@
 #include "mojo/public/cpp/bindings/pending_remote.h"
 #include "mojo/public/cpp/bindings/remote.h"
 #include "services/media_session/public/cpp/media_position.h"
+#include "third_party/blink/public/platform/media/web_capture_media_registry.h"
+#include "third_party/blink/public/platform/scheduler/web_scoped_virtual_time_pauser.h"
 #include "third_party/blink/public/platform/media/web_media_player_builder.h"
 #include "third_party/blink/public/platform/media/web_media_player_delegate.h"
 #include "third_party/blink/public/platform/web_audio_source_provider.h"
@@ -181,6 +183,11 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
                                   const WebMediaPlayerSource& source,
                                   CorsMode cors_mode,
                                   bool is_cache_disabled) override;
+
+  // DeterministicChromium: state for the renderer's CaptureAgent
+  // (deterministic-capture/DESIGN.md 4.3 step 3). Main thread.
+  void CaptureState(WebCaptureMediaState* out) const;
+  bool CaptureIsStable() const;
 
   // Playback controls.
   void Play() override;
@@ -750,6 +757,17 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
 
   // Scheduler of the frame the player belongs to.
   raw_ptr<FrameScheduler> frame_scheduler_ = nullptr;
+
+  // DeterministicChromium: every play, pause, seek, rate change, suspend and
+  // resume holds virtual time until the pipeline is stable again (see
+  // CaptureNoteTransition()). No-ops outside --deterministic-capture.
+  void CaptureNoteTransition();
+  void CapturePostSettleProbe();
+  void CaptureSettleStep();
+  WebScopedVirtualTimePauser capture_pauser_;
+  bool capture_pauser_held_ = false;
+  bool capture_settle_probe_in_flight_ = false;
+  int capture_settle_rounds_ = 0;
 
   // Returns whether the user recently interacted with the frame, to tell
   // user-initiated play and pause apart.

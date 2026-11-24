@@ -120,6 +120,11 @@ class MEDIA_EXPORT PipelineController {
   //   - Resume() is processed immediately while in the SUSPENDED state.
   bool IsStable();
 
+  // DeterministicChromium: true while a start, seek, suspend, resume or track
+  // change is in flight or queued. A player that was never started and one
+  // that is playing or fully suspended both report false.
+  bool HasPendingOperation();
+
   // Returns true if the current target state is suspended.
   bool IsSuspended();
 
