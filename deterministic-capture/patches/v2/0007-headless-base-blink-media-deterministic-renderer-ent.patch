@@ -1,0 +1,1008 @@
+From 512568fb1da37177a0f6a0aa23709b23a10e25f0 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 21:14:41 +0900
+Subject: [PATCH 7/8] headless, base, blink, media: deterministic renderer
+ entropy, unsupported-API detection, review fixes
+
+Patches 9 (partial) and 10 of the deterministic capture series, plus the
+fixes from the code review of patches 6-8.
+
+Entropy (patch 9): base::subtle::SetRandBytesOverride in the new header
+base/rand_util_deterministic_capture.h (rand_util.h untouched) lets a
+--deterministic-capture renderer replace the OS entropy source behind
+base::RandBytes with a seeded xoshiro256** stream
+(--deterministic-capture-seed, default 1); crypto.getRandomValues,
+crypto.randomUUID and the renderer's UUIDs repeat run to run. Blob URL
+identifiers are minted in the browser process and still vary.
+
+Unsupported APIs (patch 10): CaptureAgent observes use counters
+(DidObserveNewFeatureUsage) for getUserMedia, getDisplayMedia,
+RTCPeerConnection, MediaRecorder, EncryptedMedia, captureStream, WebCodecs,
+WebGPU, ServiceWorker, SharedWorker and setSinkId; UseCounterImpl notifies the
+frame client for file:// and about: documents in capture mode (only http(s)
+did). Each API is reported once per document as a warning, or as the error
+UnsupportedApiUsed when media.failOnUnsupportedApi is true (default).
+
+Review fixes:
+- WebMediaPlayerImpl releases the virtual-time pauser on OnError, treats an
+  errored network state as stable and gives up a hold after 20 s real time, so
+  a failed or stalled pipeline cannot freeze the renderer's clock.
+- AudioRendererImpl keeps the capture sink for muted elements instead of the
+  real-time null sink (the sink applies the volume), never waits for decoded
+  audio on the media thread itself, and creates its weak pointer on the media
+  thread.
+- CaptureAudioEngine holds scoped_refptrs to its sinks; a sink leaves the
+  list in Stop(), not in its destructor; the engine lock is never taken under
+  a sink lock; the volume is an atomic.
+- VideoRendererImpl reads past the soft buffering cap while a capture wait
+  needs more frames (sources faster than three times the capture rate).
+- CaptureSession counts audio sample frames only when the ring slot was
+  written, keeps the resolved markers/media/audio defaults in the effective
+  configuration, and sizes the prepare timer for the renderer's worst case.
+- RawFrameSink validates the slot geometry including the audio area.
+- Patch version 2.1.0-p10.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ base/BUILD.gn                                 |  1 +
+ base/rand_util_deterministic_capture.h        | 27 ++++++++
+ base/rand_util_posix.cc                       | 18 +++++
+ headless/BUILD.gn                             |  2 +
+ .../lib/browser/capture/capture_session.cc    | 26 +++++--
+ .../lib/browser/capture/capture_session.h     |  2 +
+ .../lib/browser/capture/raw_frame_sink.cc     |  2 +-
+ .../headless_content_browser_client.cc        |  1 +
+ headless/lib/renderer/capture_agent.cc        | 47 +++++++++++++
+ headless/lib/renderer/capture_agent.h         |  7 ++
+ headless/lib/renderer/capture_audio.cc        | 69 ++++++++++++-------
+ headless/lib/renderer/capture_audio.h         |  8 ++-
+ headless/lib/renderer/capture_random.cc       | 69 +++++++++++++++++++
+ headless/lib/renderer/capture_random.h        | 21 ++++++
+ .../headless_content_renderer_client.cc       |  7 ++
+ headless/public/switches.h                    |  4 ++
+ media/renderers/audio_renderer_impl.cc        | 23 +++++--
+ media/renderers/audio_renderer_impl.h         |  1 +
+ media/renderers/video_renderer_impl.cc        | 10 ++-
+ media/renderers/video_renderer_impl.h         |  1 +
+ .../renderer/core/frame/use_counter_impl.cc   | 10 +++
+ .../platform/media/web_media_player_impl.cc   | 27 +++++++-
+ .../platform/media/web_media_player_impl.h    |  2 +
+ 23 files changed, 347 insertions(+), 38 deletions(-)
+ create mode 100644 base/rand_util_deterministic_capture.h
+ create mode 100644 headless/lib/renderer/capture_random.cc
+ create mode 100644 headless/lib/renderer/capture_random.h
+
+diff --git a/base/BUILD.gn b/base/BUILD.gn
+index c71d7a6434..c74dc31a76 100644
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -673,6 +673,7 @@ component("base") {
+     "profiler/unwinder.h",
+     "rand_util.cc",
+     "rand_util.h",
++    "rand_util_deterministic_capture.h",
+     "run_loop.cc",
+     "run_loop.h",
+     "sampling_heap_profiler/lock_free_address_hash_set.cc",
+diff --git a/base/rand_util_deterministic_capture.h b/base/rand_util_deterministic_capture.h
+new file mode 100644
+index 0000000000..ec8cc4d0cf
+--- /dev/null
++++ b/base/rand_util_deterministic_capture.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef BASE_RAND_UTIL_DETERMINISTIC_CAPTURE_H_
++#define BASE_RAND_UTIL_DETERMINISTIC_CAPTURE_H_
++
++#include <stdint.h>
++
++#include "base/base_export.h"
++#include "base/containers/span.h"
++
++namespace base::subtle {
++
++// DeterministicChromium: replaces the OS entropy source behind base::RandBytes
++// (and so crypto::RandBytes, base::Uuid, blob URLs and crypto.getRandomValues)
++// for the whole process. Installed only by renderers started with
++// --deterministic-capture so that a capture's random values repeat from run to
++// run (deterministic-capture/DESIGN.md 4.8). Kept out of rand_util.h so the
++// hook does not recompile everything that includes it. Never set in ordinary
++// builds; the function must not allocate.
++using RandBytesOverrideFunction = void (*)(span<uint8_t> output);
++BASE_EXPORT void SetRandBytesOverride(RandBytesOverrideFunction function);
++
++}  // namespace base::subtle
++
++#endif  // BASE_RAND_UTIL_DETERMINISTIC_CAPTURE_H_
+diff --git a/base/rand_util_posix.cc b/base/rand_util_posix.cc
+index 71bb35a2ff..559975eac2 100644
+--- a/base/rand_util_posix.cc
++++ b/base/rand_util_posix.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "base/rand_util.h"
++#include "base/rand_util_deterministic_capture.h"
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -21,6 +22,8 @@
+ #else
+ #include <errno.h>
+ #include <fcntl.h>
++
++#include <atomic>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
+@@ -92,7 +95,14 @@ bool GetRandomSyscall(void* output, size_t output_length) {
+ #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) ||
+         // BUILDFLAG(IS_ANDROID)
+ 
++std::atomic<subtle::RandBytesOverrideFunction> g_rand_bytes_override{nullptr};
++
+ void RandBytesInternal(span<uint8_t> output, bool avoid_allocation) {
++  if (subtle::RandBytesOverrideFunction override =
++          g_rand_bytes_override.load(std::memory_order_acquire)) {
++    override(output);
++    return;
++  }
+   if (!avoid_allocation) {
+     // BoringSSL's RAND_bytes always returns 1. Any error aborts the program.
+     (void)RAND_bytes(output.data(), output.size());
+@@ -148,4 +158,12 @@ int GetUrandomFD() {
+ }
+ #endif  // !BUILDFLAG(IS_APPLE)
+ 
++namespace subtle {
++
++void SetRandBytesOverride(RandBytesOverrideFunction function) {
++  g_rand_bytes_override.store(function, std::memory_order_release);
++}
++
++}  // namespace subtle
++
+ }  // namespace base
+diff --git a/headless/BUILD.gn b/headless/BUILD.gn
+index 9e8a2d0ad2..0f6f496fc2 100644
+--- a/headless/BUILD.gn
++++ b/headless/BUILD.gn
+@@ -246,6 +246,8 @@ source_set("headless_renderer") {
+     "lib/renderer/capture_agent.h",
+     "lib/renderer/capture_audio.cc",
+     "lib/renderer/capture_audio.h",
++    "lib/renderer/capture_random.cc",
++    "lib/renderer/capture_random.h",
+     "lib/renderer/headless_content_renderer_client.cc",
+     "lib/renderer/headless_content_renderer_client.h",
+   ]
+diff --git a/headless/lib/browser/capture/capture_session.cc b/headless/lib/browser/capture/capture_session.cc
+index 26cee7a0b4..9eeeeb23fd 100644
+--- a/headless/lib/browser/capture/capture_session.cc
++++ b/headless/lib/browser/capture/capture_session.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <string_view>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+@@ -177,6 +178,7 @@ void CaptureSession::Configure(base::DictValue config,
+     }
+   }
+   RawFrameSink::Config sink_config;
++  effective_config_ = config.Clone();  // the sections below add their resolved defaults
+   if (const base::DictValue* markers = config.FindDict("markers")) {
+     if (const std::string* prefix = markers->FindString("prefix")) {
+       marker_prefix_ = *prefix;
+@@ -220,6 +222,7 @@ void CaptureSession::Configure(base::DictValue config,
+       media_wait_timeout_ms_ = *ms;
+     }
+     fail_on_media_wait_timeout_ = media->FindBool("failOnWaitTimeout").value_or(true);
++    fail_on_unsupported_api_ = media->FindBool("failOnUnsupportedApi").value_or(true);
+   }
+   base::DictValue effective_markers;
+   effective_markers.Set("prefix", marker_prefix_);
+@@ -232,6 +235,7 @@ void CaptureSession::Configure(base::DictValue config,
+   base::DictValue effective_media;
+   effective_media.Set("waitTimeoutMs", media_wait_timeout_ms_);
+   effective_media.Set("failOnWaitTimeout", fail_on_media_wait_timeout_);
++  effective_media.Set("failOnUnsupportedApi", fail_on_unsupported_api_);
+   effective_config_.Set("media", std::move(effective_media));
+   if (const base::DictValue* sink = config.FindDict("frameSink")) {
+     const std::string* type = sink->FindString("type");
+@@ -264,7 +268,6 @@ void CaptureSession::Configure(base::DictValue config,
+   sink_config.audio_channels = static_cast<uint32_t>(audio_channels_);
+   sink_config.audio_format = audio_s16_ ? ring::kAudioFormatS16 : ring::kAudioFormatF32;
+   sink_ = std::make_unique<RawFrameSink>(sink_config);
+-  effective_config_ = config.Clone();
+   effective_config_.Set("protocolVersion", kProtocolVersion);
+   effective_config_.Set("pixelFormat", kCanonicalPixelFormat);
+   // Opening maps the ring or creates the file; keep it off the UI thread.
+@@ -403,7 +406,9 @@ void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
+   params->render_audio = true;
+   params->audio_frames_through = AudioSamplesThrough(index + 1);
+   prepare_pending_ = std::move(pending);
+-  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
++  // The renderer may spend the quiescence wait plus one 10 s decode wait each
++  // for video and audio before it answers.
++  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 25000),
+                        base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
+   agent_->Prepare(std::move(params),
+                   base::BindOnce(&CaptureSession::OnPrepared, weak_factory_.GetWeakPtr(), index));
+@@ -450,8 +455,18 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
+     m.Set("hasAudio", media->has_audio);
+     pending->media.Append(std::move(m));
+   }
++  static constexpr std::string_view kUnsupportedPrefix = "UnsupportedApiUsed: ";
+   for (const std::string& warning : result->warnings) {
+     pending->warnings.Append(warning);
++    if (fail_on_unsupported_api_ && warning.starts_with(kUnsupportedPrefix)) {
++      base::DictValue details;
++      details.Set("api", warning.substr(kUnsupportedPrefix.size()));
++      details.Set("frameIndex", static_cast<double>(frame_index));
++      Error err{"UnsupportedApiUsed", warning, std::move(details)};
++      Fail(err);
++      std::move(pending->callback).Run(err, base::DictValue());
++      return;
++    }
+   }
+   if (result->audio_frames > 0 || !result->pcm.empty()) {
+     const int64_t expected = AudioSamplesThrough(frame_index + 1) - AudioSamplesThrough(frame_index);
+@@ -486,8 +501,7 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
+     pcm_chain_hash_ = ChainHash(pcm_chain_hash_, pending->pcm_frame_hash);
+     pending->audio_frames = result->audio_frames;
+     if (pending->capture_audio) {
+-      pending->audio = std::move(bytes);
+-      audio_sample_frames_ += result->audio_frames;
++      pending->audio = std::move(bytes);  // counted when the slot is written
+     }
+   }
+   if (!result->timed_out_players.empty()) {
+@@ -648,6 +662,9 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
+                 slot.audio = std::move(audio);
+                 slot.audio_frames = audio_frames;
+                 out.sink_error = sink->Write(slot);
++                if (!out.sink_error) {
++                  out.audio_frames_written = audio_frames;
++                }
+                 out.sink = base::TimeTicks::Now() - t1;
+               }
+               return out;
+@@ -673,6 +690,7 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
+ 
+ void CaptureSession::OnFrameProcessed(Processed processed) {
+   --inflight_;
++  audio_sample_frames_ += processed.audio_frames_written;
+   hash_ms_.push_back(processed.hash.InMillisecondsF());
+   sink_ms_.push_back(processed.sink.InMillisecondsF());
+   if (!processed.frame_hash.empty()) {
+diff --git a/headless/lib/browser/capture/capture_session.h b/headless/lib/browser/capture/capture_session.h
+index 308a2e8a73..c134bb2505 100644
+--- a/headless/lib/browser/capture/capture_session.h
++++ b/headless/lib/browser/capture/capture_session.h
+@@ -111,6 +111,7 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+     std::optional<SinkError> sink_error;
+     base::TimeDelta hash;
+     base::TimeDelta sink;
++    uint32_t audio_frames_written = 0;
+   };
+   struct PendingAdvance {
+     int64_t frame_index;
+@@ -207,6 +208,7 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+   std::string pcm_chain_hash_;
+   double media_wait_timeout_ms_ = 10000;
+   bool fail_on_media_wait_timeout_ = true;
++  bool fail_on_unsupported_api_ = true;
+   std::unique_ptr<RawFrameSink> sink_;
+   bool sink_wants_frames_ = false;
+   scoped_refptr<base::SequencedTaskRunner> worker_;
+diff --git a/headless/lib/browser/capture/raw_frame_sink.cc b/headless/lib/browser/capture/raw_frame_sink.cc
+index b507613352..5c558ac6bd 100644
+--- a/headless/lib/browser/capture/raw_frame_sink.cc
++++ b/headless/lib/browser/capture/raw_frame_sink.cc
+@@ -146,7 +146,7 @@ std::optional<SinkError> RawFrameSink::OpenRing() {
+   ring_width_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffWidth));
+   ring_height_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffHeight));
+   const uint64_t needed = ring::kHeaderBytes + static_cast<uint64_t>(slot_count_) * slot_bytes_;
+-  if (slot_count_ == 0 || slot_bytes_ < ring::kSlotHeaderBytes + video_bytes_ || needed > ring_size_ ||
++  if (slot_count_ == 0 || slot_bytes_ < ring::kSlotHeaderBytes + video_bytes_ + ring_audio_bytes_ || needed > ring_size_ ||
+       video_bytes_ != CanonicalBytes(ring_width_, ring_height_)) {
+     return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring geometry is inconsistent"};
+   }
+diff --git a/headless/lib/browser/headless_content_browser_client.cc b/headless/lib/browser/headless_content_browser_client.cc
+index 7ac750491f..d0c5294869 100644
+--- a/headless/lib/browser/headless_content_browser_client.cc
++++ b/headless/lib/browser/headless_content_browser_client.cc
+@@ -343,6 +343,7 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
+         // The renderer installs the capture agent and audio sinks when set.
+         switches::kDeterministicCapture,
+         switches::kDeterministicCaptureAudio,
++        switches::kDeterministicCaptureSeed,
+         switches::kDisablePDFTagging,
+     };
+     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);
+diff --git a/headless/lib/renderer/capture_agent.cc b/headless/lib/renderer/capture_agent.cc
+index a4b33b3dee..ab091bef63 100644
+--- a/headless/lib/renderer/capture_agent.cc
++++ b/headless/lib/renderer/capture_agent.cc
+@@ -20,6 +20,8 @@
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time_override.h"
+ #include "content/public/common/isolated_world_ids.h"
++#include "third_party/blink/public/common/use_counter/use_counter_feature.h"
++#include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom.h"
+ #include "gin/converter.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
+ #include "third_party/blink/public/platform/media/web_capture_media_registry.h"
+@@ -68,6 +70,47 @@ void CaptureAgent::OnDestruct() {
+ 
+ void CaptureAgent::DidCreateNewDocument() {
+   reported_marks_.clear();
++  unsupported_reported_.clear();
++}
++
++void CaptureAgent::DidObserveNewFeatureUsage(const blink::UseCounterFeature& feature) {
++  // Use counters for APIs whose results depend on real devices, real time or
++  // other processes (DESIGN.md 4.9). The names are the contract's vocabulary.
++  struct Entry {
++    blink::mojom::WebFeature feature;
++    const char* api;
++  };
++  static constexpr Entry kUnsupported[] = {
++    {blink::mojom::WebFeature::kSharedWorkerStart, "SharedWorker"},
++    {blink::mojom::WebFeature::kEncryptedMediaSecureOrigin, "EncryptedMedia"},
++    {blink::mojom::WebFeature::kServiceWorkerControlledPage, "ServiceWorker"},
++    {blink::mojom::WebFeature::kRTCPeerConnectionConstructorConstraints, "RTCPeerConnection"},
++    {blink::mojom::WebFeature::kRTCPeerConnectionConstructorCompliant, "RTCPeerConnection"},
++    {blink::mojom::WebFeature::kGetUserMediaPrefixed, "getUserMedia"},
++    {blink::mojom::WebFeature::kGetUserMediaLegacy, "getUserMedia"},
++    {blink::mojom::WebFeature::kGetUserMediaPromise, "getUserMedia"},
++    {blink::mojom::WebFeature::kGetDisplayMedia, "getDisplayMedia"},
++    {blink::mojom::WebFeature::kCanvasCaptureStream, "captureStream"},
++    {blink::mojom::WebFeature::kMediaRecorder_MimeType, "MediaRecorder"},
++    {blink::mojom::WebFeature::kMediaRecorder_VideoBitsPerSecond, "MediaRecorder"},
++    {blink::mojom::WebFeature::kMediaRecorder_AudioBitsPerSecond, "MediaRecorder"},
++    {blink::mojom::WebFeature::kWebCodecsAudioDecoder, "WebCodecs"},
++    {blink::mojom::WebFeature::kWebCodecsVideoDecoder, "WebCodecs"},
++    {blink::mojom::WebFeature::kWebCodecsVideoEncoder, "WebCodecs"},
++    {blink::mojom::WebFeature::kWebCodecsVideoTrackReader, "WebCodecs"},
++    {blink::mojom::WebFeature::kHTMLMediaElementSetSinkId, "setSinkId"},
++    {blink::mojom::WebFeature::kWebGPURequestAdapter, "WebGPU"},
++    {blink::mojom::WebFeature::kAudioContextSetSinkId, "setSinkId"},
++  };
++  if (feature.type() != blink::mojom::UseCounterFeatureType::kWebFeature) {
++    return;
++  }
++  for (const Entry& entry : kUnsupported) {
++    if (static_cast<uint32_t>(entry.feature) == feature.value() &&
++        unsupported_reported_.insert(entry.api).second) {
++      unsupported_pending_.push_back(entry.api);
++    }
++  }
+ }
+ 
+ void CaptureAgent::BindReceiver(
+@@ -190,6 +233,10 @@ void CaptureAgent::OnAudioRendered(std::unique_ptr<Pending> pending,
+   for (const std::string& api : CaptureAudioEngine::Get()->TakeUnsupported()) {
+     result->warnings.push_back("UnsupportedApiUsed: " + api);
+   }
++  for (const std::string& api : unsupported_pending_) {
++    result->warnings.push_back("UnsupportedApiUsed: " + api);
++  }
++  unsupported_pending_.clear();
+   FlushMediaEvents(std::move(pending), std::move(result), 0);
+ }
+ 
+diff --git a/headless/lib/renderer/capture_agent.h b/headless/lib/renderer/capture_agent.h
+index 31148b222c..d2f2e77713 100644
+--- a/headless/lib/renderer/capture_agent.h
++++ b/headless/lib/renderer/capture_agent.h
+@@ -6,8 +6,10 @@
+ #define HEADLESS_LIB_RENDERER_CAPTURE_AGENT_H_
+ 
+ #include <map>
++#include <set>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
+@@ -33,6 +35,7 @@ class CaptureAgent : public content::RenderFrameObserver,
+   // content::RenderFrameObserver:
+   void OnDestruct() override;
+   void DidCreateNewDocument() override;
++  void DidObserveNewFeatureUsage(const blink::UseCounterFeature& feature) override;
+ 
+   // mojom::CaptureAgent:
+   void Prepare(mojom::PrepareParamsPtr params, PrepareCallback callback) override;
+@@ -62,6 +65,10 @@ class CaptureAgent : public content::RenderFrameObserver,
+   // (name, startTime) -> occurrences already reported, so each mark is
+   // reported once even though performance.getEntriesByType returns all.
+   std::map<std::pair<std::string, double>, int> reported_marks_;
++  // APIs outside the capture contract seen since the last Prepare, and the
++  // ones already reported once for this document (DESIGN.md 4.9).
++  std::vector<std::string> unsupported_pending_;
++  std::set<std::string> unsupported_reported_;
+   base::WeakPtrFactory<CaptureAgent> weak_factory_{this};
+ };
+ 
+diff --git a/headless/lib/renderer/capture_audio.cc b/headless/lib/renderer/capture_audio.cc
+index 0d8a75b094..d4a6f41c16 100644
+--- a/headless/lib/renderer/capture_audio.cc
++++ b/headless/lib/renderer/capture_audio.cc
+@@ -74,12 +74,24 @@ scoped_refptr<base::SingleThreadTaskRunner> CaptureAudioEngine::task_runner() co
+ 
+ void CaptureAudioEngine::AddSink(CaptureAudioRendererSink* sink) {
+   base::AutoLock lock(lock_);
+-  sinks_.push_back(sink);
++  for (const auto& existing : sinks_) {
++    if (existing.get() == sink) {
++      return;
++    }
++  }
++  sinks_.push_back(base::WrapRefCounted(sink));
+ }
+ 
+ void CaptureAudioEngine::RemoveSink(CaptureAudioRendererSink* sink) {
++  scoped_refptr<CaptureAudioRendererSink> dropped;  // released outside the lock
+   base::AutoLock lock(lock_);
+-  std::erase(sinks_, sink);
++  for (auto it = sinks_.begin(); it != sinks_.end(); ++it) {
++    if (it->get() == sink) {
++      dropped = std::move(*it);
++      sinks_.erase(it);
++      break;
++    }
++  }
+ }
+ 
+ void CaptureAudioEngine::NoteUnsupported(const std::string& api) {
+@@ -104,7 +116,7 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
+                                              scoped_refptr<base::SequencedTaskRunner> reply_runner) {
+   const int64_t need64 = frames_through - rendered_through_;
+   const int frames = static_cast<int>(std::clamp<int64_t>(need64, 0, 1 << 24));
+-  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks;
++  std::vector<scoped_refptr<CaptureAudioRendererSink>> sinks;
+   {
+     base::AutoLock lock(lock_);
+     sinks = sinks_;
+@@ -116,7 +128,7 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
+     // Virtual time is paused at T_n while this runs; the sinks report it as
+     // the delay timestamp so AudioClock reads capture time.
+     const base::TimeTicks now = base::TimeTicks::Now();
+-    for (CaptureAudioRendererSink* sink : sinks) {
++    for (const auto& sink : sinks) {
+       sink->MixInto(mix.get(), frames, now);
+     }
+     mix->ToInterleaved<media::Float32SampleTypeTraitsNoClip>(base::span<float>(pcm));
+@@ -132,13 +144,20 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
+ CaptureAudioRendererSink::CaptureAudioRendererSink(blink::WebAudioDeviceSourceType source_type)
+     : source_type_(source_type), engine_(CaptureAudioEngine::Get()) {}
+ 
+-CaptureAudioRendererSink::~CaptureAudioRendererSink() {
+-  engine_->RemoveSink(this);
+-}
++CaptureAudioRendererSink::~CaptureAudioRendererSink() = default;
+ 
+ void CaptureAudioRendererSink::Initialize(const media::AudioParameters& params,
+                                           RenderCallback* callback) {
+-  base::AutoLock lock(lock_);
++  {
++    base::AutoLock lock(lock_);
++    InitializeLocked(params, callback);
++  }
++  engine_->AddSink(this);  // engine lock is never taken under the sink lock
++}
++
++void CaptureAudioRendererSink::InitializeLocked(const media::AudioParameters& params,
++                                                RenderCallback* callback) {
++  lock_.AssertAcquired();
+   params_ = params;
+   callback_ = callback;
+   const CaptureAudioFormat& device = engine_->format();
+@@ -172,7 +191,6 @@ void CaptureAudioRendererSink::Initialize(const media::AudioParameters& params,
+   fifo_.assign(device.channels, {});
+   fifo_read_ = 0;
+   initialized_ = true;
+-  engine_->AddSink(this);
+ }
+ 
+ void CaptureAudioRendererSink::Start() {
+@@ -181,15 +199,18 @@ void CaptureAudioRendererSink::Start() {
+ }
+ 
+ void CaptureAudioRendererSink::Stop() {
+-  base::AutoLock lock(lock_);
+-  started_ = false;
+-  playing_ = false;
+-  callback_ = nullptr;
+-  initialized_ = false;
+-  for (auto& channel : fifo_) {
+-    channel.clear();
++  {
++    base::AutoLock lock(lock_);
++    started_ = false;
++    playing_ = false;
++    callback_ = nullptr;
++    initialized_ = false;
++    for (auto& channel : fifo_) {
++      channel.clear();
++    }
++    fifo_read_ = 0;
+   }
+-  fifo_read_ = 0;
++  engine_->RemoveSink(this);
+ }
+ 
+ void CaptureAudioRendererSink::Pause(PauseReason) {
+@@ -211,8 +232,8 @@ void CaptureAudioRendererSink::Flush() {
+ }
+ 
+ bool CaptureAudioRendererSink::SetVolume(double volume) {
+-  base::AutoLock lock(lock_);
+-  volume_ = volume;
++  // Lock-free: the media thread may set it while a mix is rendering.
++  volume_.store(volume, std::memory_order_relaxed);
+   return true;
+ }
+ 
+@@ -260,8 +281,9 @@ void CaptureAudioRendererSink::RenderOneBuffer_Locked(base::TimeTicks now) {
+       render_bus_->ZeroFramesPartial(got, render_bus_->frames() - got);
+     }
+   }
+-  if (volume_ != 1.0) {
+-    source->Scale(static_cast<float>(volume_));
++  const double volume = volume_.load(std::memory_order_relaxed);
++  if (volume != 1.0) {
++    source->Scale(static_cast<float>(volume));
+   }
+   media::AudioBus* out = source;
+   if (mixer_) {
+@@ -291,8 +313,9 @@ void CaptureAudioRendererSink::MixInto(media::AudioBus* mix, int frames, base::T
+     if (got < frames) {
+       exact_bus_->ZeroFramesPartial(got, frames - got);
+     }
+-    if (volume_ != 1.0) {
+-      exact_bus_->Scale(static_cast<float>(volume_));
++    const double volume = volume_.load(std::memory_order_relaxed);
++    if (volume != 1.0) {
++      exact_bus_->Scale(static_cast<float>(volume));
+     }
+     media::AudioBus* out = exact_bus_.get();
+     if (mixer_) {
+diff --git a/headless/lib/renderer/capture_audio.h b/headless/lib/renderer/capture_audio.h
+index 8305fc7e32..1fb7d54220 100644
+--- a/headless/lib/renderer/capture_audio.h
++++ b/headless/lib/renderer/capture_audio.h
+@@ -5,6 +5,7 @@
+ #ifndef HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
+ #define HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -78,7 +79,9 @@ class CaptureAudioEngine {
+   CaptureAudioFormat format_;
+   base::Thread thread_{"DcapAudio"};
+   base::Lock lock_;
+-  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks_;  // creation order
++  // Owned references: a sink stays mixable (as silence once stopped) until
++  // Stop() removes it, so the audio thread never dereferences a freed sink.
++  std::vector<scoped_refptr<CaptureAudioRendererSink>> sinks_;  // creation order
+   std::vector<std::string> unsupported_;
+   int64_t rendered_through_ = 0;  // audio thread only
+ };
+@@ -111,6 +114,7 @@ class CaptureAudioRendererSink : public media::SwitchableAudioRendererSink {
+ 
+  private:
+   ~CaptureAudioRendererSink() override;
++  void InitializeLocked(const media::AudioParameters& params, RenderCallback* callback);
+   void RenderOneBuffer_Locked(base::TimeTicks now);
+ 
+   const blink::WebAudioDeviceSourceType source_type_;
+@@ -121,7 +125,7 @@ class CaptureAudioRendererSink : public media::SwitchableAudioRendererSink {
+   bool initialized_ = false;
+   bool started_ = false;
+   bool playing_ = false;
+-  double volume_ = 1.0;
++  std::atomic<double> volume_{1.0};  // set from the media thread while a mix may be running
+   std::unique_ptr<media::AudioBus> render_bus_;     // source format
+   std::unique_ptr<media::AudioBus> resampled_bus_;  // device rate, source channels
+   std::unique_ptr<media::MultiChannelResampler> resampler_;
+diff --git a/headless/lib/renderer/capture_random.cc b/headless/lib/renderer/capture_random.cc
+new file mode 100644
+index 0000000000..58ed5bce63
+--- /dev/null
++++ b/headless/lib/renderer/capture_random.cc
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/renderer/capture_random.h"
++
++#include <atomic>
++#include <cstring>
++
++#include "base/containers/span.h"
++#include "base/rand_util_deterministic_capture.h"
++
++namespace headless {
++
++namespace {
++
++// State protected by a spin lock: RandBytes may run inside the allocator shim,
++// so this path allocates nothing and depends on nothing in base.
++uint64_t g_state[4];
++std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
++
++uint64_t SplitMix64(uint64_t& x) {
++  uint64_t z = (x += 0x9E3779B97F4A7C15ULL);
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++  return z ^ (z >> 31);
++}
++
++uint64_t Rotl(uint64_t x, int k) {
++  return (x << k) | (x >> (64 - k));
++}
++
++// xoshiro256** (Blackman & Vigna), public domain.
++uint64_t NextLocked() {
++  const uint64_t result = Rotl(g_state[1] * 5, 7) * 9;
++  const uint64_t t = g_state[1] << 17;
++  g_state[2] ^= g_state[0];
++  g_state[3] ^= g_state[1];
++  g_state[1] ^= g_state[2];
++  g_state[0] ^= g_state[3];
++  g_state[2] ^= t;
++  g_state[3] = Rotl(g_state[3], 45);
++  return result;
++}
++
++void DeterministicRandBytes(base::span<uint8_t> output) {
++  while (g_lock.test_and_set(std::memory_order_acquire)) {
++  }
++  size_t i = 0;
++  while (i < output.size()) {
++    const uint64_t word = NextLocked();
++    const size_t n = output.size() - i < 8 ? output.size() - i : 8;
++    memcpy(output.data() + i, &word, n);
++    i += n;
++  }
++  g_lock.clear(std::memory_order_release);
++}
++
++}  // namespace
++
++void InstallDeterministicRandom(uint64_t seed) {
++  uint64_t x = seed ^ 0x44434150'52414E44ULL;  // "DCAPRAND"
++  for (uint64_t& word : g_state) {
++    word = SplitMix64(x);
++  }
++  base::subtle::SetRandBytesOverride(&DeterministicRandBytes);
++}
++
++}  // namespace headless
+diff --git a/headless/lib/renderer/capture_random.h b/headless/lib/renderer/capture_random.h
+new file mode 100644
+index 0000000000..077e2f9d20
+--- /dev/null
++++ b/headless/lib/renderer/capture_random.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_RENDERER_CAPTURE_RANDOM_H_
++#define HEADLESS_LIB_RENDERER_CAPTURE_RANDOM_H_
++
++#include <cstdint>
++
++namespace headless {
++
++// Replaces this process's entropy source (base::RandBytes and everything on
++// top of it: crypto::RandBytes, base::Uuid, blob URLs, crypto.getRandomValues)
++// with a seeded xoshiro256** stream, so a capture repeats its random values
++// run to run (deterministic-capture/DESIGN.md 4.8). Call once, early, in a
++// --deterministic-capture renderer. Not a cryptographic generator.
++void InstallDeterministicRandom(uint64_t seed);
++
++}  // namespace headless
++
++#endif  // HEADLESS_LIB_RENDERER_CAPTURE_RANDOM_H_
+diff --git a/headless/lib/renderer/headless_content_renderer_client.cc b/headless/lib/renderer/headless_content_renderer_client.cc
+index 70e9ac55c2..f38977afca 100644
+--- a/headless/lib/renderer/headless_content_renderer_client.cc
++++ b/headless/lib/renderer/headless_content_renderer_client.cc
+@@ -8,11 +8,13 @@
+ 
+ #include "base/check_deref.h"
+ #include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "content/public/common/web_identity.h"
+ #include "content/public/renderer/render_thread.h"
+ #include "headless/lib/common/headless_features.h"
+ #include "headless/lib/renderer/capture_agent.h"
++#include "headless/lib/renderer/capture_random.h"
+ #include "headless/public/switches.h"
+ #include "media/base/video_codecs.h"
+ #include "printing/buildflags/buildflags.h"
+@@ -96,6 +98,11 @@ namespace headless {
+ HeadlessContentRendererClient::HeadlessContentRendererClient() {
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kDeterministicCapture)) {
++    uint64_t seed = 1;
++    base::StringToUint64(base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++                             switches::kDeterministicCaptureSeed),
++                         &seed);
++    InstallDeterministicRandom(seed);
+     capture_audio_factory_ = std::make_unique<CaptureAudioDeviceFactory>();
+   }
+   const auto& command_line =
+diff --git a/headless/public/switches.h b/headless/public/switches.h
+index ea6f8146dd..6a3b006ddc 100644
+--- a/headless/public/switches.h
++++ b/headless/public/switches.h
+@@ -49,6 +49,10 @@ inline constexpr char kDeterministicCapture[] = "deterministic-capture";
+ inline constexpr char kDeterministicCaptureAudio[] =
+     "deterministic-capture-audio";
+ 
++// Seed of the renderer's replacement entropy source (crypto.getRandomValues,
++// UUIDs, blob URLs) under --deterministic-capture; default 1.
++inline constexpr char kDeterministicCaptureSeed[] = "deterministic-capture-seed";
++
+ // Whether cookies stored as part of user profile are encrypted.
+ inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
+ 
+diff --git a/media/renderers/audio_renderer_impl.cc b/media/renderers/audio_renderer_impl.cc
+index 7f4d8c7f40..02e07ed837 100644
+--- a/media/renderers/audio_renderer_impl.cc
++++ b/media/renderers/audio_renderer_impl.cc
+@@ -324,13 +324,16 @@ void AudioRendererImpl::StartRendering_Locked() {
+ 
+   sink_playing_ = true;
+   capture_wait_cancelled_ = false;
++  if (capture_mode_) {
++    capture_weak_this_ = weak_factory_.GetWeakPtr();  // created on the media thread
++  }
+   was_unmuted_ = was_unmuted_ || volume_ != 0;
+   if (state_ == kReinitializingSink) {
+     // Do not start the sink yet if the sink is reinitializing.
+     return;
+   }
+   base::AutoUnlock auto_unlock(lock_);
+-  if (volume_ || render_muted_audio_) {
++  if (volume_ || render_muted_audio_ || capture_mode_) {
+     MaybeStartRealSink();
+   } else {
+     null_sink_->Play();
+@@ -381,7 +384,7 @@ void AudioRendererImpl::StopRendering_Locked(
+   }
+ 
+   base::AutoUnlock auto_unlock(lock_);
+-  if (volume_ || render_muted_audio_) {
++  if (volume_ || render_muted_audio_ || capture_mode_) {
+     sink_->Pause(pause_reason);
+   } else {
+     null_sink_->Pause(pause_reason);
+@@ -497,7 +500,7 @@ void AudioRendererImpl::Flush(base::OnceClosure callback) {
+   // Flush |sink_| now.  |sink_| must only be accessed on |task_runner_| and not
+   // be called under |lock_|.
+   DCHECK(!sink_playing_);
+-  if (volume_ || render_muted_audio_) {
++  if (volume_ || render_muted_audio_ || capture_mode_) {
+     sink_->Flush();
+   } else {
+     null_sink_->Flush();
+@@ -952,6 +955,12 @@ void AudioRendererImpl::SetVolume(float volume) {
+   // Two cases to handle:
+   //   1. Changing from muted to unmuted state.
+   //   2. Unmuted startup case.
++  if (capture_mode_) {
++    // The capture sink is the clock and applies the volume itself; never
++    // switch a muted element to the real-time null sink (DESIGN.md 4.6).
++    volume_ = volume;
++    return;
++  }
+   if ((!render_muted_audio_ && !volume_ && volume) ||
+       (volume && real_sink_needs_start_)) {
+     MaybeStartRealSink();
+@@ -1392,6 +1401,11 @@ bool AudioRendererImpl::IsBeforeStartTime(const AudioBuffer& buffer) {
+ 
+ void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
+   lock_.AssertAcquired();
++  // Decoded audio arrives on the media thread; a Render() running there (the
++  // null sink) cannot wait for it.
++  if (task_runner_->RunsTasksInCurrentSequence() || !capture_weak_this_) {
++    return;
++  }
+   // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
+   // time.
+   constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
+@@ -1405,8 +1419,7 @@ void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
+          algorithm_->BufferedFrames() < needed) {
+     if (!pending_read_) {
+       task_runner_->PostTask(
+-          FROM_HERE,
+-          base::BindOnce(&AudioRendererImpl::AttemptRead, weak_factory_.GetWeakPtr()));
++          FROM_HERE, base::BindOnce(&AudioRendererImpl::AttemptRead, capture_weak_this_));
+     }
+     capture_frames_cv_.TimedWait(base::Milliseconds(1));
+     if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {
+diff --git a/media/renderers/audio_renderer_impl.h b/media/renderers/audio_renderer_impl.h
+index 937b00eb8a..efbae4b6f5 100644
+--- a/media/renderers/audio_renderer_impl.h
++++ b/media/renderers/audio_renderer_impl.h
+@@ -356,6 +356,7 @@ class MEDIA_EXPORT AudioRendererImpl
+   const bool capture_mode_;
+   base::ConditionVariable capture_frames_cv_;
+   bool capture_wait_cancelled_ = false;
++  base::WeakPtr<AudioRendererImpl> capture_weak_this_;
+   void WaitForBufferedAudio_Locked(int frames_requested);
+ 
+   // Algorithm for scaling audio.
+diff --git a/media/renderers/video_renderer_impl.cc b/media/renderers/video_renderer_impl.cc
+index f63a43898f..10ebd2033a 100644
+--- a/media/renderers/video_renderer_impl.cc
++++ b/media/renderers/video_renderer_impl.cc
+@@ -842,6 +842,8 @@ void VideoRendererImpl::WaitForCoveringFrames_Locked(
+   constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
+   const base::TimeTicks give_up =
+       base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
++  capture_waiting_ = true;
++  absl::Cleanup done = [this] { capture_waiting_ = false; };
+   while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
+          state_ == kPlaying) {
+     if (algorithm_->frames_queued() > 0 &&
+@@ -879,7 +881,13 @@ void VideoRendererImpl::AttemptRead_Locked() {
+   if (pending_read_ || received_end_of_stream_)
+     return;
+ 
+-  if (HaveReachedBufferingCap(max_buffered_frames_))
++  // While a capture-mode Render() waits for frames covering its deadline, the
++  // soft cap must not stop reads (a source faster than 3x the capture rate
++  // needs more than four frames per interval); the absolute cap still holds.
++  const bool capture_needs_more =
++      capture_mode_ && capture_waiting_ &&
++      algorithm_->frames_queued() < static_cast<size_t>(kAbsoluteMaxFrames);
++  if (HaveReachedBufferingCap(max_buffered_frames_) && !capture_needs_more)
+     return;
+ 
+   switch (state_) {
+diff --git a/media/renderers/video_renderer_impl.h b/media/renderers/video_renderer_impl.h
+index a763ed07da..79a1956633 100644
+--- a/media/renderers/video_renderer_impl.h
++++ b/media/renderers/video_renderer_impl.h
+@@ -250,6 +250,7 @@ class MEDIA_EXPORT VideoRendererImpl
+   const bool capture_mode_;
+   base::ConditionVariable capture_frames_cv_;
+   bool capture_wait_cancelled_ = false;
++  bool capture_waiting_ = false;  // a Render() is waiting for coverage
+   int capture_wait_timeouts_ = 0;
+   base::WeakPtr<VideoRendererImpl> capture_weak_this_;
+ 
+diff --git a/third_party/blink/renderer/core/frame/use_counter_impl.cc b/third_party/blink/renderer/core/frame/use_counter_impl.cc
+index 63edd3353d..0dae641a33 100644
+--- a/third_party/blink/renderer/core/frame/use_counter_impl.cc
++++ b/third_party/blink/renderer/core/frame/use_counter_impl.cc
+@@ -26,6 +26,7 @@
+ #include "third_party/blink/renderer/core/frame/use_counter_impl.h"
+ 
+ #include "base/metrics/histogram_functions.h"
++#include "base/command_line.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/strings/strcat.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+@@ -331,6 +332,15 @@ bool UseCounterImpl::ReportMeasurement(const UseCounterFeature& feature,
+   if (feature.type() == mojom::blink::UseCounterFeatureType::kWebFeature)
+     NotifyFeatureCounted(static_cast<WebFeature>(feature.value()));
+ 
++  // DeterministicChromium: the capture agent (a RenderFrameObserver) learns
++  // about API use through this notification; captured pages are usually
++  // file:// documents, which otherwise count only on the renderer side.
++  static const bool capture_mode =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("deterministic-capture");
++  if (capture_mode && context_ != kDefaultContext) {
++    client->DidObserveNewFeatureUsage(feature);
++  }
++
+   // Report to browser about observed event only when URL is HTTP/HTTPS or
+   // isolated-app://, as other URL schemes are filtered out in
+   // |MetricsWebContentsObserver::DoesTimingUpdateHaveError| anyway.
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index 65799f1a32..442f77f0c4 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -655,6 +655,10 @@ WebMediaPlayerImpl::~WebMediaPlayerImpl() {
+ }
+ 
+ bool WebMediaPlayerImpl::CaptureIsStable() const {
++  // A failed pipeline will never complete its transition; seeking_ stays set.
++  if (network_state_ >= WebMediaPlayer::kNetworkStateFormatError) {
++    return true;
++  }
+   if (pipeline_controller_->HasPendingOperation() || seeking_ ||
+       pending_suspend_resume_cycle_ || is_pipeline_resuming_) {
+     return false;
+@@ -693,6 +697,7 @@ void WebMediaPlayerImpl::CaptureNoteTransition() {
+         WebScopedVirtualTimePauser::VirtualTaskDuration::kInstant);
+     capture_pauser_.PauseVirtualTime();
+     capture_pauser_held_ = true;
++    capture_hold_started_ = base::subtle::TimeTicksNowIgnoringOverride();
+   }
+   capture_settle_rounds_ = 0;
+   if (!capture_settle_probe_in_flight_) {
+@@ -712,6 +717,13 @@ void WebMediaPlayerImpl::CapturePostSettleProbe() {
+       base::BindOnce(&WebMediaPlayerImpl::CaptureSettleStep, weak_this_));
+ }
+ 
++void WebMediaPlayerImpl::CaptureReleaseVirtualTime() {
++  if (capture_pauser_held_) {
++    capture_pauser_.UnpauseVirtualTime();
++    capture_pauser_held_ = false;
++  }
++}
++
+ void WebMediaPlayerImpl::CaptureSettleStep() {
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+   capture_settle_probe_in_flight_ = false;
+@@ -720,12 +732,22 @@ void WebMediaPlayerImpl::CaptureSettleStep() {
+   }
+   if (CaptureIsStable()) {
+     if (++capture_settle_rounds_ >= 2) {
+-      capture_pauser_.UnpauseVirtualTime();
+-      capture_pauser_held_ = false;
++      CaptureReleaseVirtualTime();
+       return;
+     }
+   } else {
+     capture_settle_rounds_ = 0;
++    // A transition that cannot complete (stalled network, a decoder that never
++    // answers) must not freeze the whole renderer: give the controller its
++    // timeout back and let the quiescence report show the player as unstable.
++    constexpr base::TimeDelta kMaxHold = base::Seconds(20);
++    if (base::subtle::TimeTicksNowIgnoringOverride() - capture_hold_started_ > kMaxHold) {
++      MEDIA_LOG(WARNING, media_log_.get())
++          << "deterministic capture: media transition did not settle in 20 s; "
++             "releasing virtual time";
++      CaptureReleaseVirtualTime();
++      return;
++    }
+   }
+   CapturePostSettleProbe();
+ }
+@@ -2160,6 +2182,7 @@ void WebMediaPlayerImpl::OnError(media::PipelineStatus status) {
+ 
+   if (suppress_destruction_errors_)
+     return;
++  CaptureReleaseVirtualTime();  // the pending transition will not complete
+ 
+ #if BUILDFLAG(IS_WIN)
+   // An error or another hardware context reset (HCR) occurred within a very
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.h b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+index 7e2f246b5d..4ac0b2a9c2 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.h
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+@@ -764,8 +764,10 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+   void CaptureNoteTransition();
+   void CapturePostSettleProbe();
+   void CaptureSettleStep();
++  void CaptureReleaseVirtualTime();
+   WebScopedVirtualTimePauser capture_pauser_;
+   bool capture_pauser_held_ = false;
++  base::TimeTicks capture_hold_started_;  // real time
+   bool capture_settle_probe_in_flight_ = false;
+   int capture_settle_rounds_ = 0;
+ 
+-- 
+2.53.0
+

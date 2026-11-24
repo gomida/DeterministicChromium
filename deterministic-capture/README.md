@@ -81,7 +81,12 @@ dcap render spec.json --browser ~/DeterministicChromium/src/out/dev/headless_she
 ```
 
 Outputs under `output.dir`: `capture.<mp4|mov>`, `capture-report.json`,
-`hashes/`, and `run/<id>/work/` with `plan.json`, logs and profiles.
+`hashes/`, and `run/<id>/work/` with `plan.json`, logs and profiles. With
+`"audio": {"capture": true}` the final file carries the page's audio
+(media elements and Web Audio) with exact per-frame sample counts; the
+engine's renderer agent (patches 6-8) makes `<video>` playback, media events
+and `performance.mark` markers frame-exact, so a page with video and audio
+renders identically in chunks and serially (DESIGN.md section 14).
 
 ## Backends on this workstation (WSL2)
 

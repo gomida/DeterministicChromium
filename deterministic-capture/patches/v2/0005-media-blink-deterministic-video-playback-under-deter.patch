@@ -1,0 +1,878 @@
+From 64d715547730c1cbe9cc3030f55aa6fd4beba7b9 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 20:22:51 +0900
+Subject: [PATCH 5/8] media, blink: deterministic video playback under
+ --deterministic-capture
+
+Patch 7 of the deterministic capture series.
+
+- WebMediaPlayerImpl registers with CaptureMediaRegistry (platform/media,
+  exposed as blink::WebCaptureMediaRegistry) and holds a kInstant virtual-time
+  pauser from every play, pause, seek, rate change, suspend, resume and
+  pipeline start until the media thread has absorbed it, no PipelineController
+  operation is pending (new HasPendingOperation()) and a running, unsuspended
+  pipeline has reached HAVE_FUTURE_DATA. loadedmetadata, canplay and the
+  autoplay play() therefore land at the virtual time of the request.
+- MainThreadSchedulerImpl does not fence task queues while virtual time is
+  stopped in capture mode (neither on pause nor for queues created while
+  paused); the pauser would otherwise deadlock on the fenced media callbacks.
+  Delayed tasks stay gated by virtual time.
+- VideoRendererImpl::Render waits, with the lock released, until the queued
+  frames cover the render deadline or end of stream (10 s bound), cancelled
+  before the sink stops; VideoFrameSubmitter renders [T, T+interval] for the
+  BeginFrame at T; VideoFrameCompositor background rendering is off;
+  MultiBufferDataSource seeks without the 20 ms delay that virtual time would
+  gate.
+- media/base/deterministic_capture.h: IsDeterministicCaptureMode().
+
+Measured on 158 with a muted looping WebM: run-to-run identical hashes over
+120 frames, and two chunks with pre-roll equal to the serial render frame by
+frame.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ media/base/BUILD.gn                           |   1 +
+ media/base/deterministic_capture.h            |  26 ++++
+ media/filters/pipeline_controller.cc          |  20 +++
+ media/filters/pipeline_controller.h           |   5 +
+ media/renderers/video_renderer_impl.cc        |  73 ++++++++++-
+ media/renderers/video_renderer_impl.h         |  16 +++
+ third_party/blink/public/BUILD.gn             |   1 +
+ .../media/web_capture_media_registry.h        |  48 ++++++++
+ .../graphics/video_frame_submitter.cc         |   8 ++
+ .../blink/renderer/platform/media/BUILD.gn    |   2 +
+ .../platform/media/capture_media_registry.cc  |  57 +++++++++
+ .../platform/media/capture_media_registry.h   |  40 ++++++
+ .../media/multi_buffer_data_source.cc         |   7 +-
+ .../platform/media/video_frame_compositor.cc  |   7 ++
+ .../platform/media/web_media_player_impl.cc   | 116 ++++++++++++++++++
+ .../platform/media/web_media_player_impl.h    |  18 +++
+ .../main_thread/main_thread_scheduler_impl.cc |  27 +++-
+ 17 files changed, 469 insertions(+), 3 deletions(-)
+ create mode 100644 media/base/deterministic_capture.h
+ create mode 100644 third_party/blink/public/platform/media/web_capture_media_registry.h
+ create mode 100644 third_party/blink/renderer/platform/media/capture_media_registry.cc
+ create mode 100644 third_party/blink/renderer/platform/media/capture_media_registry.h
+
+diff --git a/media/base/BUILD.gn b/media/base/BUILD.gn
+index be4a2d8864..2e92bef88e 100644
+--- a/media/base/BUILD.gn
++++ b/media/base/BUILD.gn
+@@ -180,6 +180,7 @@ source_set("base") {
+     "demuxer_memory_limit.h",
+     "demuxer_stream.cc",
+     "demuxer_stream.h",
++    "deterministic_capture.h",
+     "device_enumeration_outcome.h",
+     "djb2.cc",
+     "djb2.h",
+diff --git a/media/base/deterministic_capture.h b/media/base/deterministic_capture.h
+new file mode 100644
+index 0000000000..bdd828f6cd
+--- /dev/null
++++ b/media/base/deterministic_capture.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_BASE_DETERMINISTIC_CAPTURE_H_
++#define MEDIA_BASE_DETERMINISTIC_CAPTURE_H_
++
++#include "base/command_line.h"
++
++namespace media {
++
++// DeterministicChromium: true in processes started with --deterministic-capture
++// (headless_shell forwards the switch to its renderers). Media code uses it to
++// wait for decoded data instead of dropping or underflowing, so that frame
++// selection does not depend on decode speed (deterministic-capture/DESIGN.md
++// 4.5). The switch name is spelled out here because media/ cannot depend on
++// headless/public/switches.h.
++inline bool IsDeterministicCaptureMode() {
++  static const bool enabled =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("deterministic-capture");
++  return enabled;
++}
++
++}  // namespace media
++
++#endif  // MEDIA_BASE_DETERMINISTIC_CAPTURE_H_
+diff --git a/media/filters/pipeline_controller.cc b/media/filters/pipeline_controller.cc
+index 6ebc6f1f50..f2ba9c8d70 100644
+--- a/media/filters/pipeline_controller.cc
++++ b/media/filters/pipeline_controller.cc
+@@ -146,6 +146,26 @@ bool PipelineController::IsStable() {
+   return state_ == State::PLAYING;
+ }
+ 
++bool PipelineController::HasPendingOperation() {
++  DCHECK(thread_checker_.CalledOnValidThread());
++  switch (state_) {
++    case State::STARTING:
++    case State::SEEKING:
++    case State::SWITCHING_TRACKS:
++    case State::SUSPENDING:
++    case State::RESUMING:
++      return true;
++    case State::STOPPED:
++    case State::PLAYING:
++    case State::PLAYING_OR_SUSPENDED:
++    case State::SUSPENDED:
++      break;
++  }
++  return pending_seek_ || pending_suspend_ || pending_resume_ ||
++         pending_audio_track_change_ || pending_video_track_change_ ||
++         pending_seeked_cb_;
++}
++
+ bool PipelineController::IsPendingSeek() {
+   DCHECK(thread_checker_.CalledOnValidThread());
+   return pending_seek_except_start_;
+diff --git a/media/filters/pipeline_controller.h b/media/filters/pipeline_controller.h
+index ae2b0ff2f7..a68d72d7d7 100644
+--- a/media/filters/pipeline_controller.h
++++ b/media/filters/pipeline_controller.h
+@@ -120,6 +120,11 @@ class MEDIA_EXPORT PipelineController {
+   //   - Resume() is processed immediately while in the SUSPENDED state.
+   bool IsStable();
+ 
++  // DeterministicChromium: true while a start, seek, suspend, resume or track
++  // change is in flight or queued. A player that was never started and one
++  // that is playing or fully suspended both report false.
++  bool HasPendingOperation();
++
+   // Returns true if the current target state is suspended.
+   bool IsSuspended();
+ 
+diff --git a/media/renderers/video_renderer_impl.cc b/media/renderers/video_renderer_impl.cc
+index e8842ee111..f63a43898f 100644
+--- a/media/renderers/video_renderer_impl.cc
++++ b/media/renderers/video_renderer_impl.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -20,8 +21,10 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
++#include "base/time/time_override.h"
+ #include "base/trace_event/trace_event.h"
+ #include "media/base/media_log.h"
++#include "media/base/deterministic_capture.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/pipeline_status.h"
+ #include "media/base/renderer_client.h"
+@@ -79,7 +82,9 @@ VideoRendererImpl::VideoRendererImpl(
+       last_frame_opaque_(false),
+       painted_first_frame_(false),
+       min_buffered_frames_(initial_buffering_size_.value()),
+-      max_buffered_frames_(initial_buffering_size_.value()) {
++      max_buffered_frames_(initial_buffering_size_.value()),
++      capture_mode_(IsDeterministicCaptureMode()),
++      capture_frames_cv_(&lock_) {
+   DCHECK(create_video_decoders_cb_);
+ }
+ 
+@@ -249,6 +254,9 @@ scoped_refptr<VideoFrame> VideoRendererImpl::Render(
+ 
+   last_render_time_ = tick_clock_->NowTicks();
+ 
++  if (capture_mode_)
++    WaitForCoveringFrames_Locked(deadline_min, deadline_max);
++
+   size_t frames_dropped = 0;
+   scoped_refptr<VideoFrame> result =
+       algorithm_->Render(deadline_min, deadline_max, &frames_dropped);
+@@ -587,6 +595,12 @@ void VideoRendererImpl::FrameReady(VideoDecoderStream::ReadResult result) {
+   DCHECK_EQ(state_, kPlaying);
+   CHECK(pending_read_);
+   pending_read_ = false;
++  // Whatever this read produced (a frame, end of stream or an error), a
++  // capture-mode Render() waiting on the compositor thread must re-evaluate.
++  absl::Cleanup wake_capture_wait = [this] {
++    if (capture_mode_)
++      capture_frames_cv_.Broadcast();
++  };
+ 
+   // Can happen when demuxers are preparing for a new Seek().
+   if (!result.has_value()) {
+@@ -813,6 +827,51 @@ void VideoRendererImpl::AddReadyFrame_Locked(scoped_refptr<VideoFrame> frame) {
+   algorithm_->EnqueueFrame(std::move(frame));
+ }
+ 
++void VideoRendererImpl::AttemptReadForCapture() {
++  DCHECK(task_runner_->RunsTasksInCurrentSequence());
++  base::AutoLock auto_lock(lock_);
++  AttemptRead_Locked();
++}
++
++void VideoRendererImpl::WaitForCoveringFrames_Locked(
++    base::TimeTicks deadline_min,
++    base::TimeTicks deadline_max) {
++  lock_.AssertAcquired();
++  // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
++  // time.
++  constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
++  const base::TimeTicks give_up =
++      base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
++  while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
++         state_ == kPlaying) {
++    if (algorithm_->frames_queued() > 0 &&
++        algorithm_->last_frame_end_time() >= deadline_max) {
++      return;
++    }
++    // Frames that ended before this interval still count against the
++    // buffering cap and would stop AttemptRead_Locked() from reading further.
++    if (algorithm_->frames_queued() > 0 &&
++        (algorithm_->effective_frames_queued() >= max_buffered_frames_ ||
++         algorithm_->frames_queued() >= kAbsoluteMaxFrames)) {
++      algorithm_->RemoveExpiredFrames(deadline_min);
++    }
++    if (!pending_read_ && capture_weak_this_) {
++      task_runner_->PostTask(
++          FROM_HERE, base::BindOnce(&VideoRendererImpl::AttemptReadForCapture,
++                                    capture_weak_this_));
++    }
++    capture_frames_cv_.TimedWait(base::Milliseconds(1));
++    if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {
++      ++capture_wait_timeouts_;
++      MEDIA_LOG(INFO, media_log_)
++          << "deterministic capture: video frames did not cover the render "
++             "deadline within 10 s (queued "
++          << algorithm_->frames_queued() << ")";
++      return;
++    }
++  }
++}
++
+ void VideoRendererImpl::AttemptRead_Locked() {
+   DCHECK(task_runner_->RunsTasksInCurrentSequence());
+   lock_.AssertAcquired();
+@@ -913,11 +972,23 @@ void VideoRendererImpl::StartSink() {
+   DCHECK_GT(algorithm_->frames_queued(), 0u);
+   sink_started_ = true;
+   was_background_rendering_ = false;
++  if (capture_mode_) {
++    base::AutoLock auto_lock(lock_);
++    capture_wait_cancelled_ = false;
++    capture_weak_this_ = weak_factory_.GetWeakPtr();
++  }
+   sink_->Start(this);
+ }
+ 
+ void VideoRendererImpl::StopSink() {
+   DCHECK(task_runner_->RunsTasksInCurrentSequence());
++  if (capture_mode_) {
++    // sink_->Stop() blocks on the compositor's callback lock, which a
++    // Render() waiting for frames holds; release that wait first.
++    base::AutoLock auto_lock(lock_);
++    capture_wait_cancelled_ = true;
++    capture_frames_cv_.Broadcast();
++  }
+   sink_->Stop();
+   algorithm_->set_time_stopped();
+   sink_started_ = false;
+diff --git a/media/renderers/video_renderer_impl.h b/media/renderers/video_renderer_impl.h
+index 71f05fd6c7..a763ed07da 100644
+--- a/media/renderers/video_renderer_impl.h
++++ b/media/renderers/video_renderer_impl.h
+@@ -133,6 +133,11 @@ class MEDIA_EXPORT VideoRendererImpl
+   // capacity.
+   void AttemptRead_Locked();
+ 
++  // Capture mode: issues a read from the media thread while a Render() waits.
++  void AttemptReadForCapture();
++  void WaitForCoveringFrames_Locked(base::TimeTicks deadline_min,
++                                    base::TimeTicks deadline_max);
++
+   // Called when VideoDecoderStream::Reset() completes.
+   void OnVideoDecoderStreamResetDone();
+ 
+@@ -237,6 +242,17 @@ class MEDIA_EXPORT VideoRendererImpl
+   // Used for accessing data members.
+   base::Lock lock_;
+ 
++  // DeterministicChromium (deterministic-capture/DESIGN.md 4.5): in capture
++  // mode Render() waits, with |lock_| released, until the queued frames cover
++  // the render deadline or end of stream, so the selected frame does not
++  // depend on decode speed. FrameReady() signals; StopSink() cancels before
++  // the sink takes its callback lock so the two threads cannot deadlock.
++  const bool capture_mode_;
++  base::ConditionVariable capture_frames_cv_;
++  bool capture_wait_cancelled_ = false;
++  int capture_wait_timeouts_ = 0;
++  base::WeakPtr<VideoRendererImpl> capture_weak_this_;
++
+   raw_ptr<RendererClient> client_;
+ 
+   // Pool of MappableSharedImages and resources used to create hardware frames.
+diff --git a/third_party/blink/public/BUILD.gn b/third_party/blink/public/BUILD.gn
+index b40fe89390..b7e84ac46b 100644
+--- a/third_party/blink/public/BUILD.gn
++++ b/third_party/blink/public/BUILD.gn
+@@ -131,6 +131,7 @@ source_set("blink_headers") {
+     "platform/interface_registry.h",
+     "platform/media/key_system_config_selector.h",
+     "platform/media/video_capture.h",
++    "platform/media/web_capture_media_registry.h",
+     "platform/media/web_encrypted_media_client_impl.h",
+     "platform/media/web_media_player_builder.h",
+     "platform/media/web_media_player_delegate.h",
+diff --git a/third_party/blink/public/platform/media/web_capture_media_registry.h b/third_party/blink/public/platform/media/web_capture_media_registry.h
+new file mode 100644
+index 0000000000..c866519c12
+--- /dev/null
++++ b/third_party/blink/public/platform/media/web_capture_media_registry.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_PUBLIC_PLATFORM_MEDIA_WEB_CAPTURE_MEDIA_REGISTRY_H_
++#define THIRD_PARTY_BLINK_PUBLIC_PLATFORM_MEDIA_WEB_CAPTURE_MEDIA_REGISTRY_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "third_party/blink/public/platform/web_common.h"
++
++namespace blink {
++
++// DeterministicChromium: what the renderer's CaptureAgent needs to know about
++// the media players of this process between two captured frames
++// (deterministic-capture/DESIGN.md 4.3 step 3). Renderer main thread only.
++struct WebCaptureMediaState {
++  int player_id = 0;
++  // idle | starting | playing | paused | seeking | transition | ended
++  std::string state;
++  double media_time_ms = 0;
++  // No pipeline operation (start, seek, suspend, resume, track change) is in
++  // flight or queued.
++  bool stable = true;
++  bool has_video = false;
++  bool has_audio = false;
++};
++
++struct WebCaptureMediaSnapshot {
++  std::vector<WebCaptureMediaState> players;
++  // Count of play, pause, seek and rate changes since the process started.
++  // Two equal snapshots around a media-thread round trip mean no transition
++  // was started in between.
++  uint64_t transitions = 0;
++};
++
++class BLINK_PLATFORM_EXPORT WebCaptureMediaRegistry {
++ public:
++  // False unless the process runs with --deterministic-capture.
++  static bool Enabled();
++  static WebCaptureMediaSnapshot Snapshot();
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_PLATFORM_MEDIA_WEB_CAPTURE_MEDIA_REGISTRY_H_
+diff --git a/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc b/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
+index 6d0152472e..4f870c57fc 100644
+--- a/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
++++ b/third_party/blink/renderer/platform/graphics/video_frame_submitter.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "media/base/deterministic_capture.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -500,6 +501,13 @@ void VideoFrameSubmitter::OnBeginFrame(
+   base::TimeTicks deadline_min = args.frame_time + vsync_interval;
+   base::TimeTicks deadline_max =
+       args.frame_time + args.interval + vsync_interval;
++  if (media::IsDeterministicCaptureMode()) {
++    // DeterministicChromium: the captured frame for BeginFrame(T) is frame T
++    // itself, not the frame displayed one vsync later, so render for
++    // [T, T + interval] (deterministic-capture/DESIGN.md 4.3 step 6).
++    deadline_min = args.frame_time;
++    deadline_max = args.frame_time + args.interval;
++  }
+   // Default expected display time for tracing: the end of the BeginFrame
+   // deadline window (two intervals after frame_time). This is unrelated to how
+   // |average_delta_between_receive_and_present_| is computed: that EMA is built
+diff --git a/third_party/blink/renderer/platform/media/BUILD.gn b/third_party/blink/renderer/platform/media/BUILD.gn
+index 9d129df311..9b62bb43fb 100644
+--- a/third_party/blink/renderer/platform/media/BUILD.gn
++++ b/third_party/blink/renderer/platform/media/BUILD.gn
+@@ -10,6 +10,8 @@ blink_platform_sources("media") {
+     "buffered_data_source_host_impl.h",
+     "cache_util.cc",
+     "cache_util.h",
++    "capture_media_registry.cc",
++    "capture_media_registry.h",
+     "cdm_result_promise.h",
+     "cdm_result_promise_helper.cc",
+     "cdm_result_promise_helper.h",
+diff --git a/third_party/blink/renderer/platform/media/capture_media_registry.cc b/third_party/blink/renderer/platform/media/capture_media_registry.cc
+new file mode 100644
+index 0000000000..bde3c43239
+--- /dev/null
++++ b/third_party/blink/renderer/platform/media/capture_media_registry.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/platform/media/capture_media_registry.h"
++
++#include "media/base/deterministic_capture.h"
++#include "third_party/blink/renderer/platform/media/web_media_player_impl.h"
++#include "third_party/blink/renderer/platform/wtf/std_lib_extras.h"
++#include "third_party/blink/renderer/platform/wtf/wtf.h"
++
++namespace blink {
++
++// static
++CaptureMediaRegistry* CaptureMediaRegistry::GetIfEnabled() {
++  if (!media::IsDeterministicCaptureMode()) {
++    return nullptr;
++  }
++  DCHECK(IsMainThread());
++  DEFINE_STATIC_LOCAL(CaptureMediaRegistry, registry, ());
++  return &registry;
++}
++
++void CaptureMediaRegistry::Register(WebMediaPlayerImpl* player) {
++  players_.push_back(player);
++}
++
++void CaptureMediaRegistry::Unregister(WebMediaPlayerImpl* player) {
++  wtf_size_t index = players_.Find(player);
++  if (index != kNotFound) {
++    players_.EraseAt(index);
++  }
++}
++
++WebCaptureMediaSnapshot CaptureMediaRegistry::Snapshot() const {
++  WebCaptureMediaSnapshot snapshot;
++  snapshot.transitions = transitions_;
++  for (WebMediaPlayerImpl* player : players_) {
++    WebCaptureMediaState state;
++    player->CaptureState(&state);
++    snapshot.players.push_back(std::move(state));
++  }
++  return snapshot;
++}
++
++// static
++bool WebCaptureMediaRegistry::Enabled() {
++  return CaptureMediaRegistry::GetIfEnabled() != nullptr;
++}
++
++// static
++WebCaptureMediaSnapshot WebCaptureMediaRegistry::Snapshot() {
++  CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled();
++  return registry ? registry->Snapshot() : WebCaptureMediaSnapshot();
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/platform/media/capture_media_registry.h b/third_party/blink/renderer/platform/media/capture_media_registry.h
+new file mode 100644
+index 0000000000..e99e113eb6
+--- /dev/null
++++ b/third_party/blink/renderer/platform/media/capture_media_registry.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_MEDIA_CAPTURE_MEDIA_REGISTRY_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_MEDIA_CAPTURE_MEDIA_REGISTRY_H_
++
++#include <cstdint>
++
++#include "third_party/blink/public/platform/media/web_capture_media_registry.h"
++#include "third_party/blink/renderer/platform/platform_export.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
++
++namespace blink {
++
++class WebMediaPlayerImpl;
++
++// DeterministicChromium: the players of this renderer in creation order, and a
++// transition counter, for WebCaptureMediaRegistry. Exists only under
++// --deterministic-capture; everything runs on the renderer main thread.
++class PLATFORM_EXPORT CaptureMediaRegistry {
++ public:
++  // nullptr when the process is not in capture mode.
++  static CaptureMediaRegistry* GetIfEnabled();
++
++  CaptureMediaRegistry() = default;  // for DEFINE_STATIC_LOCAL
++
++  void Register(WebMediaPlayerImpl* player);
++  void Unregister(WebMediaPlayerImpl* player);
++  void NoteTransition() { ++transitions_; }
++  WebCaptureMediaSnapshot Snapshot() const;
++
++ private:
++  Vector<WebMediaPlayerImpl*> players_;
++  uint64_t transitions_ = 0;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_MEDIA_CAPTURE_MEDIA_REGISTRY_H_
+diff --git a/third_party/blink/renderer/platform/media/multi_buffer_data_source.cc b/third_party/blink/renderer/platform/media/multi_buffer_data_source.cc
+index c8bf3c17b4..25a5d17042 100644
+--- a/third_party/blink/renderer/platform/media/multi_buffer_data_source.cc
++++ b/third_party/blink/renderer/platform/media/multi_buffer_data_source.cc
+@@ -9,6 +9,8 @@
+ #include <ranges>
+ #include <utility>
+ 
++#include "media/base/deterministic_capture.h"
++
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+ #include "base/memory/raw_span.h"
+@@ -424,7 +426,10 @@ void MultiBufferDataSource::Read(int64_t position,
+               *render_task_runner_, FROM_HERE,
+               CrossThreadBindOnce(&MultiBufferDataSource::SeekTask,
+                                   weak_factory_.GetWeakPtr()),
+-              kSeekDelay);
++              // DeterministicChromium: a delayed task is gated by virtual
++              // time, which a pending media transition holds; seek at once.
++              media::IsDeterministicCaptureMode() ? base::TimeDelta()
++                                                  : kSeekDelay);
+         }
+ 
+         std::move(read_cb).Run(static_cast<int>(bytes_read));
+diff --git a/third_party/blink/renderer/platform/media/video_frame_compositor.cc b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+index a0e4a3f104..bc0b08a9f0 100644
+--- a/third_party/blink/renderer/platform/media/video_frame_compositor.cc
++++ b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+@@ -13,6 +13,7 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
++#include "media/base/deterministic_capture.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/video_frame.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/post_cross_thread_task.h"
+@@ -50,6 +51,12 @@ VideoFrameCompositor::VideoFrameCompositor(
+               &VideoFrameCompositor::StopForceBeginFrames,
+               CrossThreadUnretained(this)))),
+       submitter_(std::move(submitter)) {
++  // DeterministicChromium: the 250 ms background render would call Render()
++  // at a real-time-dependent virtual time; frames are selected only by
++  // BeginFrames in capture mode (deterministic-capture/DESIGN.md 4.5).
++  if (media::IsDeterministicCaptureMode()) {
++    background_rendering_enabled_ = false;
++  }
+   if (submitter_) {
+     PostCrossThreadTask(
+         *task_runner_, FROM_HERE,
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index eb6d6f364d..65799f1a32 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "third_party/blink/renderer/platform/media/web_media_player_impl.h"
+ 
++#include "base/threading/platform_thread.h"
++#include "third_party/blink/public/platform/scheduler/web_scoped_virtual_time_pauser.h"
++#include "third_party/blink/renderer/platform/media/capture_media_registry.h"
++
+ #include <algorithm>
+ #include <cmath>
+ #include <limits>
+@@ -637,11 +641,116 @@ WebMediaPlayerImpl::WebMediaPlayerImpl(
+       base::BindPostTaskToCurrentDefault(blink::BindRepeating(
+           &WebMediaPlayerImpl::OnRemotePlayStateChange, weak_this_)));
+ #endif  // defined (IS_ANDROID)
++  if (CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled()) {
++    registry->Register(this);
++  }
+ }
+ 
+ WebMediaPlayerImpl::~WebMediaPlayerImpl() {
+   // Ensure Shutdown() has been called.
+   CHECK(!client_);
++  if (CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled()) {
++    registry->Unregister(this);
++  }
++}
++
++bool WebMediaPlayerImpl::CaptureIsStable() const {
++  if (pipeline_controller_->HasPendingOperation() || seeking_ ||
++      pending_suspend_resume_cycle_ || is_pipeline_resuming_) {
++    return false;
++  }
++  // A running, unsuspended pipeline that has not reached HAVE_FUTURE_DATA is
++  // still prerolling (after a start, seek or resume) or waiting for data. The
++  // readyState change, canplay and the autoplay play() it triggers must land
++  // at the virtual time of the request, not at a time that depends on decoder
++  // speed, so hold until the renderers report enough data. A pipeline that
++  // suspended after metadata (preload=metadata without autoplay) or was never
++  // started has nothing to wait for.
++  if (!ended_ && ready_state_ < WebMediaPlayer::kReadyStateHaveFutureData &&
++      pipeline_controller_->IsPipelineRunning() &&
++      !pipeline_controller_->IsPipelineSuspended()) {
++    return false;
++  }
++  return true;
++}
++
++void WebMediaPlayerImpl::CaptureNoteTransition() {
++  CaptureMediaRegistry* registry = CaptureMediaRegistry::GetIfEnabled();
++  if (!registry) {
++    return;
++  }
++  registry->NoteTransition();
++  // Hold renderer virtual time until the media thread has absorbed the
++  // transition and no pipeline operation is pending. The completion then
++  // lands at the virtual time of the request instead of at a time that
++  // depends on decoder speed (deterministic-capture/DESIGN.md 4.3 step 3).
++  if (!capture_pauser_held_) {
++    if (!frame_scheduler_) {
++      return;
++    }
++    capture_pauser_ = frame_scheduler_->CreateWebScopedVirtualTimePauser(
++        "DeterministicCaptureMedia",
++        WebScopedVirtualTimePauser::VirtualTaskDuration::kInstant);
++    capture_pauser_.PauseVirtualTime();
++    capture_pauser_held_ = true;
++  }
++  capture_settle_rounds_ = 0;
++  if (!capture_settle_probe_in_flight_) {
++    CapturePostSettleProbe();
++  }
++}
++
++void WebMediaPlayerImpl::CapturePostSettleProbe() {
++  capture_settle_probe_in_flight_ = true;
++  // The media thread processes posted work in order, so when this task runs
++  // every operation posted before it has been handled there. The short sleep
++  // keeps the probe from spinning while a decoder initializes on a pool
++  // thread; it cannot be a delayed task, which virtual time would gate.
++  media_task_runner_->PostTaskAndReply(
++      FROM_HERE,
++      base::BindOnce([] { base::PlatformThread::Sleep(base::Microseconds(200)); }),
++      base::BindOnce(&WebMediaPlayerImpl::CaptureSettleStep, weak_this_));
++}
++
++void WebMediaPlayerImpl::CaptureSettleStep() {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++  capture_settle_probe_in_flight_ = false;
++  if (!capture_pauser_held_) {
++    return;
++  }
++  if (CaptureIsStable()) {
++    if (++capture_settle_rounds_ >= 2) {
++      capture_pauser_.UnpauseVirtualTime();
++      capture_pauser_held_ = false;
++      return;
++    }
++  } else {
++    capture_settle_rounds_ = 0;
++  }
++  CapturePostSettleProbe();
++}
++
++void WebMediaPlayerImpl::CaptureState(WebCaptureMediaState* out) const {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++  out->player_id = player_id_;
++  out->media_time_ms = GetCurrentTimeInternal().InMillisecondsF();
++  out->has_video = HasVideo();
++  out->has_audio = HasAudio();
++  const bool pipeline_busy = pipeline_controller_->HasPendingOperation();
++  out->stable = CaptureIsStable();
++  if (ended_) {
++    out->state = "ended";
++  } else if (seeking_) {
++    out->state = "seeking";
++  } else if (pipeline_busy) {
++    out->state = ready_state_ < WebMediaPlayer::kReadyStateHaveMetadata
++                     ? "starting"
++                     : "transition";
++  } else if (!pipeline_controller_->IsPipelineRunning()) {
++    out->state = "idle";
++  } else {
++    out->state = paused_ ? "paused" : "playing";
++  }
+ }
+ 
+ void WebMediaPlayerImpl::Shutdown() {
+@@ -1017,6 +1126,7 @@ void WebMediaPlayerImpl::UnlockBackgroundPlayback() {
+ void WebMediaPlayerImpl::Play() {
+   DVLOG(1) << __func__;
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
++  CaptureNoteTransition();
+ 
+   // User initiated play unlocks background video playback.
+   if (has_transient_user_activation_cb_.Run()) {
+@@ -1058,6 +1168,7 @@ void WebMediaPlayerImpl::Play() {
+ void WebMediaPlayerImpl::Pause(PauseReason pause_reason) {
+   DVLOG(1) << __func__;
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
++  CaptureNoteTransition();
+ 
+   // We update the paused state even when casting, since we expect pause() to be
+   // called when casting begins, and when we exit casting we should end up in a
+@@ -1128,6 +1239,7 @@ void WebMediaPlayerImpl::Seek(double seconds) {
+ 
+ void WebMediaPlayerImpl::DoSeek(base::TimeDelta time, bool time_updated) {
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
++  CaptureNoteTransition();
+   TRACE_EVENT2("media", "WebMediaPlayerImpl::DoSeek", "target",
+                time.InSecondsF(), "id", media_player_id_);
+ 
+@@ -1224,6 +1336,7 @@ void WebMediaPlayerImpl::DoSeek(base::TimeDelta time, bool time_updated) {
+ void WebMediaPlayerImpl::SetRate(double rate) {
+   DVLOG(1) << __func__ << "(" << rate << ")";
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
++  CaptureNoteTransition();
+ 
+   if (rate != playback_rate_) {
+     LIMITED_MEDIA_LOG(INFO, media_log_.get(), num_playback_rate_logs_,
+@@ -3059,6 +3172,7 @@ media::PipelineStatus WebMediaPlayerImpl::OnDemuxerCreated(
+     bool is_static) {
+   CHECK_NE(demuxer, nullptr);
+   seeking_ = true;
++  CaptureNoteTransition();
+ 
+   if (start_type != media::Pipeline::StartType::kNormal) {
+     attempting_suspended_start_ = true;
+@@ -3274,6 +3388,7 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
+       preroll_attempt_pending_ = true;
+       preroll_attempt_start_time_ = base::TimeTicks();
+     }
++    CaptureNoteTransition();
+     pipeline_controller_->Suspend();
+   } else {
+     // When resuming, start the preroll attempt clock.
+@@ -3281,6 +3396,7 @@ void WebMediaPlayerImpl::SetSuspendState(bool is_suspended) {
+       preroll_attempt_pending_ = false;
+       preroll_attempt_start_time_ = tick_clock_->NowTicks();
+     }
++    CaptureNoteTransition();
+     pipeline_controller_->Resume();
+   }
+ }
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.h b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+index 40e0e7c376..7e2f246b5d 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.h
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+@@ -46,6 +46,8 @@
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "services/media_session/public/cpp/media_position.h"
++#include "third_party/blink/public/platform/media/web_capture_media_registry.h"
++#include "third_party/blink/public/platform/scheduler/web_scoped_virtual_time_pauser.h"
+ #include "third_party/blink/public/platform/media/web_media_player_builder.h"
+ #include "third_party/blink/public/platform/media/web_media_player_delegate.h"
+ #include "third_party/blink/public/platform/web_audio_source_provider.h"
+@@ -182,6 +184,11 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+                                   CorsMode cors_mode,
+                                   bool is_cache_disabled) override;
+ 
++  // DeterministicChromium: state for the renderer's CaptureAgent
++  // (deterministic-capture/DESIGN.md 4.3 step 3). Main thread.
++  void CaptureState(WebCaptureMediaState* out) const;
++  bool CaptureIsStable() const;
++
+   // Playback controls.
+   void Play() override;
+   void UnlockBackgroundPlayback() override;
+@@ -751,6 +758,17 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+   // Scheduler of the frame the player belongs to.
+   raw_ptr<FrameScheduler> frame_scheduler_ = nullptr;
+ 
++  // DeterministicChromium: every play, pause, seek, rate change, suspend and
++  // resume holds virtual time until the pipeline is stable again (see
++  // CaptureNoteTransition()). No-ops outside --deterministic-capture.
++  void CaptureNoteTransition();
++  void CapturePostSettleProbe();
++  void CaptureSettleStep();
++  WebScopedVirtualTimePauser capture_pauser_;
++  bool capture_pauser_held_ = false;
++  bool capture_settle_probe_in_flight_ = false;
++  int capture_settle_rounds_ = 0;
++
+   // Returns whether the user recently interacted with the frame, to tell
+   // user-initiated play and pause apart.
+   const WebMediaPlayerBuilder::HasTransientUserActivationCB
+diff --git a/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc b/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
+index 513daf785f..9db46a198c 100644
+--- a/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
++++ b/third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+@@ -250,6 +251,23 @@ BASE_FEATURE(kLoadingModeFromPerformanceScenario,
+ 
+ 
+ 
++namespace {
++
++// DeterministicChromium: under --deterministic-capture, pausing virtual time
++// stops the clock but not the main thread. Media pipeline transitions hold a
++// virtual-time pauser until the media thread has settled; their completion
++// callbacks run on fenced queues, so the fence would deadlock the grant.
++// Delayed tasks remain gated by virtual time either way
++// (deterministic-capture/DESIGN.md 4.3 steps 1 and 3). Applies to the fences
++// inserted when virtual time stops and to queues created while it is stopped.
++bool FenceQueuesWhileVirtualTimePaused() {
++  static const bool capture =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("deterministic-capture");
++  return !capture;
++}
++
++}  // namespace
++
+ MainThreadSchedulerImpl::MainThreadSchedulerImpl(
+     std::unique_ptr<base::sequence_manager::SequenceManager> sequence_manager)
+     : MainThreadSchedulerImpl(sequence_manager.get()) {
+@@ -826,7 +844,8 @@ scoped_refptr<MainThreadTaskQueue> MainThreadSchedulerImpl::NewTaskQueue(
+   // be suspended by adding a fence to prevent immediate tasks from running when
+   // they're not supposed to.
+   if (!VirtualTimeAllowedToAdvance() &&
+-      !task_queue->CanRunWhenVirtualTimePaused()) {
++      !task_queue->CanRunWhenVirtualTimePaused() &&
++      FenceQueuesWhileVirtualTimePaused()) {
+     task_queue->GetTaskQueue()->InsertFence(
+         TaskQueue::InsertFencePosition::kNow);
+   }
+@@ -2013,6 +2032,9 @@ void MainThreadSchedulerImpl::OnVirtualTimeDisabled() {
+ }
+ 
+ void MainThreadSchedulerImpl::OnVirtualTimePaused() {
++  if (!FenceQueuesWhileVirtualTimePaused()) {
++    return;
++  }
+   for (const auto& pair : task_runners_) {
+     if (pair.first->CanRunWhenVirtualTimePaused())
+       continue;
+@@ -2023,6 +2045,9 @@ void MainThreadSchedulerImpl::OnVirtualTimePaused() {
+ }
+ 
+ void MainThreadSchedulerImpl::OnVirtualTimeResumed() {
++  if (!FenceQueuesWhileVirtualTimePaused()) {
++    return;
++  }
+   for (const auto& pair : task_runners_) {
+     if (pair.first->CanRunWhenVirtualTimePaused())
+       continue;
+-- 
+2.53.0
+

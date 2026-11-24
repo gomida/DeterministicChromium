@@ -1,0 +1,830 @@
+From e1176b746c9a4ee8df348c2ed6e348dd3b96f144 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 20:22:50 +0900
+Subject: [PATCH 4/8] headless: renderer CaptureAgent for the prepare step
+ (wake, media quiescence, markers)
+
+Patch 6 of the deterministic capture series. Every frame in a
+--deterministic-capture renderer gets a CaptureAgent (associated mojo
+interface, headless/public/mojom/capture_agent.mojom). After the virtual-time
+grant and before the BeginFrame, CaptureSession calls Prepare(): the agent
+round-trips the media and compositor threads so due work runs now, waits with
+media-thread round trips until no WebMediaPlayerImpl has a pipeline operation
+in flight (bounded by media.waitTimeoutMs; media.failOnWaitTimeout chooses
+error or warning), flushes the media element event queues so canplay/ended
+handlers run before the main frame, and collects performance.mark entries
+with the configured prefix from an isolated world. Marks are attributed to
+frames by age (a mark made in frame n-1's rAF belongs to n-1). advance
+responses now carry markers, media states, prepare/wake/quiesce timings and
+warnings; features markers and prepare are advertised.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ headless/BUILD.gn                             |  10 +
+ .../lib/browser/capture/capture_session.cc    | 174 ++++++++++++-
+ .../lib/browser/capture/capture_session.h     |  32 ++-
+ .../protocol/deterministic_capture_handler.cc |   2 +-
+ headless/lib/renderer/DEPS                    |   1 +
+ headless/lib/renderer/capture_agent.cc        | 245 ++++++++++++++++++
+ headless/lib/renderer/capture_agent.h         |  67 +++++
+ .../headless_content_renderer_client.cc       |   5 +
+ headless/public/mojom/capture_agent.mojom     |  58 +++++
+ 9 files changed, 584 insertions(+), 10 deletions(-)
+ create mode 100644 headless/lib/renderer/capture_agent.cc
+ create mode 100644 headless/lib/renderer/capture_agent.h
+ create mode 100644 headless/public/mojom/capture_agent.mojom
+
+diff --git a/headless/BUILD.gn b/headless/BUILD.gn
+index dfc1a56d8f..edcc57e4ae 100644
+--- a/headless/BUILD.gn
++++ b/headless/BUILD.gn
+@@ -233,17 +233,26 @@ source_set("headless_common") {
+   ]
+ }
+ 
++mojom("capture_agent_mojom") {
++  sources = [ "public/mojom/capture_agent.mojom" ]
++  public_deps = [ "//mojo/public/mojom/base" ]
++}
++
+ source_set("headless_renderer") {
+   sources = [
+     "lib/renderer/allowlist.cc",
+     "lib/renderer/allowlist.h",
++    "lib/renderer/capture_agent.cc",
++    "lib/renderer/capture_agent.h",
+     "lib/renderer/headless_content_renderer_client.cc",
+     "lib/renderer/headless_content_renderer_client.h",
+   ]
+ 
+   deps = [
++    ":capture_agent_mojom",
+     "//content/public/common",
+     "//gin",
++    "//mojo/public/cpp/bindings",
+     "//printing/buildflags",
+     "//third_party/blink/public:blink",
+     "//ui/gl",
+@@ -381,6 +390,7 @@ source_set("headless_browser") {
+ 
+   deps = [
+     ":backend_cdp_bindings",
++    ":capture_agent_mojom",
+     ":headless_common",
+     "//base:base_static",
+     "//build:branding_buildflags",
+diff --git a/headless/lib/browser/capture/capture_session.cc b/headless/lib/browser/capture/capture_session.cc
+index d85dcaeba3..fa785a2ee6 100644
+--- a/headless/lib/browser/capture/capture_session.cc
++++ b/headless/lib/browser/capture/capture_session.cc
+@@ -12,10 +12,12 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
+ #include "headless/lib/browser/capture/canonical_hash.h"
+ #include "headless/lib/browser/headless_web_contents_impl.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ 
+ namespace headless::capture {
+@@ -140,7 +142,7 @@ void CaptureSession::Configure(base::DictValue config,
+     return;
+   }
+   // Feature negotiation: everything this build implements.
+-  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"};
++  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"};
+   if (const base::ListValue* required = config.FindList("requiredFeatures")) {
+     for (const base::Value& feature : *required) {
+       const std::string* name = feature.GetIfString();
+@@ -167,6 +169,38 @@ void CaptureSession::Configure(base::DictValue config,
+     }
+   }
+   RawFrameSink::Config sink_config;
++  if (const base::DictValue* markers = config.FindDict("markers")) {
++    if (const std::string* prefix = markers->FindString("prefix")) {
++      marker_prefix_ = *prefix;
++    }
++    collect_marks_ = true;
++    if (const base::ListValue* sources = markers->FindList("sources")) {
++      collect_marks_ = false;
++      for (const base::Value& source : *sources) {
++        if (source.is_string() && source.GetString() == "performanceMark") {
++          collect_marks_ = true;
++        }
++      }
++    }
++  }
++  if (const base::DictValue* media = config.FindDict("media")) {
++    if (std::optional<double> ms = media->FindDouble("waitTimeoutMs")) {
++      media_wait_timeout_ms_ = *ms;
++    }
++    fail_on_media_wait_timeout_ = media->FindBool("failOnWaitTimeout").value_or(true);
++  }
++  base::DictValue effective_markers;
++  effective_markers.Set("prefix", marker_prefix_);
++  base::ListValue effective_sources;
++  if (collect_marks_) {
++    effective_sources.Append("performanceMark");
++  }
++  effective_markers.Set("sources", std::move(effective_sources));
++  effective_config_.Set("markers", std::move(effective_markers));
++  base::DictValue effective_media;
++  effective_media.Set("waitTimeoutMs", media_wait_timeout_ms_);
++  effective_media.Set("failOnWaitTimeout", fail_on_media_wait_timeout_);
++  effective_config_.Set("media", std::move(effective_media));
+   if (const base::DictValue* sink = config.FindDict("frameSink")) {
+     const std::string* type = sink->FindString("type");
+     if (type && *type == "shm") {
+@@ -303,11 +337,128 @@ void CaptureSession::OnGranted(std::unique_ptr<PendingAdvance> pending,
+     std::move(pending->callback).Run(err, base::DictValue());
+     return;
+   }
+-  // TODO(patch 5): wake non-main renderer threads, quiesce media transitions,
+-  // render audio to T, collect markers (CaptureAgent.Prepare).
++  PrepareFrame(std::move(pending));
++}
++
++void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
++  content::RenderFrameHost* rfh = web_contents_->GetPrimaryMainFrame();
++  if (!rfh || !rfh->IsRenderFrameLive()) {
++    Error err{"RendererCrashed", "no live main frame for prepare"};
++    Fail(err);
++    std::move(pending->callback).Run(err, base::DictValue());
++    return;
++  }
++  if (!agent_.is_bound() || rfh->GetGlobalId() != agent_frame_id_) {
++    agent_.reset();
++    rfh->GetRemoteAssociatedInterfaces()->GetInterface(&agent_);
++    agent_.set_disconnect_handler(
++        base::BindOnce(&CaptureSession::OnAgentDisconnected, weak_factory_.GetWeakPtr()));
++    agent_frame_id_ = rfh->GetGlobalId();
++  }
++  const int64_t index = pending->frame_index;
++  auto params = mojom::PrepareParams::New();
++  params->frame_index = index;
++  params->frame_interval_ms =
++      (FrameOffsetMicros(index + 1) - FrameOffsetMicros(index)) / 1000.0;
++  params->marker_prefix = marker_prefix_;
++  params->collect_marks = collect_marks_;
++  params->wait_timeout_ms = media_wait_timeout_ms_;
++  prepare_pending_ = std::move(pending);
++  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
++                       base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
++  agent_->Prepare(std::move(params),
++                  base::BindOnce(&CaptureSession::OnPrepared, weak_factory_.GetWeakPtr(), index));
++}
++
++void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr result) {
++  if (!prepare_pending_ || prepare_pending_->frame_index != frame_index) {
++    return;  // answered already by a timeout or a disconnect
++  }
++  prepare_timer_.Stop();
++  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
++  pending->after_prepare = base::TimeTicks::Now();
++  prepare_ms_.push_back((pending->after_prepare - pending->after_grant).InMillisecondsF());
++  wake_ms_.push_back(result->wake_ms);
++  quiesce_ms_.push_back(result->quiesce_ms);
++  pending->wake_ms = result->wake_ms;
++  pending->quiesce_ms = result->quiesce_ms;
++  pending->audio_ms = result->audio_ms;
++  const double interval_ms =
++      (FrameOffsetMicros(frame_index + 1) - FrameOffsetMicros(frame_index)) / 1000.0;
++  for (const mojom::CaptureMarkerPtr& marker : result->markers) {
++    // A mark made during the grant for frame n (age < one interval) belongs
++    // to n; one made in frame n-1's rAF (age == one interval, +-0.1 ms of
++    // TimeClamper rounding) belongs to n-1. The quarter-millisecond slack
++    // keeps the rounding on the right side of the boundary.
++    int64_t frames_back = 0;
++    if (interval_ms > 0) {
++      frames_back = static_cast<int64_t>((marker->age_ms + 0.25) / interval_ms);
++    }
++    base::DictValue m;
++    m.Set("name", marker->name);
++    m.Set("frameIndex", static_cast<double>(std::max<int64_t>(0, frame_index - frames_back)));
++    m.Set("source", marker->source);
++    m.Set("ageMs", marker->age_ms);
++    pending->markers.Append(std::move(m));
++  }
++  for (const mojom::CaptureMediaStatePtr& media : result->media) {
++    base::DictValue m;
++    m.Set("playerId", media->player_id);
++    m.Set("state", media->state);
++    m.Set("mediaTimeMs", media->media_time_ms);
++    m.Set("stable", media->stable);
++    m.Set("hasVideo", media->has_video);
++    m.Set("hasAudio", media->has_audio);
++    pending->media.Append(std::move(m));
++  }
++  for (const std::string& warning : result->warnings) {
++    pending->warnings.Append(warning);
++  }
++  if (!result->timed_out_players.empty()) {
++    base::DictValue details;
++    base::ListValue players;
++    for (int32_t id : result->timed_out_players) {
++      players.Append(id);
++    }
++    details.Set("players", std::move(players));
++    details.Set("media", pending->media.Clone());
++    details.Set("frameIndex", static_cast<double>(frame_index));
++    if (fail_on_media_wait_timeout_) {
++      Error err{"MediaWaitTimeout", "media pipelines did not settle within the wait timeout", std::move(details)};
++      Fail(err);
++      std::move(pending->callback).Run(err, base::DictValue());
++      return;
++    }
++    pending->warnings.Append("MediaWaitTimeout: " + base::NumberToString(result->timed_out_players.size()) +
++                             " player(s) still unstable; continuing (media.failOnWaitTimeout=false)");
++  }
+   IssueBeginFrame(std::move(pending));
+ }
+ 
++void CaptureSession::OnPrepareTimeout() {
++  if (!prepare_pending_) {
++    return;
++  }
++  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
++  base::DictValue details;
++  details.Set("frameIndex", static_cast<double>(pending->frame_index));
++  Error err{"PrepareTimeout", "renderer did not answer CaptureAgent.Prepare", std::move(details)};
++  Fail(err);
++  std::move(pending->callback).Run(err, base::DictValue());
++}
++
++void CaptureSession::OnAgentDisconnected() {
++  agent_.reset();
++  if (!prepare_pending_) {
++    return;
++  }
++  prepare_timer_.Stop();
++  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
++  Error err{"RendererCrashed", "CaptureAgent disconnected during prepare"};
++  Fail(err);
++  std::move(pending->callback).Run(err, base::DictValue());
++}
++
+ void CaptureSession::IssueBeginFrame(std::unique_ptr<PendingAdvance> pending) {
+   HeadlessWebContentsImpl* headless_contents = HeadlessWebContentsImpl::From(web_contents_);
+   if (!headless_contents || !headless_contents->begin_frame_control_enabled()) {
+@@ -334,7 +485,7 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
+                                      std::unique_ptr<SkBitmap> bitmap,
+                                      std::string error) {
+   pending->after_begin_frame = base::TimeTicks::Now();
+-  begin_frame_ms_.push_back((pending->after_begin_frame - pending->after_grant).InMillisecondsF());
++  begin_frame_ms_.push_back((pending->after_begin_frame - pending->after_prepare).InMillisecondsF());
+   if (!error.empty()) {
+     Error err{"RendererCrashed", "BeginFrame failed: " + error};
+     Fail(err);
+@@ -500,16 +651,20 @@ void CaptureSession::Respond(std::unique_ptr<PendingAdvance> pending,
+   r.Set("reusedReadback", reused);
+   r.Set("surfaceWarmed", pending->retried_for_surface);
+   r.Set("audioSampleFrames", 0);  // TODO(patch 7)
+-  r.Set("markers", base::ListValue());  // TODO(patch 5)
+-  r.Set("media", base::ListValue());    // TODO(patch 5)
++  r.Set("markers", std::move(pending->markers));
++  r.Set("media", std::move(pending->media));
+   base::DictValue timings;
+   timings.Set("grantMs", (pending->after_grant - pending->started).InMillisecondsF());
+-  timings.Set("beginFrameMs", (pending->after_begin_frame - pending->after_grant).InMillisecondsF());
++  timings.Set("prepareMs", (pending->after_prepare - pending->after_grant).InMillisecondsF());
++  timings.Set("wakeMs", pending->wake_ms);
++  timings.Set("quiesceMs", pending->quiesce_ms);
++  timings.Set("audioMs", pending->audio_ms);
++  timings.Set("beginFrameMs", (pending->after_begin_frame - pending->after_prepare).InMillisecondsF());
+   timings.Set("queueDepth", inflight_);
+   timings.Set("sinkQueued", sink_ ? static_cast<double>(sink_->frames_queued()) : 0.0);
+   r.Set("timings", std::move(timings));
+   r.Set("completed", TakeCompleted());
+-  r.Set("warnings", base::ListValue());
++  r.Set("warnings", std::move(pending->warnings));
+   last_response_ = r.Clone();
+   last_response_frame_ = index;
+   std::move(pending->callback).Run(std::nullopt, std::move(r));
+@@ -607,6 +762,9 @@ void CaptureSession::OnDrained(ResultCallback callback) {
+   }
+   base::DictValue histograms;
+   histograms.Set("grantMs", Histogram(grant_ms_));
++  histograms.Set("prepareMs", Histogram(prepare_ms_));
++  histograms.Set("wakeMs", Histogram(wake_ms_));
++  histograms.Set("quiesceMs", Histogram(quiesce_ms_));
+   histograms.Set("beginFrameMs", Histogram(begin_frame_ms_));
+   histograms.Set("hashMs", Histogram(hash_ms_));
+   histograms.Set("sinkMs", Histogram(sink_ms_));
+diff --git a/headless/lib/browser/capture/capture_session.h b/headless/lib/browser/capture/capture_session.h
+index 474f0fb574..94bd0edd36 100644
+--- a/headless/lib/browser/capture/capture_session.h
++++ b/headless/lib/browser/capture/capture_session.h
+@@ -16,10 +16,14 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
++#include "base/timer/timer.h"
+ #include "base/values.h"
++#include "content/public/browser/global_routing_id.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ #include "headless/lib/browser/capture/raw_frame_sink.h"
+ #include "headless/lib/browser/capture/virtual_time_owner.h"
++#include "headless/public/mojom/capture_agent.mojom.h"
++#include "mojo/public/cpp/bindings/associated_remote.h"
+ 
+ class SkBitmap;
+ 
+@@ -115,7 +119,15 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+     bool hash;
+     base::TimeTicks started;
+     base::TimeTicks after_grant;
++    base::TimeTicks after_prepare;
+     base::TimeTicks after_begin_frame;
++    // Filled by the renderer agent (DESIGN.md 4.3 steps 2-5).
++    base::ListValue markers;
++    base::ListValue media;
++    base::ListValue warnings;
++    double wake_ms = 0;
++    double quiesce_ms = 0;
++    double audio_ms = 0;
+     // Set when the surface did not exist before this frame's BeginFrame and a
+     // second BeginFrame at the same frame time was issued to obtain readback
+     // (only ever the first frame; DESIGN.md 4.3 step 8).
+@@ -139,6 +151,13 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+   // renderer agent).
+   void RunAdvance(std::unique_ptr<PendingAdvance> pending);
+   void OnGranted(std::unique_ptr<PendingAdvance> pending, std::optional<std::string> error);
++  // Steps 2-5 through the renderer's CaptureAgent. The pending advance is
++  // held in prepare_pending_ while the renderer works so a timeout or a
++  // renderer exit can still answer the controller.
++  void PrepareFrame(std::unique_ptr<PendingAdvance> pending);
++  void OnPrepared(int64_t frame_index, mojom::PrepareResultPtr result);
++  void OnPrepareTimeout();
++  void OnAgentDisconnected();
+   void IssueBeginFrame(std::unique_ptr<PendingAdvance> pending);
+   void OnFrameFinished(std::unique_ptr<PendingAdvance> pending, bool has_damage,
+                        std::unique_ptr<SkBitmap> bitmap, std::string error);
+@@ -167,6 +186,14 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+   int height_ = 0;
+ 
+   std::unique_ptr<VirtualTimeOwner> virtual_time_;
++  mojo::AssociatedRemote<mojom::CaptureAgent> agent_;
++  content::GlobalRenderFrameHostId agent_frame_id_;
++  std::unique_ptr<PendingAdvance> prepare_pending_;
++  base::OneShotTimer prepare_timer_;
++  std::string marker_prefix_ = "dcap:";
++  bool collect_marks_ = true;
++  double media_wait_timeout_ms_ = 10000;
++  bool fail_on_media_wait_timeout_ = true;
+   std::unique_ptr<RawFrameSink> sink_;
+   bool sink_wants_frames_ = false;
+   scoped_refptr<base::SequencedTaskRunner> worker_;
+@@ -189,7 +216,10 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+   int gpu_process_crashes_ = 0;
+   std::optional<SinkError> first_sink_error_;
+   std::vector<double> grant_ms_;
+-  std::vector<double> begin_frame_ms_;  // grant to frame-finished; includes the GPU readback
++  std::vector<double> prepare_ms_;      // grant to agent reply (wake + quiesce + audio + marks)
++  std::vector<double> wake_ms_;
++  std::vector<double> quiesce_ms_;
++  std::vector<double> begin_frame_ms_;  // prepare to frame-finished; includes the GPU readback
+   std::vector<double> hash_ms_;
+   std::vector<double> sink_ms_;
+ 
+diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.cc b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+index 4ecbc2b065..bbce82116b 100644
+--- a/headless/lib/browser/protocol/deterministic_capture_handler.cc
++++ b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+@@ -148,7 +148,7 @@ Response DeterministicCaptureHandler::GetCapabilities(
+   // Features appear as the patch series lands them.
+   auto features =
+       std::make_unique<protocol::Array<DeterministicCapture::Feature>>();
+-  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"}) {
++  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"}) {
+     features->push_back(DeterministicCapture::Feature::Create()
+                             .SetName(name)
+                             .SetVersion(1)
+diff --git a/headless/lib/renderer/DEPS b/headless/lib/renderer/DEPS
+index 700424421f..3e5b8234bf 100644
+--- a/headless/lib/renderer/DEPS
++++ b/headless/lib/renderer/DEPS
+@@ -2,6 +2,7 @@ include_rules = [
+   "+components/printing/renderer",
+   "+content/public/renderer",
+   "+media/base",
++  "+mojo/public/cpp/bindings",
+   "+printing",
+   "+third_party/blink/public",
+   "+v8/include",
+diff --git a/headless/lib/renderer/capture_agent.cc b/headless/lib/renderer/capture_agent.cc
+new file mode 100644
+index 0000000000..edb08966ec
+--- /dev/null
++++ b/headless/lib/renderer/capture_agent.cc
+@@ -0,0 +1,245 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/renderer/capture_agent.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/barrier_closure.h"
++#include "base/functional/callback_helpers.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/string_escape.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time_override.h"
++#include "content/public/common/isolated_world_ids.h"
++#include "gin/converter.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
++#include "third_party/blink/public/platform/media/web_capture_media_registry.h"
++#include "third_party/blink/public/platform/platform.h"
++#include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
++#include "third_party/blink/public/platform/task_type.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_script_source.h"
++#include "v8/include/v8.h"
++
++namespace headless {
++
++namespace {
++
++// Isolated world used to read the performance timeline without touching the
++// page's own JavaScript state. Content reserves ids up to
++// ISOLATED_WORLD_ID_CONTENT_END; embedders may use the ten above it.
++constexpr int32_t kCaptureWorldId = content::ISOLATED_WORLD_ID_CONTENT_END + 1;
++
++// Returns a flat JSON array [name, startTime, age, name, startTime, age, ...]
++// of the marks with the prefix. `age` is performance.now() - startTime at the
++// moment of collection: with virtual time paused at T_n, that is how far
++// before T_n the mark was made.
++constexpr char kCollectMarksScript[] =
++    "(function(prefix){"
++    "const now=performance.now();const out=[];"
++    "for(const e of performance.getEntriesByType('mark')){"
++    "if(e.name.startsWith(prefix)){out.push(e.name,e.startTime,now-e.startTime);}}"
++    "return JSON.stringify(out);})(";
++
++}  // namespace
++
++CaptureAgent::CaptureAgent(content::RenderFrame* render_frame)
++    : content::RenderFrameObserver(render_frame) {
++  render_frame->GetAssociatedInterfaceRegistry()->AddInterface<mojom::CaptureAgent>(
++      base::BindRepeating(&CaptureAgent::BindReceiver, weak_factory_.GetWeakPtr()));
++}
++
++CaptureAgent::~CaptureAgent() = default;
++
++void CaptureAgent::OnDestruct() {
++  delete this;
++}
++
++void CaptureAgent::DidCreateNewDocument() {
++  reported_marks_.clear();
++}
++
++void CaptureAgent::BindReceiver(
++    mojo::PendingAssociatedReceiver<mojom::CaptureAgent> receiver) {
++  receiver_.reset();
++  receiver_.Bind(std::move(receiver));
++}
++
++void CaptureAgent::Prepare(mojom::PrepareParamsPtr params, PrepareCallback callback) {
++  auto pending = std::make_unique<Pending>();
++  pending->params = std::move(params);
++  pending->callback = std::move(callback);
++  pending->started = base::subtle::TimeTicksNowIgnoringOverride();
++
++  // Durations are measured with the real clock: base::TimeTicks::Now() in a
++  // capture renderer is virtual time, which is paused here.
++  // Step 2 (wake): a round trip through the media thread and the compositor
++  // thread runs every task already due there before we go on, so work that
++  // became due during the grant does not land at a real-time-dependent later
++  // moment.
++  std::vector<scoped_refptr<base::SequencedTaskRunner>> runners;
++  if (auto media = blink::Platform::Current()->MediaThreadTaskRunner()) {
++    runners.push_back(std::move(media));
++  }
++  if (auto compositor = blink::Platform::Current()->CompositorThreadTaskRunner()) {
++    runners.push_back(std::move(compositor));
++  }
++  if (runners.empty()) {
++    OnWoken(std::move(pending));
++    return;
++  }
++  Pending* raw = pending.get();
++  base::RepeatingClosure barrier = base::BarrierClosure(
++      runners.size(),
++      base::BindOnce(&CaptureAgent::OnWoken, weak_factory_.GetWeakPtr(), std::move(pending)));
++  (void)raw;
++  for (auto& runner : runners) {
++    runner->PostTaskAndReply(FROM_HERE, base::DoNothing(), barrier);
++  }
++}
++
++void CaptureAgent::OnWoken(std::unique_ptr<Pending> pending) {
++  pending->woken = base::subtle::TimeTicksNowIgnoringOverride();
++  Quiesce(std::move(pending));
++}
++
++void CaptureAgent::Quiesce(std::unique_ptr<Pending> pending) {
++  // Step 3: wait until no player has a pipeline operation in flight and no
++  // play, pause, seek or rate change happened since the previous snapshot.
++  // Each round is a media-thread round trip (play and rate changes have no
++  // acknowledgement, so the trip is what makes them land). The main thread is
++  // never blocked.
++  blink::WebCaptureMediaSnapshot snapshot = blink::WebCaptureMediaRegistry::Snapshot();
++  const bool all_stable = std::all_of(snapshot.players.begin(), snapshot.players.end(),
++                                      [](const blink::WebCaptureMediaState& p) { return p.stable; });
++  const bool settled = all_stable && pending->rounds > 0 &&
++                       snapshot.transitions == pending->last_transitions;
++  pending->last_transitions = snapshot.transitions;
++  const double waited_ms =
++      (base::subtle::TimeTicksNowIgnoringOverride() - pending->woken).InMillisecondsF();
++  const bool timed_out = !settled && waited_ms >= pending->params->wait_timeout_ms;
++  if (snapshot.players.empty() || settled || timed_out) {
++    pending->quiesced = base::subtle::TimeTicksNowIgnoringOverride();
++    auto result = mojom::PrepareResult::New();
++    for (const blink::WebCaptureMediaState& p : snapshot.players) {
++      auto state = mojom::CaptureMediaState::New();
++      state->player_id = p.player_id;
++      state->state = p.state;
++      state->media_time_ms = p.media_time_ms;
++      state->stable = p.stable;
++      state->has_video = p.has_video;
++      state->has_audio = p.has_audio;
++      result->media.push_back(std::move(state));
++      if (timed_out && !p.stable) {
++        result->timed_out_players.push_back(p.player_id);
++      }
++    }
++    FlushMediaEvents(std::move(pending), std::move(result), 0);
++    return;
++  }
++  ++pending->rounds;
++  scoped_refptr<base::SequencedTaskRunner> media = blink::Platform::Current()->MediaThreadTaskRunner();
++  if (!media) {
++    media = base::SequencedTaskRunner::GetCurrentDefault();
++  }
++  // A short real-time pause between rounds keeps a long decoder start from
++  // turning into a busy loop; the media thread does the work meanwhile.
++  base::OnceClosure next =
++      base::BindOnce(&CaptureAgent::Quiesce, weak_factory_.GetWeakPtr(), std::move(pending));
++  media->PostTaskAndReply(FROM_HERE, base::BindOnce([] {
++                            base::PlatformThread::Sleep(base::Microseconds(250));
++                          }),
++                          std::move(next));
++}
++
++void CaptureAgent::FlushMediaEvents(std::unique_ptr<Pending> pending,
++                                    mojom::PrepareResultPtr result,
++                                    int stage) {
++  // Step 4: media element events (canplay, playing, timeupdate, ended) are
++  // queued as ordinary tasks; the BeginFrame arrives on the compositor queue
++  // and may overtake them. Tasks of equal priority run in posting order, so a
++  // round trip through the media queues guarantees everything queued before
++  // it has run before the browser issues the BeginFrame.
++  static constexpr blink::TaskType kQueues[] = {blink::TaskType::kMediaElementEvent,
++                                                blink::TaskType::kInternalMedia};
++  content::RenderFrame* frame = render_frame();
++  if (!frame || stage >= static_cast<int>(std::size(kQueues))) {
++    Complete(std::move(pending), std::move(result));
++    return;
++  }
++  frame->GetTaskRunner(kQueues[stage])->PostTask(
++      FROM_HERE, base::BindOnce(&CaptureAgent::FlushMediaEvents, weak_factory_.GetWeakPtr(),
++                                std::move(pending), std::move(result), stage + 1));
++}
++
++void CaptureAgent::Complete(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result) {
++  if (pending->params->collect_marks) {
++    CollectMarks(*pending->params, result.get());
++  }
++  const base::TimeTicks done = base::subtle::TimeTicksNowIgnoringOverride();
++  result->wake_ms = (pending->woken - pending->started).InMillisecondsF();
++  result->quiesce_ms = (pending->quiesced - pending->woken).InMillisecondsF();
++  result->audio_ms = (done - pending->quiesced).InMillisecondsF();
++  std::move(pending->callback).Run(std::move(result));
++}
++
++void CaptureAgent::CollectMarks(const mojom::PrepareParams& params, mojom::PrepareResult* result) {
++  content::RenderFrame* frame = render_frame();
++  if (!frame || !frame->GetWebFrame()) {
++    result->warnings.push_back("markers: no frame");
++    return;
++  }
++  blink::WebLocalFrame* web_frame = frame->GetWebFrame();
++  v8::Isolate* isolate = web_frame->GetAgentGroupScheduler()->Isolate();
++  v8::HandleScope handle_scope(isolate);
++  const std::string source = std::string(kCollectMarksScript) +
++                             base::GetQuotedJSONString(params.marker_prefix) + ")";
++  v8::Local<v8::Value> value = web_frame->ExecuteScriptInIsolatedWorldAndReturnValue(
++      kCaptureWorldId, blink::WebScriptSource(blink::WebString::FromUtf8(source)),
++      blink::BackForwardCacheAware::kAllow);
++  if (value.IsEmpty() || !value->IsString()) {
++    result->warnings.push_back("markers: performance timeline unavailable");
++    return;
++  }
++  std::optional<base::Value> parsed = base::JSONReader::Read(gin::V8ToString(isolate, value), base::JSON_PARSE_RFC);
++  if (!parsed || !parsed->is_list()) {
++    result->warnings.push_back("markers: unreadable result");
++    return;
++  }
++  const base::ListValue& flat = parsed->GetList();
++  std::map<std::pair<std::string, double>, int> seen;
++  for (size_t i = 0; i + 2 < flat.size(); i += 3) {
++    const std::string* name = flat[i].GetIfString();
++    const bool numeric = (flat[i + 1].is_double() || flat[i + 1].is_int()) &&
++                         (flat[i + 2].is_double() || flat[i + 2].is_int());
++    if (!name || !numeric) {
++      continue;
++    }
++    const double start = flat[i + 1].GetDouble();
++    const double age = flat[i + 2].GetDouble();
++    const std::pair<std::string, double> key(*name, start);
++    int& count = seen[key];
++    ++count;
++    if (count <= reported_marks_[key]) {
++      continue;  // already reported on an earlier frame
++    }
++    auto marker = mojom::CaptureMarker::New();
++    marker->name = *name;
++    marker->source = "performanceMark";
++    marker->age_ms = age;
++    result->markers.push_back(std::move(marker));
++  }
++  // Remember what has been reported; forget marks the page cleared.
++  reported_marks_ = std::move(seen);
++}
++
++}  // namespace headless
+diff --git a/headless/lib/renderer/capture_agent.h b/headless/lib/renderer/capture_agent.h
+new file mode 100644
+index 0000000000..754a7b6a3e
+--- /dev/null
++++ b/headless/lib/renderer/capture_agent.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_RENDERER_CAPTURE_AGENT_H_
++#define HEADLESS_LIB_RENDERER_CAPTURE_AGENT_H_
++
++#include <map>
++#include <string>
++#include <utility>
++
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "content/public/renderer/render_frame.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "headless/public/mojom/capture_agent.mojom.h"
++#include "mojo/public/cpp/bindings/associated_receiver.h"
++#include "mojo/public/cpp/bindings/pending_associated_receiver.h"
++
++namespace headless {
++
++// Renderer side of DESIGN.md 4.3 steps 2-5, one per RenderFrame in a
++// --deterministic-capture renderer. Owned by the RenderFrame (deletes itself
++// in OnDestruct).
++class CaptureAgent : public content::RenderFrameObserver,
++                     public mojom::CaptureAgent {
++ public:
++  explicit CaptureAgent(content::RenderFrame* render_frame);
++  CaptureAgent(const CaptureAgent&) = delete;
++  CaptureAgent& operator=(const CaptureAgent&) = delete;
++  ~CaptureAgent() override;
++
++  // content::RenderFrameObserver:
++  void OnDestruct() override;
++  void DidCreateNewDocument() override;
++
++  // mojom::CaptureAgent:
++  void Prepare(mojom::PrepareParamsPtr params, PrepareCallback callback) override;
++
++ private:
++  struct Pending {
++    mojom::PrepareParamsPtr params;
++    PrepareCallback callback;
++    base::TimeTicks started;
++    base::TimeTicks woken;
++    base::TimeTicks quiesced;
++    int rounds = 0;
++    uint64_t last_transitions = 0;
++  };
++
++  void BindReceiver(mojo::PendingAssociatedReceiver<mojom::CaptureAgent> receiver);
++  void OnWoken(std::unique_ptr<Pending> pending);
++  void Quiesce(std::unique_ptr<Pending> pending);
++  void FlushMediaEvents(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result, int stage);
++  void Complete(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result);
++  void CollectMarks(const mojom::PrepareParams& params, mojom::PrepareResult* result);
++
++  mojo::AssociatedReceiver<mojom::CaptureAgent> receiver_{this};
++  // (name, startTime) -> occurrences already reported, so each mark is
++  // reported once even though performance.getEntriesByType returns all.
++  std::map<std::pair<std::string, double>, int> reported_marks_;
++  base::WeakPtrFactory<CaptureAgent> weak_factory_{this};
++};
++
++}  // namespace headless
++
++#endif  // HEADLESS_LIB_RENDERER_CAPTURE_AGENT_H_
+diff --git a/headless/lib/renderer/headless_content_renderer_client.cc b/headless/lib/renderer/headless_content_renderer_client.cc
+index df349d3bf6..28e686d07c 100644
+--- a/headless/lib/renderer/headless_content_renderer_client.cc
++++ b/headless/lib/renderer/headless_content_renderer_client.cc
+@@ -12,6 +12,7 @@
+ #include "content/public/common/web_identity.h"
+ #include "content/public/renderer/render_thread.h"
+ #include "headless/lib/common/headless_features.h"
++#include "headless/lib/renderer/capture_agent.h"
+ #include "headless/public/switches.h"
+ #include "media/base/video_codecs.h"
+ #include "printing/buildflags/buildflags.h"
+@@ -107,6 +108,10 @@ HeadlessContentRendererClient::~HeadlessContentRendererClient() = default;
+ 
+ void HeadlessContentRendererClient::RenderFrameCreated(
+     content::RenderFrame* render_frame) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kDeterministicCapture)) {
++    new CaptureAgent(render_frame);  // owned by the RenderFrame
++  }
+ #if BUILDFLAG(ENABLE_PRINTING)
+   new printing::PrintRenderFrameHelper(
+       render_frame, std::make_unique<HeadlessPrintRenderFrameHelperDelegate>());
+diff --git a/headless/public/mojom/capture_agent.mojom b/headless/public/mojom/capture_agent.mojom
+new file mode 100644
+index 0000000000..4942f4dc16
+--- /dev/null
++++ b/headless/public/mojom/capture_agent.mojom
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// DeterministicChromium: the browser's CaptureSession talks to the renderer's
++// CaptureAgent once per frame, between the virtual-time grant and the
++// BeginFrame (deterministic-capture/DESIGN.md 4.3 steps 2-5).
++module headless.mojom;
++
++struct PrepareParams {
++  // Frame about to be composited; its time is T_n = base + offset(n + 1).
++  int64 frame_index;
++  // offset(n + 1) - offset(n) in milliseconds; used to attribute marks.
++  double frame_interval_ms;
++  // Only performance marks whose name starts with this prefix are reported.
++  string marker_prefix;
++  bool collect_marks;
++  // Upper bound for the media quiescence wait.
++  double wait_timeout_ms;
++};
++
++struct CaptureMarker {
++  string name;
++  // "performanceMark"
++  string source;
++  // performance.now() at collection minus the mark's startTime, so the
++  // browser can attribute the mark to a frame without knowing timeOrigin.
++  double age_ms;
++};
++
++struct CaptureMediaState {
++  int32 player_id;
++  // "idle" | "playing" | "paused" | "ended" | "seeking" | "waiting"
++  string state;
++  double media_time_ms;
++  bool stable;
++  bool has_video;
++  bool has_audio;
++};
++
++struct PrepareResult {
++  array<CaptureMarker> markers;
++  array<CaptureMediaState> media;
++  double wake_ms;
++  double quiesce_ms;
++  double audio_ms;
++  // Players that were still unstable when wait_timeout_ms expired.
++  array<int32> timed_out_players;
++  array<string> warnings;
++};
++
++// Lives on the renderer main thread of every frame in a --deterministic-capture
++// renderer; the browser uses the primary main frame's instance.
++interface CaptureAgent {
++  // Wakes the media and compositor threads, waits for media pipelines to be
++  // stable, and collects marks. Never blocks the renderer main thread.
++  Prepare(PrepareParams params) => (PrepareResult result);
++};
+-- 
+2.53.0
+

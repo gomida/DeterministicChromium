@@ -1,0 +1,26 @@
+From 04ad011d7b447c03daff4ac8ca3f6437f08cbd4f Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 21:18:47 +0900
+Subject: [PATCH 8/8] headless: patch version 2.1.0-p10
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ headless/lib/browser/protocol/deterministic_capture_handler.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.h b/headless/lib/browser/protocol/deterministic_capture_handler.h
+index 8c8086adf1..34bf3d1f4e 100644
+--- a/headless/lib/browser/protocol/deterministic_capture_handler.h
++++ b/headless/lib/browser/protocol/deterministic_capture_handler.h
+@@ -78,7 +78,7 @@ class DeterministicCaptureHandler : public DomainHandler,
+       std::unique_ptr<protocol::DictionaryValue>* out_last_error) override;
+ 
+   static constexpr char kProtocolVersion[] = "2.1";
+-  static constexpr char kPatchVersion[] = "2.1.0-p5";
++  static constexpr char kPatchVersion[] = "2.1.0-p10";
+ 
+  private:
+   bool ModeEnabled() const;
+-- 
+2.53.0
+

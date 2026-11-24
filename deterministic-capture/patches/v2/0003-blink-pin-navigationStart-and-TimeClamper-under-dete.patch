@@ -1,7 +1,7 @@
 From ab28126233e7fd2e1845aef3f8930e2bcfeb309e Mon Sep 17 00:00:00 2001
 From: Sunwoong Joo <gomida@gmail.com>
 Date: Tue, 24 Nov 2026 19:17:44 +0900
-Subject: [PATCH 3/3] blink: pin navigationStart and TimeClamper under
+Subject: [PATCH 3/8] blink: pin navigationStart and TimeClamper under
  --deterministic-capture
 
 navigationStart came from browser wall time and shifted performance.timeOrigin

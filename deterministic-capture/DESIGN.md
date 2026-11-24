@@ -385,10 +385,16 @@ and is an open item (section 8).
 - Background rendering in `VideoFrameCompositor` is disabled in capture mode;
   canvas and WebGL readers of a video get the frame selected by the last
   BeginFrame, and `requestVideoFrameCallback` metadata uses capture time.
-- Virtual-time pausers are used only where Blink already uses them and
-  always as `kInstant` on the main thread; media transitions are handled by
-  quiescence (4.3 step 3), not by pausers, because a held pauser also stops
-  the main-thread delayed tasks some transitions need.
+- Media transitions hold a `kInstant` virtual-time pauser *(changed when
+  patch 7 was built; see 14.2)*: `WebMediaPlayerImpl` pauses virtual time
+  from every play, pause, seek, rate change, suspend, resume and pipeline
+  start until the media thread has absorbed it, no `PipelineController`
+  operation is pending and a running, unsuspended pipeline has reached
+  `HAVE_FUTURE_DATA`. The completion therefore lands at the virtual time of
+  the request. The earlier objection (a held pauser stops the main-thread
+  delayed tasks some transitions need) was real for `MultiBufferDataSource`'s
+  20 ms seek delay, which is now zero in capture mode; the quiescence wait of
+  4.3 step 3 remains as the fallback and the source of the `media` report.
 
 ### 4.6 Audio: renderer-side capture sinks
 
@@ -470,7 +476,8 @@ messaging, WebGPU asynchronous results, WebCodecs. The engine also pins
 `--force-effective-connection-type`, device scale factor, `Save-Data`,
 `--hide-scrollbars`, and installs a capture-mode hook in the renderer's
 `base::RandBytes`/`crypto::RandBytes` so `crypto.getRandomValues`, UUIDs and
-blob URLs repeat.
+blob URLs repeat *(built: `base::subtle::SetRandBytesOverride`, a seeded
+xoshiro256** stream from `--deterministic-capture-seed`; see 14.4)*.
 
 ### 4.9 Detection of unsupported APIs
 
@@ -690,11 +697,11 @@ patch builds and is testable:
 | 3 | CaptureSession, internal DevTools session for virtual time, RawFrameSink, canonical hash | `headless/lib/browser/capture/{capture_session,virtual_time_owner,raw_frame_sink,canonical_hash}.{h,cc}` |
 | 4 | `advance`/`advanceRange`/`finish` over BeginFrame and readback, pipelined responses | handler, `headless_web_contents_impl.cc` (minimal hook) |
 | 5 (built) | Canonical BGRA hashed in place, `shm` ring sink (`shm_ring.h`), `file`/`null` sinks, `fifo` removed, protocol 2.1; `angle_enable_gl=true` in the build profiles so `--use-angle=gl` exists | `capture/{canonical_hash,raw_frame_sink,shm_ring}.*`, `capture_session.cc`, handler, `build/*.gn` |
-| 6 | Renderer CaptureAgent: wake, quiescence, markers, ack verification | `headless/lib/renderer/capture_agent.{h,cc}`, `headless/public/mojom/capture_agent.mojom`, `headless_content_renderer_client.cc`, `CaptureMediaRegistry` in `third_party/blink/renderer/platform/media/` |
-| 7 | Capture-mode media: cancellable video wait, audio wait, submitter deadlines, timers, muted rendering | `media/renderers/video_renderer_impl.cc`, `audio_renderer_impl.cc`, `third_party/blink/renderer/platform/media/video_frame_compositor.cc`, `web_media_player_impl.cc`, `third_party/blink/renderer/platform/graphics/video_frame_submitter.cc`, `renderer_web_media_player_delegate.cc` |
-| 8 | Capture audio sinks and mixing | `headless/lib/renderer/capture_audio_device_factory.{h,cc}`, `capture_audio_renderer_sink.{h,cc}`, `renderer_webaudiodevice_impl.cc` (suspender off) |
-| 9 | Pausers for asynchronous completions, `TimeClamper`, RNG hook, worker auto-attach | Blink image decode, Web Audio decode, IndexedDB, `time_clamper.cc`, `base::RandBytes` hook |
-| 10 | Unsupported-API detection | use-counter hooks in the agent |
+| 6 (built) | Renderer CaptureAgent: wake, quiescence, markers, ack verification | `headless/lib/renderer/capture_agent.{h,cc}`, `headless/public/mojom/capture_agent.mojom`, `headless_content_renderer_client.cc`, `CaptureMediaRegistry` in `third_party/blink/renderer/platform/media/` |
+| 7 (built) | Capture-mode media: cancellable video wait, audio wait, submitter deadlines, timers, muted rendering | `media/renderers/video_renderer_impl.cc`, `audio_renderer_impl.cc`, `third_party/blink/renderer/platform/media/video_frame_compositor.cc`, `web_media_player_impl.cc`, `third_party/blink/renderer/platform/graphics/video_frame_submitter.cc`, `renderer_web_media_player_delegate.cc` |
+| 8 (built) | Capture audio sinks and mixing | `headless/lib/renderer/capture_audio_device_factory.{h,cc}`, `capture_audio_renderer_sink.{h,cc}`, `renderer_webaudiodevice_impl.cc` (suspender off) |
+| 9 (partial: `TimeClamper` in 3, RNG hook built; pausers for image/IndexedDB completions and worker auto-attach open) | Pausers for asynchronous completions, `TimeClamper`, RNG hook, worker auto-attach | Blink image decode, Web Audio decode, IndexedDB, `time_clamper.cc`, `base::RandBytes` hook |
+| 10 (built) | Unsupported-API detection | use-counter hooks in the agent |
 | 11 | Protocol tests and browser tests | `headless/test/data/protocol/deterministic_capture/*`, `headless/test/` |
 
 Budget for changes to existing upstream files: under 300 lines, tracked in
@@ -1004,14 +1011,35 @@ against a per-codec allowlist and echoed in `effective`:
 "output": {"dir": "./run", "container": "mp4", "keepChunks": false}
 ```
 
+Measured 2026-11-24 on captured frames (1920×1080, 30 fps, 90 frames of the
+video-plus-oscillator page, Mesa D3D12, `dcap` encoder thread, release
+build):
+
+| Codec (input) | Encode ms/frame | KB/frame | Lossless to the hash | Note |
+| --- | --- | --- | --- | --- |
+| `ffv1` (`bgr0`, level 3, 16 slices) | 6.0 | 162 | yes | smallest; below the engine's frame time, so off the critical path |
+| `utvideo` (`gbrp`) | 0.5 | 855 | yes | MOV only |
+| `magicyuv` (`gbrp`) | 0.4 | 858 | yes | MOV only |
+| `ffvhuff` (`bgra`, plane prediction) | 1.4 | 2074 | yes | MOV only; largest lossless |
+| `rawvideo` (`bgra`) | 4.0 (copy) | 8106 | yes | 747 MB for 3 s |
+| `h264_nvenc` (`yuv444p`, lossless tune, intra-only) | 2.0 | 169 | no (4:4:4 YUV) | hardware session per worker |
+| `hevc_nvenc` (`yuv444p`, lossless tune, intra-only) | 1.6 | 180 | no (4:4:4 YUV) | hardware session per worker |
+
+Wall time was 3.8-4.9 s for every codec: the engine, not the encoder, sets
+the pace at 1080p. Decision: FFV1 `bgr0` stays the default (one fifth the
+size of the fast lossless codecs, and its 6 ms sits under the engine's
+beginFrame time); `utvideo` or `magicyuv` when encoder CPU must be minimal
+and size does not matter; NVENC when a YUV deliverable is wanted directly.
+`dcap codecs` reports all seven as available on this workstation.
+
 ### 13.6 Stages and gates
 
 | Stage | Change | Gate |
 | --- | --- | --- |
 | 1 (done) | Engine path (13.2): BGRA canonical form, in-place hash, no UI-thread copy | Run-to-run identical hashes; 1080p gap 3.4 ms, 4K gap 12 ms (hash-bound, see 13.2) |
 | 2 (done) | `shm` sink in the browser; the encoder lives in the `dcap` binary itself (not a separate helper) reading the ring; fake engine writes the ring | No ffmpeg process in a run; `dcap` RSS 229 MB at 1280×720 including the encoder; hashes identical to the FIFO path |
-| 3 (done, video) | Join in `dcap`, controller spec and tests rewritten in Rust, FIFO path and Python deleted | Six end-to-end tests pass against the fake engine; exact 60000/1001 timestamps on a chunked run. Audio into chunks waits for patch 8 (the engine has no audio sink yet) |
-| 4 (open) | Codec matrix on captured frames (13.5); NVENC availability reporting | `dcap codecs` reports availability; the default stays FFV1 `bgr0` until a measured page decides |
+| 3 (done, video) | Join in `dcap`, controller spec and tests rewritten in Rust, FIFO path and Python deleted | Six end-to-end tests pass against the fake engine; exact 60000/1001 timestamps on a chunked run. Audio in chunks landed with patch 8: PCM rides in the ring slots, chunks carry it, joins assert exact sample counts (section 14.3) |
+| 4 (done) | Codec matrix on captured frames (13.5); NVENC availability reporting | Measured at 1080p; FFV1 `bgr0` stays the default; `dcap codecs` reports all seven encoders |
 
 ### 13.7 Rejected alternatives
 
@@ -1046,3 +1074,124 @@ MP4 join, and specified the index-based timestamps, chunk audio and the
 join rule. The adversarial review argued that the first draft optimized the
 wrong component, measured the CLI's 0.8 GB floor and the faster RGB intra
 codecs, and proposed the shared-memory helper that 13.3 adopts.
+
+## 14. Renderer agent, media and audio (implemented 2026-11-24/25)
+
+Patches 6-8 plus the RNG hook and the use-counter detection of 9-10 were
+built on `dev-v2` after section 13. The contract of 4.3-4.9 stands; the
+points below are where building it corrected the design.
+
+### 14.0 Result
+
+| Case | Result |
+| --- | --- |
+| Marker page (rAF `performance.mark`, a 200 ms timer mark), 60 fps, stop on `dcap:test:done` | Marks attributed to frames 10, 11 and 25 as the page intended; `repeat` verification equal |
+| Muted looping WebM (VP8, 30 fps capture, 120 frames) | Run-to-run identical; two chunks with pre-roll equal to the serial render frame by frame (`full`) |
+| WebM with Vorbis audio plus a Web Audio oscillator, 60000/1001, 150 frames in three chunks | Video and PCM hashes equal to the plan pass for every frame (300 comparisons); join holds exactly 120120 sample frames with `1001/60000` frame durations; `video.currentTime` reads exactly `n/30` at frame n at 30 fps |
+| Prepare cost per frame | 0.5-1.2 ms including the media-thread round trips, audio render and event-queue flush |
+
+### 14.1 Virtual time stops the main thread: the fence
+
+Blink's `ThreadSchedulerBase::SetVirtualTimeStopped(true)` inserts a fence on
+every main-thread task queue that cannot run while virtual time is paused
+(`MainThreadSchedulerImpl::OnVirtualTimePaused`), and again on queues created
+while stopped (`OnTaskQueueCreated`). Under policy `pause`, and under
+`pauseIfNetworkFetchesPending` whenever any pauser is held, no main-thread
+task runs: media pipeline completions (`OnPipelineStarted`, data-source
+reads, `canplay`) wait for the next grant and land at a real-time-dependent
+point of it, and a pauser held across a transition deadlocks because its
+settle callback is itself fenced. A media element's lazily created
+`kInternalMedia` queue stayed fenced forever once created while stopped.
+In capture mode the fence is not inserted at either place; delayed tasks
+remain gated by virtual time, so the clock is still frozen between grants
+while real work completes. This is the change that makes 4.3 steps 3-4
+possible.
+
+### 14.2 Media transitions hold virtual time
+
+With the fence gone, `WebMediaPlayerImpl` holds a `kInstant` pauser from each
+transition request until a media-thread round trip finds no pending
+`PipelineController` operation (new `HasPendingOperation()`), no seek, no
+suspend/resume cycle, and, for a running unsuspended pipeline,
+`readyState >= HAVE_FUTURE_DATA`. The last condition pins the preroll:
+without it `canplay` and the autoplay `play()` raced the first BeginFrame
+(frame 0 or 1 by decoder speed). `loadedmetadata`, `canplay`, `play` and
+`playing` all land in frame 0's grant at the virtual time of the load.
+`MultiBufferDataSource`'s 20 ms seek delay is zero in capture mode because
+a delayed task cannot fire while the pauser holds the clock.
+
+### 14.3 Audio
+
+- `AudioRendererImpl` outputs at the capture device rate through the
+  `AudioBufferConverter` (non-MSE playback otherwise keeps the stream rate,
+  which put a resampler and a buffer-sized FIFO between the clock and the
+  capture). A media element's sink is rendered as one request of exactly
+  `S(n+1) − S(n)` frames with zero reported delay, so `AudioClock` and
+  `video.currentTime` read exactly `T_n`; Web Audio destinations render
+  128-frame quanta into a FIFO reported as output delay, so
+  `AudioContext.currentTime` is the first quantum boundary at or past `T_n`
+  (`--deterministic-capture-audio=RATE,CHANNELS,128`).
+- The mix is a float sum in sink creation order, channel-mixed to the device
+  layout; PCM crosses mojo as `array<float>` (12.8 KB per 30 fps frame at 48
+  kHz stereo), the browser converts to `s16` or `f32`, hashes it
+  (`pcmFrameHash`), chains `pcmHash` and writes it beside the video into the
+  ring slot. Chunk audio pts are `S(start+n) − S(start)`, not `S(n)`: at
+  60000/1001 the intervals are 800 or 801 frames and the local formula lost a
+  sample at chunk boundaries. PCM audio moves the default container from MP4
+  to MOV.
+- `AudioRendererImpl::Render` waits for decoded audio instead of writing
+  silence; `VideoRendererImpl::Render` waits until the queued frames cover
+  the deadline. Both waits are cancelled before the sink pauses or stops.
+
+### 14.4 Randomness and unsupported APIs
+
+`base::subtle::SetRandBytesOverride` (new header
+`base/rand_util_deterministic_capture.h`, so `rand_util.h` is untouched)
+replaces the OS entropy source of a capture renderer with a seeded
+xoshiro256** stream (`--deterministic-capture-seed`, from
+`determinism.seed`); `crypto.getRandomValues`, `crypto.randomUUID` and blob
+URLs repeat. V8's `Math.random` was already seeded through `--js-flags`.
+The agent observes use counters (`RenderFrameObserver::DidObserveNewFeatureUsage`)
+for getUserMedia, getDisplayMedia, RTCPeerConnection, MediaRecorder,
+EncryptedMedia, captureStream, WebCodecs, WebGPU, ServiceWorker,
+SharedWorker and setSinkId, and the audio factory reports WebRTC and
+MediaStreamTrack sinks; each is reported once per document as
+`UnsupportedApiUsed: <api>` in the next response's warnings, or as the error
+`UnsupportedApiUsed{api}` when `media.failOnUnsupportedApi` is true (the
+default).
+
+### 14.5 Open after this round
+
+Pausers for image decode, `decodeAudioData` and IndexedDB completions and
+dedicated-worker auto-attach (patch 9); protocol and browser tests (patch
+11); `beginFrameMs` dominates 4K, so the frame hash is no longer the
+bottleneck and its replacement is deferred. Blob URL identifiers come from
+the browser process and still vary between runs; a page that renders them
+is not reproducible.
+
+### 14.6 Review of patches 6-8
+
+A code review (one agent, read-only, 2026-11-24) found ten defects, all
+fixed in the patch 9-10 commit: a failed pipeline start left `seeking_` set
+and held the pauser forever (now released in `OnError`, an errored network
+state counts as stable, and any hold is dropped after 20 s real time); muted
+elements were routed to the real-time `NullAudioSink`, so their clock was
+not pinned and the audio wait could block the media thread (the capture sink
+is now always used and applies the volume); the audio engine mixed through
+raw sink pointers that the media thread could free (refcounted list, removal
+on `Stop()`); the video wait could never cover the deadline for sources
+faster than three times the capture rate (reads bypass the soft cap during
+the wait); `audioSampleFrames` counted PCM the ring never received (counted
+on slot write); the resolved `markers`/`media`/`audio` defaults were dropped
+from `effective`; the ring geometry check ignored the audio area; the
+browser's prepare timer was shorter than the renderer's bounds; the audio
+wait created a `WeakPtr` on the wrong thread. The reviewer confirmed the
+agent lifetime handling, the settle loop, mark attribution, the `S(n+1)`
+arithmetic, the ring publication order, the s16 conversion and that every
+change is behind the capture switch.
+
+The upstream touch budget of section 7 (300 lines) is exceeded: about 650
+changed lines in 34 existing files (`patches/UPSTREAM_TOUCHES.txt`), two
+thirds of them in `web_media_player_impl.cc`, `audio_renderer_impl.cc` and
+`video_renderer_impl.cc`.
+

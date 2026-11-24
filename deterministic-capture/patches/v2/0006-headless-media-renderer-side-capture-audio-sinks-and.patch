@@ -1,0 +1,1323 @@
+From ede7c0e1e25642fb2e3e16a5a8d542b40f796196 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 20:51:36 +0900
+Subject: [PATCH 6/8] headless, media: renderer-side capture audio sinks and
+ PCM in the frame stream
+
+Patch 8 of the deterministic capture series.
+
+- CaptureAudioDeviceFactory replaces Blink's AudioDeviceFactory in
+  --deterministic-capture renderers: every media element and AudioContext
+  gets a CaptureAudioRendererSink that renders only when asked. Sinks are
+  registered with CaptureAudioEngine, which owns the capture audio thread and
+  the device format from --deterministic-capture-audio=RATE,CHANNELS,FRAMES
+  (default 48000,2,128).
+- CaptureAgent.Prepare step 4: the engine renders every sink through S(n+1)
+  device frames and returns the interval's float mix. Media elements are
+  rendered as one request of exactly the interval's frames with no output
+  delay, so AudioClock and video.currentTime read exactly T_n - start; Web
+  Audio destinations render whole 128-frame quanta into a FIFO reported as
+  output delay, so AudioContext.currentTime is the first quantum boundary at
+  or past T_n. Mixing is a float sum in creation order with ChannelMixer and
+  MultiChannelResampler for sinks whose format differs from the device.
+- CaptureSession checks the count against S(n+1) - S(n), converts to the
+  configured sample format (s16 or f32), hashes the interval (pcmFrameHash),
+  chains pcmHash, counts audioSampleFrames and hands the bytes to the shm
+  ring slot's audio area with the video frame; the ring's audio format is
+  validated against the configuration. Feature audioRender is advertised.
+- AudioRendererImpl: in capture mode the output uses the device rate through
+  the AudioBufferConverter (no sink-side resampling), and Render() waits for
+  decoded audio instead of writing silence, cancelled before the sink pauses
+  or stops.
+- RendererWebAudioDeviceImpl skips the SilentSinkSuspender in capture mode.
+
+Measured on 158 with a WebM carrying Vorbis audio plus an oscillator: PCM
+hashes identical across runs; a 150-frame 60000/1001 capture in three chunks
+equals the serial render frame by frame for video and PCM and joins to
+exactly 120120 sample frames.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../media/renderer_webaudiodevice_impl.cc     |   8 +
+ headless/BUILD.gn                             |   3 +
+ .../lib/browser/capture/capture_session.cc    |  96 ++++-
+ .../lib/browser/capture/capture_session.h     |  13 +
+ .../lib/browser/capture/raw_frame_sink.cc     |  25 +-
+ headless/lib/browser/capture/raw_frame_sink.h |  11 +
+ .../headless_content_browser_client.cc        |   1 +
+ .../protocol/deterministic_capture_handler.cc |   2 +-
+ headless/lib/renderer/capture_agent.cc        |  34 +-
+ headless/lib/renderer/capture_agent.h         |   3 +
+ headless/lib/renderer/capture_audio.cc        | 369 ++++++++++++++++++
+ headless/lib/renderer/capture_audio.h         | 160 ++++++++
+ .../headless_content_renderer_client.cc       |   4 +
+ .../headless_content_renderer_client.h        |   3 +
+ headless/public/mojom/capture_agent.mojom     |  11 +
+ headless/public/switches.h                    |   6 +
+ media/renderers/audio_renderer_impl.cc        |  68 +++-
+ media/renderers/audio_renderer_impl.h         |  12 +
+ 18 files changed, 819 insertions(+), 10 deletions(-)
+ create mode 100644 headless/lib/renderer/capture_audio.cc
+ create mode 100644 headless/lib/renderer/capture_audio.h
+
+diff --git a/content/renderer/media/renderer_webaudiodevice_impl.cc b/content/renderer/media/renderer_webaudiodevice_impl.cc
+index 7a7a77a34a..4274ef5854 100644
+--- a/content/renderer/media/renderer_webaudiodevice_impl.cc
++++ b/content/renderer/media/renderer_webaudiodevice_impl.cc
+@@ -27,6 +27,7 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "media/audio/audio_features.h"
++#include "media/base/deterministic_capture.h"
+ #include "media/audio/null_audio_sink.h"
+ #include "media/base/audio_bus.h"
+ #include "media/base/audio_glitch_info.h"
+@@ -359,6 +360,13 @@ void RendererWebAudioDeviceImpl::InitializeSink() {
+     return;
+   }
+ 
++  // DeterministicChromium: the suspender's silence timer and fake Render()
++  // calls are real-time behaviour; capture sinks render only on demand.
++  if (media::IsDeterministicCaptureMode()) {
++    sink_->Initialize(current_sink_params_, this);
++    is_sink_initialized_ = true;
++    return;
++  }
+   switch (sink_descriptor_.Type()) {
+     case blink::WebAudioSinkDescriptor::kAudible:
+       // Use a task runner instead of the render thread for fake Render() calls
+diff --git a/headless/BUILD.gn b/headless/BUILD.gn
+index edcc57e4ae..9e8a2d0ad2 100644
+--- a/headless/BUILD.gn
++++ b/headless/BUILD.gn
+@@ -244,6 +244,8 @@ source_set("headless_renderer") {
+     "lib/renderer/allowlist.h",
+     "lib/renderer/capture_agent.cc",
+     "lib/renderer/capture_agent.h",
++    "lib/renderer/capture_audio.cc",
++    "lib/renderer/capture_audio.h",
+     "lib/renderer/headless_content_renderer_client.cc",
+     "lib/renderer/headless_content_renderer_client.h",
+   ]
+@@ -252,6 +254,7 @@ source_set("headless_renderer") {
+     ":capture_agent_mojom",
+     "//content/public/common",
+     "//gin",
++    "//media",
+     "//mojo/public/cpp/bindings",
+     "//printing/buildflags",
+     "//third_party/blink/public:blink",
+diff --git a/headless/lib/browser/capture/capture_session.cc b/headless/lib/browser/capture/capture_session.cc
+index fa785a2ee6..26cee7a0b4 100644
+--- a/headless/lib/browser/capture/capture_session.cc
++++ b/headless/lib/browser/capture/capture_session.cc
+@@ -5,6 +5,7 @@
+ #include "headless/lib/browser/capture/capture_session.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
+@@ -16,6 +17,7 @@
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
+ #include "headless/lib/browser/capture/canonical_hash.h"
++#include "headless/lib/browser/capture/shm_ring.h"
+ #include "headless/lib/browser/headless_web_contents_impl.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+@@ -108,6 +110,12 @@ base::TimeTicks CaptureSession::FrameTicks(int64_t frame_index) const {
+          base::Microseconds(FrameOffsetMicros(frame_index + 1));
+ }
+ 
++int64_t CaptureSession::AudioSamplesThrough(int64_t frame_index) const {
++  // Mirrors dcap's FrameRate::samples_through; the products stay below 2^63
++  // for any practical frame count (1e6 frames * 192000 * 1001 < 2e14).
++  return frame_index * audio_rate_ * frame_rate_.den / frame_rate_.num;
++}
++
+ void CaptureSession::Fail(Error error) {
+   if (!last_error_) {
+     last_error_ = error;
+@@ -142,7 +150,7 @@ void CaptureSession::Configure(base::DictValue config,
+     return;
+   }
+   // Feature negotiation: everything this build implements.
+-  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"};
++  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare", "audioRender"};
+   if (const base::ListValue* required = config.FindList("requiredFeatures")) {
+     for (const base::Value& feature : *required) {
+       const std::string* name = feature.GetIfString();
+@@ -183,6 +191,30 @@ void CaptureSession::Configure(base::DictValue config,
+       }
+     }
+   }
++  if (const base::DictValue* audio = config.FindDict("audio")) {
++    if (const base::DictValue* device = audio->FindDict("deviceFormat")) {
++      audio_rate_ = device->FindInt("rate").value_or(audio_rate_);
++      audio_channels_ = device->FindInt("channels").value_or(audio_channels_);
++    }
++    if (const std::string* fmt = audio->FindString("sampleFormat")) {
++      if (*fmt != "s16" && *fmt != "f32") {
++        std::move(callback).Run(Error{"AudioFormatUnsupported", "audio.sampleFormat must be s16 or f32"}, base::DictValue());
++        return;
++      }
++      audio_s16_ = *fmt == "s16";
++    }
++    if (audio_rate_ < 8000 || audio_rate_ > 192000 || audio_channels_ < 1 || audio_channels_ > 8) {
++      std::move(callback).Run(Error{"AudioFormatUnsupported", "audio.deviceFormat out of range"}, base::DictValue());
++      return;
++    }
++  }
++  base::DictValue effective_audio;
++  base::DictValue effective_device;
++  effective_device.Set("rate", audio_rate_);
++  effective_device.Set("channels", audio_channels_);
++  effective_audio.Set("deviceFormat", std::move(effective_device));
++  effective_audio.Set("sampleFormat", audio_s16_ ? "s16" : "f32");
++  effective_config_.Set("audio", std::move(effective_audio));
+   if (const base::DictValue* media = config.FindDict("media")) {
+     if (std::optional<double> ms = media->FindDouble("waitTimeoutMs")) {
+       media_wait_timeout_ms_ = *ms;
+@@ -228,6 +260,9 @@ void CaptureSession::Configure(base::DictValue config,
+     sink_config.stall_timeout = stall_timeout_;
+   }
+   sink_wants_frames_ = sink_config.type != RawFrameSink::Type::kNull;
++  sink_config.audio_rate = static_cast<uint32_t>(audio_rate_);
++  sink_config.audio_channels = static_cast<uint32_t>(audio_channels_);
++  sink_config.audio_format = audio_s16_ ? ring::kAudioFormatS16 : ring::kAudioFormatF32;
+   sink_ = std::make_unique<RawFrameSink>(sink_config);
+   effective_config_ = config.Clone();
+   effective_config_.Set("protocolVersion", kProtocolVersion);
+@@ -363,6 +398,10 @@ void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
+   params->marker_prefix = marker_prefix_;
+   params->collect_marks = collect_marks_;
+   params->wait_timeout_ms = media_wait_timeout_ms_;
++  // Audio is always rendered so media clocks advance; it is written to the
++  // sink only when captureAudio is set (DESIGN.md 4.3).
++  params->render_audio = true;
++  params->audio_frames_through = AudioSamplesThrough(index + 1);
+   prepare_pending_ = std::move(pending);
+   prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
+                        base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
+@@ -414,6 +453,43 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
+   for (const std::string& warning : result->warnings) {
+     pending->warnings.Append(warning);
+   }
++  if (result->audio_frames > 0 || !result->pcm.empty()) {
++    const int64_t expected = AudioSamplesThrough(frame_index + 1) - AudioSamplesThrough(frame_index);
++    if (static_cast<int64_t>(result->audio_frames) != expected ||
++        result->pcm.size() != static_cast<size_t>(result->audio_frames) * audio_channels_ ||
++        result->audio_channels != audio_channels_ || result->audio_rate != audio_rate_) {
++      base::DictValue details;
++      details.Set("frameIndex", static_cast<double>(frame_index));
++      details.Set("expectedFrames", static_cast<double>(expected));
++      details.Set("frames", static_cast<double>(result->audio_frames));
++      details.Set("rendererRate", result->audio_rate);
++      details.Set("rendererChannels", result->audio_channels);
++      Error err{"AudioFormatUnsupported", "renderer audio does not match the configured device format", std::move(details)};
++      Fail(err);
++      std::move(pending->callback).Run(err, base::DictValue());
++      return;
++    }
++    auto bytes = std::make_shared<std::vector<uint8_t>>();
++    if (audio_s16_) {
++      bytes->resize(result->pcm.size() * 2);
++      for (size_t i = 0; i < result->pcm.size(); ++i) {
++        const float v = std::clamp(result->pcm[i], -1.0f, 1.0f);
++        const int16_t s = static_cast<int16_t>(std::lrintf(v * 32767.0f));
++        (*bytes)[2 * i] = static_cast<uint8_t>(s & 0xff);
++        (*bytes)[2 * i + 1] = static_cast<uint8_t>((s >> 8) & 0xff);
++      }
++    } else {
++      bytes->resize(result->pcm.size() * 4);
++      memcpy(bytes->data(), result->pcm.data(), bytes->size());
++    }
++    pending->pcm_frame_hash = Sha256Hex(base::span<const uint8_t>(*bytes));
++    pcm_chain_hash_ = ChainHash(pcm_chain_hash_, pending->pcm_frame_hash);
++    pending->audio_frames = result->audio_frames;
++    if (pending->capture_audio) {
++      pending->audio = std::move(bytes);
++      audio_sample_frames_ += result->audio_frames;
++    }
++  }
+   if (!result->timed_out_players.empty()) {
+     base::DictValue details;
+     base::ListValue players;
+@@ -548,7 +624,8 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
+         FROM_HERE,
+         base::BindOnce(
+             [](std::shared_ptr<const SkBitmap> frame, int64_t index, int64_t virtual_time_us,
+-               bool hash, bool write, RawFrameSink* sink) {
++               bool hash, bool write, std::shared_ptr<const std::vector<uint8_t>> audio,
++               uint32_t audio_frames, RawFrameSink* sink) {
+               Processed out{index};
+               const base::TimeTicks t0 = base::TimeTicks::Now();
+               std::optional<Sha256Digest> digest;
+@@ -568,12 +645,15 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
+                 slot.virtual_time_us = virtual_time_us;
+                 slot.bitmap = std::move(frame);
+                 slot.hash = digest;
++                slot.audio = std::move(audio);
++                slot.audio_frames = audio_frames;
+                 out.sink_error = sink->Write(slot);
+                 out.sink = base::TimeTicks::Now() - t1;
+               }
+               return out;
+             },
+-            frame_bitmap, index, virtual_time_us, hash, write, base::Unretained(sink_.get())),
++            frame_bitmap, index, virtual_time_us, hash, write, pending->audio, pending->audio_frames,
++            base::Unretained(sink_.get())),
+         base::BindOnce(&CaptureSession::OnFrameProcessed, weak_factory_.GetWeakPtr()));
+     if (pending->capture_video) {
+       ++frames_written_;
+@@ -650,7 +730,10 @@ void CaptureSession::Respond(std::unique_ptr<PendingAdvance> pending,
+   r.Set("hasDamage", has_damage);
+   r.Set("reusedReadback", reused);
+   r.Set("surfaceWarmed", pending->retried_for_surface);
+-  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
++  r.Set("audioSampleFrames", static_cast<double>(pending->audio_frames));
++  if (!pending->pcm_frame_hash.empty()) {
++    r.Set("pcmFrameHash", pending->pcm_frame_hash);
++  }
+   r.Set("markers", std::move(pending->markers));
+   r.Set("media", std::move(pending->media));
+   base::DictValue timings;
+@@ -756,10 +839,13 @@ void CaptureSession::OnDrained(ResultCallback callback) {
+     r.Set("expectedFrames", static_cast<double>(expected_frames_));
+   }
+   r.Set("reusedFrames", static_cast<double>(reused_frames_));
+-  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
++  r.Set("audioSampleFrames", static_cast<double>(audio_sample_frames_));
+   if (!chain_hash_.empty()) {
+     r.Set("chainHash", chain_hash_);
+   }
++  if (!pcm_chain_hash_.empty()) {
++    r.Set("pcmHash", pcm_chain_hash_);
++  }
+   base::DictValue histograms;
+   histograms.Set("grantMs", Histogram(grant_ms_));
+   histograms.Set("prepareMs", Histogram(prepare_ms_));
+diff --git a/headless/lib/browser/capture/capture_session.h b/headless/lib/browser/capture/capture_session.h
+index 94bd0edd36..308a2e8a73 100644
+--- a/headless/lib/browser/capture/capture_session.h
++++ b/headless/lib/browser/capture/capture_session.h
+@@ -128,6 +128,11 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+     double wake_ms = 0;
+     double quiesce_ms = 0;
+     double audio_ms = 0;
++    // Audio of the interval (DESIGN.md 4.6): bytes in the configured sample
++    // format, their hash, and the frame count the renderer delivered.
++    std::shared_ptr<const std::vector<uint8_t>> audio;
++    uint32_t audio_frames = 0;
++    std::string pcm_frame_hash;
+     // Set when the surface did not exist before this frame's BeginFrame and a
+     // second BeginFrame at the same frame time was issued to obtain readback
+     // (only ever the first frame; DESIGN.md 4.3 step 8).
+@@ -139,6 +144,8 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+ 
+   base::TimeTicks FrameTicks(int64_t frame_index) const;
+   int64_t FrameOffsetMicros(int64_t frame_index) const;
++  // Device sample frames belonging to frames [0, frame_index): floor(i*rate*den/num).
++  int64_t AudioSamplesThrough(int64_t frame_index) const;
+   void Fail(Error error);
+   std::optional<Error> CheckState(const char* command) const;
+ 
+@@ -192,6 +199,12 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
+   base::OneShotTimer prepare_timer_;
+   std::string marker_prefix_ = "dcap:";
+   bool collect_marks_ = true;
++  // Audio device format and sample format of the PCM handed to the sink.
++  int audio_rate_ = 48000;
++  int audio_channels_ = 2;
++  bool audio_s16_ = true;
++  int64_t audio_sample_frames_ = 0;  // captured (written) so far
++  std::string pcm_chain_hash_;
+   double media_wait_timeout_ms_ = 10000;
+   bool fail_on_media_wait_timeout_ = true;
+   std::unique_ptr<RawFrameSink> sink_;
+diff --git a/headless/lib/browser/capture/raw_frame_sink.cc b/headless/lib/browser/capture/raw_frame_sink.cc
+index c7b058208f..b507613352 100644
+--- a/headless/lib/browser/capture/raw_frame_sink.cc
++++ b/headless/lib/browser/capture/raw_frame_sink.cc
+@@ -131,6 +131,15 @@ std::optional<SinkError> RawFrameSink::OpenRing() {
+   if (LoadPlain<uint32_t>(ring_, ring::kOffPixelFormat) != ring::kPixelFormatBgra8Premul) {
+     return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring pixel format is not bgra8-premul"};
+   }
++  const uint32_t ring_audio_format = LoadPlain<uint32_t>(ring_, ring::kOffAudioFormat);
++  if (ring_audio_format != ring::kAudioFormatNone) {
++    if (ring_audio_format != config_.audio_format ||
++        LoadPlain<uint32_t>(ring_, ring::kOffAudioRate) != config_.audio_rate ||
++        LoadPlain<uint32_t>(ring_, ring::kOffAudioChannels) != config_.audio_channels) {
++      return SinkError{-1, 0, false, 0, 0, "AudioFormatUnsupported: ring audio format differs from the capture configuration"};
++    }
++    ring_audio_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffAudioBytes);
++  }
+   slot_count_ = LoadPlain<uint32_t>(ring_, ring::kOffSlotCount);
+   slot_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffSlotBytes);
+   video_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffVideoBytes);
+@@ -190,8 +199,20 @@ std::optional<SinkError> RawFrameSink::WriteRing(const Frame& frame) {
+   uint8_t* slot = ring_ + ring::kHeaderBytes + (produced % slot_count_) * slot_bytes_;
+   StorePlain<int64_t>(slot, ring::kSlotFrameIndex, frame.frame_index);
+   StorePlain<int64_t>(slot, ring::kSlotVirtualTimeUs, frame.virtual_time_us);
+-  StorePlain<uint32_t>(slot, ring::kSlotFlags, ring::kFlagVideo);
+-  StorePlain<uint32_t>(slot, ring::kSlotAudioFrames, 0);
++  uint32_t flags = ring::kFlagVideo;
++  uint32_t audio_frames = 0;
++  if (frame.audio && frame.audio_frames > 0 && ring_audio_bytes_ > 0) {
++    if (frame.audio->size() > ring_audio_bytes_) {
++      error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                         "AudioFormatUnsupported: interval PCM exceeds the ring's audio capacity"};
++      return error_;
++    }
++    memcpy(slot + ring::kSlotVideoData + video_bytes_, frame.audio->data(), frame.audio->size());
++    flags |= ring::kFlagAudio;
++    audio_frames = frame.audio_frames;
++  }
++  StorePlain<uint32_t>(slot, ring::kSlotFlags, flags);
++  StorePlain<uint32_t>(slot, ring::kSlotAudioFrames, audio_frames);
+   StorePlain<uint64_t>(slot, ring::kSlotVideoBytes, video_bytes_);
+   if (frame.hash) {
+     memcpy(slot + ring::kSlotHash, frame.hash->data(), frame.hash->size());
+diff --git a/headless/lib/browser/capture/raw_frame_sink.h b/headless/lib/browser/capture/raw_frame_sink.h
+index 7a9e88ee67..4ee13b8082 100644
+--- a/headless/lib/browser/capture/raw_frame_sink.h
++++ b/headless/lib/browser/capture/raw_frame_sink.h
+@@ -53,6 +53,11 @@ class RawFrameSink : public base::PlatformThread::Delegate {
+     std::optional<int64_t> expected_frames;
+     int max_queued_frames = 8;
+     base::TimeDelta stall_timeout = base::Seconds(60);
++    // Audio the session will hand over with captured frames (0 = none); the
++    // ring must have been created with the same format or without audio.
++    uint32_t audio_rate = 0;
++    uint32_t audio_channels = 0;
++    uint32_t audio_format = 0;  // ring::kAudioFormat*
+   };
+ 
+   struct Frame {
+@@ -60,6 +65,9 @@ class RawFrameSink : public base::PlatformThread::Delegate {
+     int64_t virtual_time_us = 0;
+     std::shared_ptr<const SkBitmap> bitmap;
+     std::optional<Sha256Digest> hash;
++    // Interleaved PCM of the interval in the configured format, if captured.
++    std::shared_ptr<const std::vector<uint8_t>> audio;
++    uint32_t audio_frames = 0;
+   };
+ 
+   explicit RawFrameSink(Config config);
+@@ -84,6 +92,8 @@ class RawFrameSink : public base::PlatformThread::Delegate {
+   // Ring geometry for validation by the session (0 when not a ring).
+   int ring_width() const { return ring_width_; }
+   int ring_height() const { return ring_height_; }
++  // Whether the ring carries audio (format matched the configuration).
++  bool ring_has_audio() const { return ring_audio_bytes_ > 0; }
+ 
+  private:
+   struct Pending {
+@@ -111,6 +121,7 @@ class RawFrameSink : public base::PlatformThread::Delegate {
+   uint32_t slot_count_ = 0;
+   uint64_t slot_bytes_ = 0;
+   uint64_t video_bytes_ = 0;
++  uint64_t ring_audio_bytes_ = 0;
+   int ring_width_ = 0;
+   int ring_height_ = 0;
+   bool closed_ = false;
+diff --git a/headless/lib/browser/headless_content_browser_client.cc b/headless/lib/browser/headless_content_browser_client.cc
+index 7c6fa1425f..7ac750491f 100644
+--- a/headless/lib/browser/headless_content_browser_client.cc
++++ b/headless/lib/browser/headless_content_browser_client.cc
+@@ -342,6 +342,7 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
+         switches::kAllowVideoCodecs,
+         // The renderer installs the capture agent and audio sinks when set.
+         switches::kDeterministicCapture,
++        switches::kDeterministicCaptureAudio,
+         switches::kDisablePDFTagging,
+     };
+     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);
+diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.cc b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+index bbce82116b..d54c5aa6ee 100644
+--- a/headless/lib/browser/protocol/deterministic_capture_handler.cc
++++ b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+@@ -148,7 +148,7 @@ Response DeterministicCaptureHandler::GetCapabilities(
+   // Features appear as the patch series lands them.
+   auto features =
+       std::make_unique<protocol::Array<DeterministicCapture::Feature>>();
+-  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"}) {
++  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare", "audioRender"}) {
+     features->push_back(DeterministicCapture::Feature::Create()
+                             .SetName(name)
+                             .SetVersion(1)
+diff --git a/headless/lib/renderer/capture_agent.cc b/headless/lib/renderer/capture_agent.cc
+index edb08966ec..a4b33b3dee 100644
+--- a/headless/lib/renderer/capture_agent.cc
++++ b/headless/lib/renderer/capture_agent.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "headless/lib/renderer/capture_agent.h"
+ 
++#include "headless/lib/renderer/capture_audio.h"
++
+ #include <algorithm>
+ #include <memory>
+ #include <utility>
+@@ -143,7 +145,7 @@ void CaptureAgent::Quiesce(std::unique_ptr<Pending> pending) {
+         result->timed_out_players.push_back(p.player_id);
+       }
+     }
+-    FlushMediaEvents(std::move(pending), std::move(result), 0);
++    RenderAudio(std::move(pending), std::move(result));
+     return;
+   }
+   ++pending->rounds;
+@@ -161,6 +163,36 @@ void CaptureAgent::Quiesce(std::unique_ptr<Pending> pending) {
+                           std::move(next));
+ }
+ 
++void CaptureAgent::RenderAudio(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result) {
++  // Step 4: pull every capture sink through S(n+1) frames on the capture
++  // audio thread and take the interval's mix.
++  if (!pending->params->render_audio) {
++    FlushMediaEvents(std::move(pending), std::move(result), 0);
++    return;
++  }
++  const int64_t through = pending->params->audio_frames_through;
++  CaptureAudioEngine::Get()->RenderThrough(
++      through, base::BindOnce(&CaptureAgent::OnAudioRendered, weak_factory_.GetWeakPtr(),
++                              std::move(pending), std::move(result)));
++}
++
++void CaptureAgent::OnAudioRendered(std::unique_ptr<Pending> pending,
++                                   mojom::PrepareResultPtr result,
++                                   std::vector<float> pcm,
++                                   uint32_t frames,
++                                   int sinks) {
++  const CaptureAudioFormat& format = CaptureAudioEngine::Get()->format();
++  result->pcm = std::move(pcm);
++  result->audio_frames = frames;
++  result->audio_channels = format.channels;
++  result->audio_rate = format.rate;
++  result->audio_sinks = sinks;
++  for (const std::string& api : CaptureAudioEngine::Get()->TakeUnsupported()) {
++    result->warnings.push_back("UnsupportedApiUsed: " + api);
++  }
++  FlushMediaEvents(std::move(pending), std::move(result), 0);
++}
++
+ void CaptureAgent::FlushMediaEvents(std::unique_ptr<Pending> pending,
+                                     mojom::PrepareResultPtr result,
+                                     int stage) {
+diff --git a/headless/lib/renderer/capture_agent.h b/headless/lib/renderer/capture_agent.h
+index 754a7b6a3e..31148b222c 100644
+--- a/headless/lib/renderer/capture_agent.h
++++ b/headless/lib/renderer/capture_agent.h
+@@ -51,6 +51,9 @@ class CaptureAgent : public content::RenderFrameObserver,
+   void BindReceiver(mojo::PendingAssociatedReceiver<mojom::CaptureAgent> receiver);
+   void OnWoken(std::unique_ptr<Pending> pending);
+   void Quiesce(std::unique_ptr<Pending> pending);
++  void RenderAudio(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result);
++  void OnAudioRendered(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result,
++                       std::vector<float> pcm, uint32_t frames, int sinks);
+   void FlushMediaEvents(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result, int stage);
+   void Complete(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result);
+   void CollectMarks(const mojom::PrepareParams& params, mojom::PrepareResult* result);
+diff --git a/headless/lib/renderer/capture_audio.cc b/headless/lib/renderer/capture_audio.cc
+new file mode 100644
+index 0000000000..0d8a75b094
+--- /dev/null
++++ b/headless/lib/renderer/capture_audio.cc
+@@ -0,0 +1,369 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/renderer/capture_audio.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "media/base/audio_sample_types.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "headless/public/switches.h"
++#include "media/base/audio_bus.h"
++#include "media/base/audio_glitch_info.h"
++#include "media/base/audio_timestamp_helper.h"
++#include "media/base/channel_layout.h"
++#include "media/base/channel_mixer.h"
++#include "media/base/multi_channel_resampler.h"
++
++namespace headless {
++
++// ---- CaptureAudioFormat -------------------------------------------------------
++
++// static
++CaptureAudioFormat CaptureAudioFormat::FromCommandLine() {
++  CaptureAudioFormat format;
++  const std::string value = base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++      switches::kDeterministicCaptureAudio);
++  const std::vector<std::string> parts =
++      base::SplitString(value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  int rate = 0;
++  int channels = 0;
++  int frames = 0;
++  if (parts.size() >= 1 && base::StringToInt(parts[0], &rate) && rate >= 8000 && rate <= 192000) {
++    format.rate = rate;
++  }
++  if (parts.size() >= 2 && base::StringToInt(parts[1], &channels) && channels >= 1 && channels <= 8) {
++    format.channels = channels;
++  }
++  if (parts.size() >= 3 && base::StringToInt(parts[2], &frames) && frames >= 64 && frames <= 8192) {
++    format.frames_per_buffer = frames;
++  }
++  return format;
++}
++
++media::AudioParameters CaptureAudioFormat::Params() const {
++  return media::AudioParameters(media::AudioParameters::AUDIO_PCM_LOW_LATENCY,
++                                media::ChannelLayoutConfig::Guess(channels), rate,
++                                frames_per_buffer);
++}
++
++// ---- CaptureAudioEngine -------------------------------------------------------
++
++// static
++CaptureAudioEngine* CaptureAudioEngine::Get() {
++  static CaptureAudioEngine* const engine = new CaptureAudioEngine();  // leaked on purpose
++  return engine;
++}
++
++CaptureAudioEngine::CaptureAudioEngine() : format_(CaptureAudioFormat::FromCommandLine()) {
++  base::Thread::Options options;
++  options.thread_type = base::ThreadType::kRealtimeAudio;
++  CHECK(thread_.StartWithOptions(std::move(options)));
++}
++
++scoped_refptr<base::SingleThreadTaskRunner> CaptureAudioEngine::task_runner() const {
++  return thread_.task_runner();
++}
++
++void CaptureAudioEngine::AddSink(CaptureAudioRendererSink* sink) {
++  base::AutoLock lock(lock_);
++  sinks_.push_back(sink);
++}
++
++void CaptureAudioEngine::RemoveSink(CaptureAudioRendererSink* sink) {
++  base::AutoLock lock(lock_);
++  std::erase(sinks_, sink);
++}
++
++void CaptureAudioEngine::NoteUnsupported(const std::string& api) {
++  base::AutoLock lock(lock_);
++  unsupported_.push_back(api);
++}
++
++std::vector<std::string> CaptureAudioEngine::TakeUnsupported() {
++  base::AutoLock lock(lock_);
++  return std::move(unsupported_);
++}
++
++void CaptureAudioEngine::RenderThrough(int64_t frames_through, RenderCallback callback) {
++  thread_.task_runner()->PostTask(
++      FROM_HERE, base::BindOnce(&CaptureAudioEngine::RenderOnAudioThread, base::Unretained(this),
++                                frames_through, std::move(callback),
++                                base::SequencedTaskRunner::GetCurrentDefault()));
++}
++
++void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
++                                             RenderCallback callback,
++                                             scoped_refptr<base::SequencedTaskRunner> reply_runner) {
++  const int64_t need64 = frames_through - rendered_through_;
++  const int frames = static_cast<int>(std::clamp<int64_t>(need64, 0, 1 << 24));
++  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks;
++  {
++    base::AutoLock lock(lock_);
++    sinks = sinks_;
++  }
++  std::vector<float> pcm(static_cast<size_t>(frames) * format_.channels, 0.0f);
++  if (frames > 0) {
++    std::unique_ptr<media::AudioBus> mix = media::AudioBus::Create(format_.channels, frames);
++    mix->Zero();
++    // Virtual time is paused at T_n while this runs; the sinks report it as
++    // the delay timestamp so AudioClock reads capture time.
++    const base::TimeTicks now = base::TimeTicks::Now();
++    for (CaptureAudioRendererSink* sink : sinks) {
++      sink->MixInto(mix.get(), frames, now);
++    }
++    mix->ToInterleaved<media::Float32SampleTypeTraitsNoClip>(base::span<float>(pcm));
++    rendered_through_ = frames_through;
++  }
++  reply_runner->PostTask(FROM_HERE, base::BindOnce(std::move(callback), std::move(pcm),
++                                                   static_cast<uint32_t>(frames),
++                                                   static_cast<int>(sinks.size())));
++}
++
++// ---- CaptureAudioRendererSink ---------------------------------------------------
++
++CaptureAudioRendererSink::CaptureAudioRendererSink(blink::WebAudioDeviceSourceType source_type)
++    : source_type_(source_type), engine_(CaptureAudioEngine::Get()) {}
++
++CaptureAudioRendererSink::~CaptureAudioRendererSink() {
++  engine_->RemoveSink(this);
++}
++
++void CaptureAudioRendererSink::Initialize(const media::AudioParameters& params,
++                                          RenderCallback* callback) {
++  base::AutoLock lock(lock_);
++  params_ = params;
++  callback_ = callback;
++  const CaptureAudioFormat& device = engine_->format();
++  render_bus_ = media::AudioBus::Create(params.channels(), params.frames_per_buffer());
++  if (params.sample_rate() != device.rate) {
++    // Sources that insist on their own rate (an AudioContext created with a
++    // sampleRate) are resampled to the device rate in whole source buffers.
++    const double ratio = static_cast<double>(params.sample_rate()) / device.rate;
++    const int out_frames = static_cast<int>(params.frames_per_buffer() / ratio) + 1;
++    resampled_bus_ = media::AudioBus::Create(params.channels(), out_frames);
++    resampler_ = std::make_unique<media::MultiChannelResampler>(
++        params.channels(), ratio, params.frames_per_buffer(),
++        base::BindRepeating(
++            [](CaptureAudioRendererSink* self, int frame_delay, media::AudioBus* dest) {
++              self->lock_.AssertAcquired();
++              const int got = self->callback_->Render(base::TimeDelta(), base::TimeTicks::Now(),
++                                                      media::AudioGlitchInfo(), dest);
++              if (got < dest->frames()) {
++                dest->ZeroFramesPartial(got, dest->frames() - got);
++              }
++            },
++            base::Unretained(this)));
++  }
++  if (params.channels() != device.channels) {
++    mixer_ = std::make_unique<media::ChannelMixer>(
++        media::ChannelLayoutConfig::Guess(params.channels()),
++        media::ChannelLayoutConfig::Guess(device.channels));
++  }
++  const int mixed_frames = resampled_bus_ ? resampled_bus_->frames() : params.frames_per_buffer();
++  mixed_bus_ = media::AudioBus::Create(device.channels, mixed_frames);
++  fifo_.assign(device.channels, {});
++  fifo_read_ = 0;
++  initialized_ = true;
++  engine_->AddSink(this);
++}
++
++void CaptureAudioRendererSink::Start() {
++  base::AutoLock lock(lock_);
++  started_ = true;
++}
++
++void CaptureAudioRendererSink::Stop() {
++  base::AutoLock lock(lock_);
++  started_ = false;
++  playing_ = false;
++  callback_ = nullptr;
++  initialized_ = false;
++  for (auto& channel : fifo_) {
++    channel.clear();
++  }
++  fifo_read_ = 0;
++}
++
++void CaptureAudioRendererSink::Pause(PauseReason) {
++  base::AutoLock lock(lock_);
++  playing_ = false;
++}
++
++void CaptureAudioRendererSink::Play() {
++  base::AutoLock lock(lock_);
++  playing_ = true;
++}
++
++void CaptureAudioRendererSink::Flush() {
++  base::AutoLock lock(lock_);
++  for (auto& channel : fifo_) {
++    channel.clear();
++  }
++  fifo_read_ = 0;
++}
++
++bool CaptureAudioRendererSink::SetVolume(double volume) {
++  base::AutoLock lock(lock_);
++  volume_ = volume;
++  return true;
++}
++
++media::OutputDeviceInfo CaptureAudioRendererSink::GetOutputDeviceInfo() {
++  return media::OutputDeviceInfo(std::string(), media::OUTPUT_DEVICE_STATUS_OK,
++                                 engine_->format().Params());
++}
++
++void CaptureAudioRendererSink::GetOutputDeviceInfoAsync(OutputDeviceInfoCB info_cb) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(info_cb), GetOutputDeviceInfo()));
++}
++
++bool CaptureAudioRendererSink::IsOptimizedForHardwareParameters() {
++  return true;
++}
++
++bool CaptureAudioRendererSink::CurrentThreadIsRenderingThread() {
++  return engine_->task_runner()->BelongsToCurrentThread();
++}
++
++void CaptureAudioRendererSink::SwitchOutputDevice(const std::string& device_id,
++                                                  media::OutputDeviceStatusCB callback) {
++  if (!device_id.empty()) {
++    engine_->NoteUnsupported("setSinkId");
++  }
++  std::move(callback).Run(media::OUTPUT_DEVICE_STATUS_OK);
++}
++
++void CaptureAudioRendererSink::RenderOneBuffer_Locked(base::TimeTicks now) {
++  lock_.AssertAcquired();
++  const size_t fifo_frames = fifo_.empty() ? 0 : fifo_[0].size() - fifo_read_;
++  const CaptureAudioFormat& device = engine_->format();
++  media::AudioBus* source = render_bus_.get();
++  if (resampler_) {
++    resampler_->Resample(resampled_bus_->frames(), resampled_bus_.get());
++    source = resampled_bus_.get();
++  } else {
++    // The frames still in the FIFO are what the source would hear as output
++    // latency; the timestamp is the capture time.
++    const base::TimeDelta delay =
++        media::AudioTimestampHelper::FramesToTime(static_cast<int64_t>(fifo_frames), device.rate);
++    const int got = callback_->Render(delay, now, media::AudioGlitchInfo(), render_bus_.get());
++    if (got < render_bus_->frames()) {
++      render_bus_->ZeroFramesPartial(got, render_bus_->frames() - got);
++    }
++  }
++  if (volume_ != 1.0) {
++    source->Scale(static_cast<float>(volume_));
++  }
++  media::AudioBus* out = source;
++  if (mixer_) {
++    mixer_->Transform(source, mixed_bus_.get());
++    out = mixed_bus_.get();
++  }
++  for (int c = 0; c < out->channels(); ++c) {
++    const auto& span = out->AllChannels()[c];
++    fifo_[c].insert(fifo_[c].end(), span.begin(), span.end());
++  }
++  frames_rendered_ += out->frames();
++}
++
++void CaptureAudioRendererSink::MixInto(media::AudioBus* mix, int frames, base::TimeTicks now) {
++  base::AutoLock lock(lock_);
++  if (!initialized_ || !playing_ || !callback_) {
++    return;
++  }
++  if (source_type_ == blink::WebAudioDeviceSourceType::kMediaElement && !resampler_) {
++    // A media element's renderer fills any request size, so the interval is
++    // one exact request with no output delay: AudioClock then reads exactly
++    // S(n+1), the capture time, and video frames are selected against it.
++    if (!exact_bus_ || exact_bus_->frames() != frames) {
++      exact_bus_ = media::AudioBus::Create(params_.channels(), frames);
++    }
++    const int got = callback_->Render(base::TimeDelta(), now, media::AudioGlitchInfo(), exact_bus_.get());
++    if (got < frames) {
++      exact_bus_->ZeroFramesPartial(got, frames - got);
++    }
++    if (volume_ != 1.0) {
++      exact_bus_->Scale(static_cast<float>(volume_));
++    }
++    media::AudioBus* out = exact_bus_.get();
++    if (mixer_) {
++      if (!exact_mixed_bus_ || exact_mixed_bus_->frames() != frames) {
++        exact_mixed_bus_ = media::AudioBus::Create(mix->channels(), frames);
++      }
++      mixer_->Transform(out, exact_mixed_bus_.get());
++      out = exact_mixed_bus_.get();
++    }
++    for (int c = 0; c < mix->channels(); ++c) {
++      const auto& dest = mix->AllChannels()[c];
++      const auto& src = out->AllChannels()[c];
++      for (int i = 0; i < frames; ++i) {
++        dest[i] += src[i];
++      }
++    }
++    frames_rendered_ += frames;
++    return;
++  }
++  // Other sources (AudioContext destinations) render whole buffers of their
++  // own size; the excess waits in the FIFO and is reported as output delay.
++  while (static_cast<int>(fifo_[0].size() - fifo_read_) < frames) {
++    RenderOneBuffer_Locked(now);
++  }
++  for (int c = 0; c < mix->channels(); ++c) {
++    const auto& dest = mix->AllChannels()[c];
++    const std::vector<float>& src = fifo_[c];
++    for (int i = 0; i < frames; ++i) {
++      dest[i] += src[fifo_read_ + i];
++    }
++  }
++  fifo_read_ += frames;
++  // Keep the FIFO small: drop consumed frames once they dominate.
++  if (fifo_read_ > 4096 && fifo_read_ * 2 > fifo_[0].size()) {
++    for (auto& channel : fifo_) {
++      channel.erase(channel.begin(), channel.begin() + fifo_read_);
++    }
++    fifo_read_ = 0;
++  }
++}
++
++// ---- CaptureAudioDeviceFactory --------------------------------------------------
++
++CaptureAudioDeviceFactory::CaptureAudioDeviceFactory() = default;
++CaptureAudioDeviceFactory::~CaptureAudioDeviceFactory() = default;
++
++scoped_refptr<media::AudioRendererSink> CaptureAudioDeviceFactory::NewAudioRendererSink(
++    blink::WebAudioDeviceSourceType source_type,
++    const blink::LocalFrameToken& frame_token,
++    const media::AudioSinkParameters& params) {
++  if (source_type == blink::WebAudioDeviceSourceType::kWebRtc ||
++      source_type == blink::WebAudioDeviceSourceType::kNonRtcAudioTrack) {
++    CaptureAudioEngine::Get()->NoteUnsupported(
++        source_type == blink::WebAudioDeviceSourceType::kWebRtc ? "WebRTC audio" : "MediaStreamTrack audio");
++  }
++  return base::MakeRefCounted<CaptureAudioRendererSink>(source_type);
++}
++
++scoped_refptr<media::SwitchableAudioRendererSink> CaptureAudioDeviceFactory::NewMixableSink(
++    blink::WebAudioDeviceSourceType source_type,
++    const blink::LocalFrameToken& frame_token,
++    const blink::FrameToken& main_frame_token,
++    const media::AudioSinkParameters& params) {
++  return base::MakeRefCounted<CaptureAudioRendererSink>(source_type);
++}
++
++media::OutputDeviceInfo CaptureAudioDeviceFactory::GetOutputDeviceInfo(
++    const blink::LocalFrameToken& frame_token,
++    const std::string& device_id) {
++  return media::OutputDeviceInfo(device_id, media::OUTPUT_DEVICE_STATUS_OK,
++                                 CaptureAudioEngine::Get()->format().Params());
++}
++
++}  // namespace headless
+diff --git a/headless/lib/renderer/capture_audio.h b/headless/lib/renderer/capture_audio.h
+new file mode 100644
+index 0000000000..8305fc7e32
+--- /dev/null
++++ b/headless/lib/renderer/capture_audio.h
+@@ -0,0 +1,160 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
++#define HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/synchronization/lock.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/threading/thread.h"
++#include "media/base/audio_parameters.h"
++#include "media/base/audio_renderer_sink.h"
++#include "media/base/output_device_info.h"
++#include "third_party/blink/public/platform/audio/web_audio_device_source_type.h"
++#include "third_party/blink/public/web/modules/media/audio/audio_device_factory.h"
++
++namespace media {
++class AudioBus;
++class ChannelMixer;
++class MultiChannelResampler;
++}  // namespace media
++
++namespace headless {
++
++class CaptureAudioRendererSink;
++
++// Device format of every capture sink, from --deterministic-capture-audio.
++struct CaptureAudioFormat {
++  int rate = 48000;
++  int channels = 2;
++  int frames_per_buffer = 128;  // one Web Audio render quantum
++
++  static CaptureAudioFormat FromCommandLine();
++  media::AudioParameters Params() const;
++};
++
++// Renderer-side audio for deterministic capture (DESIGN.md 4.6): one capture
++// audio thread, the sinks of this process in creation order, and the mix. The
++// browser's advance renders exactly the interval's sample frames through
++// CaptureAgent::Prepare; nothing pulls audio in real time.
++class CaptureAudioEngine {
++ public:
++  // Created on first use on the renderer main thread; lives for the process.
++  static CaptureAudioEngine* Get();
++
++  const CaptureAudioFormat& format() const { return format_; }
++  scoped_refptr<base::SingleThreadTaskRunner> task_runner() const;
++
++  // Sink registration (any thread).
++  void AddSink(CaptureAudioRendererSink* sink);
++  void RemoveSink(CaptureAudioRendererSink* sink);
++  void NoteUnsupported(const std::string& api);
++  std::vector<std::string> TakeUnsupported();
++
++  // Renders every sink up to `frames_through` device frames since the start
++  // and mixes the interval since the previous call. Runs on the audio thread;
++  // `callback` runs on the calling sequence with interleaved float PCM.
++  using RenderCallback =
++      base::OnceCallback<void(std::vector<float> pcm, uint32_t frames, int sinks)>;
++  void RenderThrough(int64_t frames_through, RenderCallback callback);
++
++ private:
++  CaptureAudioEngine();
++  ~CaptureAudioEngine() = delete;
++
++  void RenderOnAudioThread(int64_t frames_through,
++                           RenderCallback callback,
++                           scoped_refptr<base::SequencedTaskRunner> reply_runner);
++
++  CaptureAudioFormat format_;
++  base::Thread thread_{"DcapAudio"};
++  base::Lock lock_;
++  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks_;  // creation order
++  std::vector<std::string> unsupported_;
++  int64_t rendered_through_ = 0;  // audio thread only
++};
++
++// A sink that renders its source only when the engine asks, in whole source
++// buffers, keeping the excess in a FIFO so the source's clock reads exactly
++// the capture time (DESIGN.md 4.6).
++class CaptureAudioRendererSink : public media::SwitchableAudioRendererSink {
++ public:
++  explicit CaptureAudioRendererSink(blink::WebAudioDeviceSourceType source_type);
++
++  // media::AudioRendererSink:
++  void Initialize(const media::AudioParameters& params, RenderCallback* callback) override;
++  void Start() override;
++  void Stop() override;
++  void Pause(PauseReason reason) override;
++  void Play() override;
++  void Flush() override;
++  bool SetVolume(double volume) override;
++  media::OutputDeviceInfo GetOutputDeviceInfo() override;
++  void GetOutputDeviceInfoAsync(OutputDeviceInfoCB info_cb) override;
++  bool IsOptimizedForHardwareParameters() override;
++  bool CurrentThreadIsRenderingThread() override;
++  // media::SwitchableAudioRendererSink:
++  void SwitchOutputDevice(const std::string& device_id, media::OutputDeviceStatusCB callback) override;
++
++  // Audio thread: adds this sink's next `frames` device frames into `mix`
++  // (silence when not playing). `now` is the capture virtual time.
++  void MixInto(media::AudioBus* mix, int frames, base::TimeTicks now);
++
++ private:
++  ~CaptureAudioRendererSink() override;
++  void RenderOneBuffer_Locked(base::TimeTicks now);
++
++  const blink::WebAudioDeviceSourceType source_type_;
++  raw_ptr<CaptureAudioEngine> engine_;
++  base::Lock lock_;
++  media::AudioParameters params_;
++  raw_ptr<RenderCallback> callback_ = nullptr;
++  bool initialized_ = false;
++  bool started_ = false;
++  bool playing_ = false;
++  double volume_ = 1.0;
++  std::unique_ptr<media::AudioBus> render_bus_;     // source format
++  std::unique_ptr<media::AudioBus> resampled_bus_;  // device rate, source channels
++  std::unique_ptr<media::MultiChannelResampler> resampler_;
++  std::unique_ptr<media::ChannelMixer> mixer_;
++  std::unique_ptr<media::AudioBus> mixed_bus_;      // device channels
++  std::unique_ptr<media::AudioBus> exact_bus_;        // media elements: one request per interval
++  std::unique_ptr<media::AudioBus> exact_mixed_bus_;
++  // FIFO of device-format frames not yet consumed, one vector per channel.
++  std::vector<std::vector<float>> fifo_;
++  size_t fifo_read_ = 0;
++  int64_t frames_rendered_ = 0;
++};
++
++// Replaces Blink's AudioDeviceFactory in --deterministic-capture renderers so
++// every media element and AudioContext gets a CaptureAudioRendererSink.
++class CaptureAudioDeviceFactory : public blink::AudioDeviceFactory {
++ public:
++  CaptureAudioDeviceFactory();
++  ~CaptureAudioDeviceFactory() override;
++
++  scoped_refptr<media::AudioRendererSink> NewAudioRendererSink(
++      blink::WebAudioDeviceSourceType source_type,
++      const blink::LocalFrameToken& frame_token,
++      const media::AudioSinkParameters& params) override;
++  scoped_refptr<media::SwitchableAudioRendererSink> NewMixableSink(
++      blink::WebAudioDeviceSourceType source_type,
++      const blink::LocalFrameToken& frame_token,
++      const blink::FrameToken& main_frame_token,
++      const media::AudioSinkParameters& params) override;
++  media::OutputDeviceInfo GetOutputDeviceInfo(const blink::LocalFrameToken& frame_token,
++                                              const std::string& device_id) override;
++};
++
++}  // namespace headless
++
++#endif  // HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
+diff --git a/headless/lib/renderer/headless_content_renderer_client.cc b/headless/lib/renderer/headless_content_renderer_client.cc
+index 28e686d07c..70e9ac55c2 100644
+--- a/headless/lib/renderer/headless_content_renderer_client.cc
++++ b/headless/lib/renderer/headless_content_renderer_client.cc
+@@ -94,6 +94,10 @@ class HeadlessContentRendererUrlLoaderThrottleProvider
+ namespace headless {
+ 
+ HeadlessContentRendererClient::HeadlessContentRendererClient() {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kDeterministicCapture)) {
++    capture_audio_factory_ = std::make_unique<CaptureAudioDeviceFactory>();
++  }
+   const auto& command_line =
+       CHECK_DEREF(base::CommandLine::ForCurrentProcess());
+   if (command_line.HasSwitch(switches::kAllowVideoCodecs)) {
+diff --git a/headless/lib/renderer/headless_content_renderer_client.h b/headless/lib/renderer/headless_content_renderer_client.h
+index a4fc6a7682..0e31a23eeb 100644
+--- a/headless/lib/renderer/headless_content_renderer_client.h
++++ b/headless/lib/renderer/headless_content_renderer_client.h
+@@ -7,6 +7,7 @@
+ 
+ #include "content/public/renderer/content_renderer_client.h"
+ #include "headless/lib/renderer/allowlist.h"
++#include "headless/lib/renderer/capture_audio.h"
+ 
+ namespace headless {
+ 
+@@ -30,6 +31,8 @@ class HeadlessContentRendererClient : public content::ContentRendererClient {
+       blink::URLLoaderThrottleProviderType provider_type) override;
+ 
+   std::optional<Allowlist> video_codecs_allowlist_;
++  // --deterministic-capture: every sink of this renderer is a capture sink.
++  std::unique_ptr<CaptureAudioDeviceFactory> capture_audio_factory_;
+ };
+ 
+ }  // namespace headless
+diff --git a/headless/public/mojom/capture_agent.mojom b/headless/public/mojom/capture_agent.mojom
+index 4942f4dc16..27a5dda0d2 100644
+--- a/headless/public/mojom/capture_agent.mojom
++++ b/headless/public/mojom/capture_agent.mojom
+@@ -17,6 +17,10 @@ struct PrepareParams {
+   bool collect_marks;
+   // Upper bound for the media quiescence wait.
+   double wait_timeout_ms;
++  // Step 4: render every capture audio sink through this many device sample
++  // frames since the capture started (S(n+1)) and return the interval's mix.
++  bool render_audio;
++  int64 audio_frames_through;
+ };
+ 
+ struct CaptureMarker {
+@@ -46,6 +50,13 @@ struct PrepareResult {
+   double audio_ms;
+   // Players that were still unstable when wait_timeout_ms expired.
+   array<int32> timed_out_players;
++  // Interleaved float PCM of the interval (audio_frames * audio_channels
++  // samples) in the device format; empty when render_audio was false.
++  array<float> pcm;
++  uint32 audio_frames;
++  int32 audio_channels;
++  int32 audio_rate;
++  int32 audio_sinks;
+   array<string> warnings;
+ };
+ 
+diff --git a/headless/public/switches.h b/headless/public/switches.h
+index b81b3fafe7..ea6f8146dd 100644
+--- a/headless/public/switches.h
++++ b/headless/public/switches.h
+@@ -43,6 +43,12 @@ inline constexpr char kDeterministicMode[] = "deterministic-mode";
+ // deterministic-capture/DESIGN.md in the project repository.
+ inline constexpr char kDeterministicCapture[] = "deterministic-capture";
+ 
++// Device format of the renderer-side capture audio sinks, as
++// "RATE,CHANNELS,FRAMES_PER_BUFFER" (default 48000,2,128). Set by the
++// controller from the capture spec so every renderer of a run agrees.
++inline constexpr char kDeterministicCaptureAudio[] =
++    "deterministic-capture-audio";
++
+ // Whether cookies stored as part of user profile are encrypted.
+ inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
+ 
+diff --git a/media/renderers/audio_renderer_impl.cc b/media/renderers/audio_renderer_impl.cc
+index 4b28c050a0..7f4d8c7f40 100644
+--- a/media/renderers/audio_renderer_impl.cc
++++ b/media/renderers/audio_renderer_impl.cc
+@@ -26,6 +26,9 @@
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "media/audio/null_audio_sink.h"
++#include "base/time/time_override.h"
++#include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
++#include "media/base/deterministic_capture.h"
+ #include "media/base/audio_buffer.h"
+ #include "media/base/audio_buffer_converter.h"
+ #include "media/base/audio_bus.h"
+@@ -142,9 +145,12 @@ OutputConfig ComputeHardwareOutputConfig(
+ 
+   // If supported by the OS and the initial sample rate is not too low, let
+   // the OS level resampler handle resampling for power efficiency.
++  // DeterministicChromium: the capture sink has no OS resampler and reads the
++  // media clock exactly only when the renderer outputs at the device rate.
+   if (AudioLatency::IsResamplingPassthroughSupported(
+           AudioLatency::Type::kPlayback) &&
+-      stream_config.samples_per_second() >= 44100) {
++      stream_config.samples_per_second() >= 44100 &&
++      !IsDeterministicCaptureMode()) {
+     sample_rate = stream_config.samples_per_second();
+   }
+ 
+@@ -226,6 +232,8 @@ AudioRendererImpl::AudioRendererImpl(
+       player_id_(media_player_id),
+       client_(nullptr),
+       tick_clock_(base::DefaultTickClock::GetInstance()),
++      capture_mode_(IsDeterministicCaptureMode()),
++      capture_frames_cv_(&lock_),
+       last_audio_memory_usage_(0),
+       last_decoded_sample_rate_(0),
+       is_encrypted_(false),
+@@ -274,6 +282,11 @@ AudioRendererImpl::~AudioRendererImpl() {
+       this);
+ 
+   // If Render() is in progress, this call will wait for Render() to finish.
++  if (capture_mode_) {
++    base::AutoLock auto_lock(lock_);
++    capture_wait_cancelled_ = true;
++    capture_frames_cv_.Broadcast();
++  }
+   // After this call, the |sink_| will not call back into |this| anymore.
+   sink_->Stop();
+   if (null_sink_)
+@@ -310,6 +323,7 @@ void AudioRendererImpl::StartRendering_Locked() {
+   lock_.AssertAcquired();
+ 
+   sink_playing_ = true;
++  capture_wait_cancelled_ = false;
+   was_unmuted_ = was_unmuted_ || volume_ != 0;
+   if (state_ == kReinitializingSink) {
+     // Do not start the sink yet if the sink is reinitializing.
+@@ -359,6 +373,12 @@ void AudioRendererImpl::StopRendering_Locked(
+   if (state_ == kReinitializingSink) {
+     return;
+   }
++  if (capture_mode_) {
++    // The capture sink's Pause() waits for a Render() in progress, which may
++    // be waiting for decoded audio; release it first.
++    capture_wait_cancelled_ = true;
++    capture_frames_cv_.Broadcast();
++  }
+ 
+   base::AutoUnlock auto_unlock(lock_);
+   if (volume_ || render_muted_audio_) {
+@@ -684,6 +704,14 @@ void AudioRendererImpl::OnDeviceInfoReceived(
+   }
+ #endif  // BUILDFLAG(ENABLE_PLATFORM_AC3_EAC3_AUDIO) && BUILDFLAG(IS_WIN)
+ 
++  // DeterministicChromium: render at the capture device rate so the capture
++  // sink needs no resampler and the media clock reads exactly the capture
++  // time. Treating the stream as one whose config may change installs the
++  // AudioBufferConverter, which resamples deterministically.
++  if (capture_mode_ && hw_params.IsValid()) {
++    expecting_config_changes_ = true;
++  }
++
+   bool use_stream_params =
+       !expecting_config_changes_ || !hw_params.IsValid() ||
+       hw_params.format() == AudioParameters::AUDIO_FAKE ||
+@@ -1006,6 +1034,12 @@ void AudioRendererImpl::DecodedAudioReady(
+ 
+   CHECK(pending_read_);
+   pending_read_ = false;
++  // Whatever this read produced, a capture-mode Render() waiting on the
++  // capture audio thread must re-evaluate.
++  absl::Cleanup wake_capture_wait = [this] {
++    if (capture_mode_)
++      capture_frames_cv_.Broadcast();
++  };
+ 
+   if (!result.has_value()) {
+     auto status = PIPELINE_ERROR_DECODE;
+@@ -1356,6 +1390,35 @@ bool AudioRendererImpl::IsBeforeStartTime(const AudioBuffer& buffer) {
+          (buffer.timestamp() + buffer.duration()) < start_timestamp_;
+ }
+ 
++void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
++  lock_.AssertAcquired();
++  // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
++  // time.
++  constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
++  const base::TimeTicks give_up =
++      base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
++  // WSOLA needs a window beyond the output frames at rates other than 1.0.
++  const int needed = static_cast<int>(
++      std::ceil(frames_requested * std::max(playback_rate_, 1.0)) + 1);
++  while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
++         state_ == kPlaying && algorithm_ &&
++         algorithm_->BufferedFrames() < needed) {
++    if (!pending_read_) {
++      task_runner_->PostTask(
++          FROM_HERE,
++          base::BindOnce(&AudioRendererImpl::AttemptRead, weak_factory_.GetWeakPtr()));
++    }
++    capture_frames_cv_.TimedWait(base::Milliseconds(1));
++    if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {
++      MEDIA_LOG(INFO, media_log_)
++          << "deterministic capture: decoded audio did not cover the request "
++             "within 10 s (buffered "
++          << algorithm_->BufferedFrames() << ", needed " << needed << ")";
++      return;
++    }
++  }
++}
++
+ int AudioRendererImpl::Render(base::TimeDelta delay,
+                               base::TimeTicks delay_timestamp,
+                               const AudioGlitchInfo& glitch_info,
+@@ -1436,6 +1499,9 @@ int AudioRendererImpl::Render(base::TimeDelta delay,
+       return 0;
+     }
+ 
++    if (capture_mode_ && !is_passthrough_)
++      WaitForBufferedAudio_Locked(frames_requested);
++
+     if (is_passthrough_) {
+       if (algorithm_->BufferedFrames() > 0) {
+         DCHECK_EQ(playback_rate_, 1.0);
+diff --git a/media/renderers/audio_renderer_impl.h b/media/renderers/audio_renderer_impl.h
+index 2ecc2fd4b7..937b00eb8a 100644
+--- a/media/renderers/audio_renderer_impl.h
++++ b/media/renderers/audio_renderer_impl.h
+@@ -27,6 +27,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/power_monitor/power_observer.h"
++#include "base/synchronization/condition_variable.h"
+ #include "base/synchronization/lock.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+@@ -346,6 +347,17 @@ class MEDIA_EXPORT AudioRendererImpl
+   // under |lock_|. ------------------------------------------------------------
+   base::Lock lock_;
+ 
++  // DeterministicChromium (deterministic-capture/DESIGN.md 4.5): in capture
++  // mode Render() waits, with |lock_| released, until the algorithm holds
++  // enough decoded audio for the request or end of stream, so the capture
++  // sink never receives silence that a faster decoder would have filled.
++  // DecodedAudioReady() signals; StopRendering_Locked() and the destructor
++  // cancel before the sink is paused or stopped.
++  const bool capture_mode_;
++  base::ConditionVariable capture_frames_cv_;
++  bool capture_wait_cancelled_ = false;
++  void WaitForBufferedAudio_Locked(int frames_requested);
++
+   // Algorithm for scaling audio.
+   double playback_rate_;
+   std::unique_ptr<AudioRendererAlgorithm> algorithm_;
+-- 
+2.53.0
+

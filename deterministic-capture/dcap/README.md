@@ -66,6 +66,9 @@ default pixel format, option set and container (`src/encode.rs`,
 `codec_defaults`). Only RGB pixel formats (`bgr0`, `bgra`, `gbrp`, `gbrap`)
 are lossless against the canonical hash; NVENC converts RGB to YUV 4:4:4 in
 hardware. `utvideo`, `magicyuv` and `ffvhuff` need the `mov` container.
+Measured at 1080p (DESIGN.md 13.5): FFV1 6 ms and 162 KB per frame, utvideo
+and magicyuv 0.5 ms and about 855 KB, NVENC 2 ms and 170-180 KB; the engine,
+not the encoder, sets the pace, so FFV1 stays the default.
 
 ## Outputs
 
