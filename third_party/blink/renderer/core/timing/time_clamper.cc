@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "base/bit_cast.h"
+#include "base/command_line.h"
 #include "base/rand_util.h"
 
 namespace blink {
@@ -15,7 +16,23 @@ namespace {
 const int64_t kTenLowerDigitsMod = 10000000000;
 }  // namespace
 
-TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
+namespace {
+
+// DeterministicChromium: the clamping threshold is derived from a per-instance
+// random secret, so the 100 us rounding of performance.now() and of animation
+// timeline time differs between runs. Under --deterministic-capture the secret
+// is a constant; the web-visible resolution is unchanged.
+uint64_t ClamperSecret() {
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          "deterministic-capture")) {
+    return uint64_t{0x5DC0DE2026111CA9};
+  }
+  return base::RandUint64();
+}
+
+}  // namespace
+
+TimeClamper::TimeClamper() : secret_(ClamperSecret()) {}
 
 // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
 base::TimeDelta TimeClamper::ClampTimeResolution(

@@ -25,6 +25,7 @@
 
 #include "third_party/blink/renderer/core/loader/document_load_timing.h"
 
+#include "base/command_line.h"
 #include "base/memory/scoped_refptr.h"
 #include "services/network/public/mojom/timing_allow_origin.mojom-blink.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
@@ -128,6 +129,15 @@ void DocumentLoadTiming::SetNavigationStart(base::TimeTicks navigation_start) {
   // navigationStart. We must set these to the current time if they haven't
   // been set yet in order to have a valid reference time in both units.
   EnsureReferenceTimesSet();
+  // DeterministicChromium: the embedder's navigationStart is browser-process
+  // wall time. Under --deterministic-capture the renderer runs on virtual time
+  // and every document, animation timeline and performance.timeOrigin must
+  // derive from it, so the time origin is the (frozen) virtual now instead.
+  // Otherwise animations are sampled at a per-run sub-millisecond offset.
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          "deterministic-capture")) {
+    navigation_start = base::TimeTicks::Now();
+  }
   navigation_start_ = navigation_start;
   TRACE_EVENT_MARK_WITH_TIMESTAMP2(
       "blink.user_timing", "navigationStart", navigation_start_, "frame",
