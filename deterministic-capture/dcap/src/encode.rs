@@ -157,10 +157,13 @@ pub fn codec_defaults(codec: &str) -> Option<(&'static str, Vec<(&'static str, &
         "ffv1" => Some(("bgr0", vec![("level", "3"), ("slices", "16"), ("slicecrc", "1"), ("g", "1"), ("context", "1"), ("coder", "range_def")], "mp4")),
         "utvideo" => Some(("gbrp", vec![("pred", "median")], "mov")),
         "magicyuv" => Some(("gbrp", vec![("pred", "median")], "mov")),
-        "ffvhuff" => Some(("bgr0", vec![("pred", "median")], "mov")),
+        // The median predictor refuses RGB input; plane prediction is the RGB-capable one.
+        "ffvhuff" => Some(("bgra", vec![("pred", "plane")], "mov")),
         "rawvideo" => Some(("bgra", vec![], "mov")),
-        "h264_nvenc" => Some(("yuv444p", vec![("preset", "p4"), ("tune", "lossless"), ("profile", "high444p"), ("g", "1")], "mp4")),
-        "hevc_nvenc" => Some(("yuv444p", vec![("preset", "p4"), ("tune", "lossless"), ("profile", "rext"), ("g", "1")], "mp4")),
+        // g=0 is libavcodec's intra-only mode for NVENC (frameIntervalP 0); g=1 is rejected by the
+        // driver ("Gop Length should be greater than number of B frames + 1") whatever bf is.
+        "h264_nvenc" => Some(("yuv444p", vec![("preset", "p4"), ("tune", "lossless"), ("profile", "high444p"), ("g", "0"), ("bf", "0")], "mp4")),
+        "hevc_nvenc" => Some(("yuv444p", vec![("preset", "p4"), ("tune", "lossless"), ("profile", "rext"), ("g", "0"), ("bf", "0")], "mp4")),
         _ => None,
     }
 }

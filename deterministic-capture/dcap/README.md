@@ -47,7 +47,20 @@ Exit codes: 0 complete, 1 failed (report still written), 2 usage or spec error.
 ```
 
 Full schema and defaults: `src/spec.rs` (`load_spec`) and DESIGN.md 5.1.
-Unknown keys are errors. `encoder.codec` is one of `ffv1`, `utvideo`,
+Unknown keys are errors. `audio: {"capture": true}` records the page's audio
+(media elements and AudioContexts, mixed in the renderer at
+`audio.deviceFormat`, default 48 kHz stereo, as `audio.sampleFormat` `s16` or
+`f32`) into the chunks and the final file with exact sample counts, verified
+per frame by `pcmFrameHash`; PCM audio moves the default container to `mov`
+(`encoder.audioCodec`: `pcm_s16le`, `pcm_f32le`, `flac`). `media.waitTimeoutMs`
+bounds the per-frame media quiescence wait (`media.failOnWaitTimeout`), and
+`media.failOnUnsupportedApi` (default true) turns a use of getUserMedia,
+WebRTC, MediaRecorder, EME, captureStream, WebCodecs, WebGPU, workers or
+setSinkId into the error `UnsupportedApiUsed` instead of a warning.
+`determinism.seed` seeds V8's `Math.random` and the renderer's entropy source
+(`crypto.getRandomValues`, UUIDs, blob URLs). Markers are `performance.mark`
+entries whose name starts with `markers.prefix` (default `dcap:`), attributed
+to the frame in whose interval they were made. `encoder.codec` is one of `ffv1`, `utvideo`,
 `magicyuv`, `ffvhuff`, `rawvideo`, `h264_nvenc`, `hevc_nvenc`; each has a
 default pixel format, option set and container (`src/encode.rs`,
 `codec_defaults`). Only RGB pixel formats (`bgr0`, `bgra`, `gbrp`, `gbrap`)

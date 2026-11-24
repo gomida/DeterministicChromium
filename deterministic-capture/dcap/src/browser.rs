@@ -85,6 +85,8 @@ pub fn launch_plan(spec: &Spec, executable: &Path, work_dir: &Path, worker: &str
     // 128 frames per buffer: AudioContext.currentTime then reaches the first
     // render quantum at or past T (DESIGN.md 4.6).
     args.push(format!("--deterministic-capture-audio={},{},128", spec.audio.rate, spec.audio.channels));
+    // Renderer entropy (crypto.getRandomValues, UUIDs, blob URLs) repeats per seed (DESIGN.md 4.8).
+    args.push(format!("--deterministic-capture-seed={}", spec.determinism.seed));
     args.push("about:blank".into());
     let mut env: HashMap<String, String> = std::env::vars().collect();
     for (k, v) in backend_env(&spec.backend) {
