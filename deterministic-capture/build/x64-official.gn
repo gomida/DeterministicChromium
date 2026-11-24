@@ -1,7 +1,7 @@
-is_debug = false
-is_component_build = false
 is_official_build = true
 dcheck_always_on = false
+is_debug = false
+is_component_build = false
 symbol_level = 0
 blink_symbol_level = 0
 v8_symbol_level = 0
@@ -12,3 +12,32 @@ use_sysroot = true
 use_remoteexec = false
 treat_warnings_as_errors = false
 chrome_pgo_phase = 0
+
+# Deterministic capture is driven over CDP only: no preference store or
+# command-line page commands. enable_printing/enable_pdf cannot be disabled in a
+# full Chromium checkout: //chrome test targets reachable from //BUILD.gn assert
+# enable_print_preview, so `gn gen` fails (checked on 158.0.8127.88).
+headless_use_prefs = false
+headless_enable_commands = false
+
+# Only the headless Ozone platform is used; X11 and Wayland backends are not built.
+ozone_platform_headless = true
+ozone_platform_x11 = false
+ozone_platform_wayland = false
+
+# Audio runs through FakeAudioOutputStream under --disable-audio-output, and no
+# desktop integration (D-Bus, GIO, udev, GTK, Qt) is needed. use_gio=false
+# requires use_gtk=false because //ui/gtk asserts GIO.
+use_alsa = false
+use_pulseaudio = false
+use_dbus = false
+use_gio = false
+use_udev = false
+use_gtk = false
+use_qt5 = false
+use_qt6 = false
+
+# ANGLE GL backend for --use-angle=gl over Mesa (D3D12 on WSL2); off by default in ozone headless builds.
+angle_enable_gl = true
+# ANGLE selects its generic EGL display on Linux only under ANGLE_USE_GBM or ANGLE_USE_WAYLAND (Display.cpp); needed by --use-angle=gl without X11/Wayland Ozone.
+angle_use_wayland = true
