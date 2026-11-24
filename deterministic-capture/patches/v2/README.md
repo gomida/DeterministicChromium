@@ -10,6 +10,5 @@ against tag 158.0.8127.88:
 | `0003-blink-pin-navigationStart-and-TimeClamper-*.patch` | Virtual-time `navigationStart` and a constant `TimeClamper` secret under the switch |
 
 Apply with `git am` on the tag; build with `../../build/x64-dev.gn` or the
-official profiles (`angle_enable_gl` and `angle_use_wayland` are required for
-the Mesa D3D12 path). Regenerate with
+official profiles (`angle_enable_gl` is required for the Mesa D3D12 path). Regenerate with
 `git format-patch -o deterministic-capture/patches/v2 158.0.8127.88..dev-v2`.

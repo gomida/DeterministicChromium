@@ -37,11 +37,12 @@ gn gen out/dev && autoninja -C out/dev headless_shell
 `build/x64-dev.gn` keeps DCHECKs off without ThinLTO/CFI for patch iteration;
 `build/x64-official.gn` is the measurement profile. Both turn off the headless
 preference store and page commands, X11/Wayland, ALSA/PulseAudio, D-Bus, GIO,
-udev, GTK and Qt, and turn on `angle_enable_gl` plus `angle_use_wayland`,
-which ozone headless builds disable by default: without the first,
-`--use-angle=gl*` has no EGL display type; without X11 or Wayland defines
-ANGLE's generic `DisplayEGL` is not compiled for platform type 0
-(`third_party/angle/src/libANGLE/Display.cpp`). The controller uses
+udev, GTK and Qt, and turn on `angle_enable_gl`, which ozone headless builds
+disable by default: without it `--use-angle=gl*` has no EGL display type.
+Plain `--use-angle=gl` still finds no display, because ANGLE's generic
+`DisplayEGL` is compiled for platform type 0 only under the X11, GBM or
+Wayland defines (`third_party/angle/src/libANGLE/Display.cpp`); the
+controller therefore uses
 `--use-angle=gles-egl`, which selects `DisplayEGL` by device type, so the
 system Mesa EGL (and through it the d3d12 gallium driver) is used. Printing
 and PDFium stay because `//chrome` test targets assert
@@ -86,7 +87,7 @@ Outputs under `output.dir`: `capture.<mp4|mov>`, `capture-report.json`,
 
 | `render.backend` | Browser flags | Needs | Status |
 | --- | --- | --- | --- |
-| `angle-gl-d3d12` | `--use-angle=gles-egl` + `GALLIUM_DRIVER=d3d12 MESA_LOADER_DRIVER_OVERRIDE=d3d12` | `angle_enable_gl=true` and `angle_use_wayland=true` in the build, Mesa d3d12, `/dev/dxg` | GPU path; renderer `ANGLE (Microsoft Corporation, D3D12 (NVIDIA GeForce RTX 4090), OpenGL ES 3.1)` |
+| `angle-gl-d3d12` | `--use-angle=gles-egl` + `GALLIUM_DRIVER=d3d12 MESA_LOADER_DRIVER_OVERRIDE=d3d12` | `angle_enable_gl=true` in the build, Mesa d3d12, `/dev/dxg` | GPU path; renderer `ANGLE (Microsoft Corporation, D3D12 (NVIDIA GeForce RTX 4090), OpenGL ES 3.1)` |
 | `swiftshader` | `--use-angle=swiftshader` | nothing | CPU fallback, slow at 4K |
 | `angle-vulkan` | `--use-angle=vulkan` | a Vulkan ICD | none on WSL2 (no dzn ICD shipped) |
 

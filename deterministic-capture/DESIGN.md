@@ -895,10 +895,11 @@ GPU path on this build: `--use-angle=gl` failed with "Initialization of all
 `angle_enable_gl=false`; with it on, ANGLE still chose no display because
 its generic `DisplayEGL` is compiled for platform type 0 only under
 `ANGLE_USE_GBM` or `ANGLE_USE_WAYLAND` (`third_party/angle/src/libANGLE/Display.cpp`),
-and the build profiles had turned Wayland off. The profiles now set
-`angle_enable_gl=true` and `angle_use_wayland=true` (Ozone Wayland stays
-off) and the controller passes `--use-angle=gles-egl`, which selects
-`DisplayEGL` by device type; the renderer string is
+and the build profiles have X11 and Wayland off. The profiles set
+`angle_enable_gl=true` and the controller passes `--use-angle=gles-egl`,
+which selects `DisplayEGL` by device type without any of those defines
+(`angle_use_wayland=true` is not needed and does not build: the Vulkan
+Wayland surface lacks `VK_USE_PLATFORM_WAYLAND_KHR`); the renderer string is
 `ANGLE (Microsoft Corporation, D3D12 (NVIDIA GeForce RTX 4090), OpenGL ES 3.1)`
 and `probe` fails with `BackendMismatch` otherwise.
 
