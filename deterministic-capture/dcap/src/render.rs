@@ -51,6 +51,10 @@ pub struct ChunkResult {
     pub overlap_hashes: BTreeMap<i64, String>,
     /// hashes the engine wrote into the ring slots, by frame
     pub slot_hashes: BTreeMap<i64, String>,
+    /// pcmFrameHash per frame and the engine's PCM chain over the chunk
+    pub pcm_hashes: BTreeMap<i64, String>,
+    pub pcm_hash: Option<String>,
+    pub audio_sample_frames: i64,
     pub markers: Vec<Value>,
     pub attempts: Vec<Attempt>,
     pub chain_hash: Option<String>,
@@ -63,7 +67,7 @@ impl ChunkResult {
         self.output.is_some() && self.attempts.last().map(|a| a.status == "complete").unwrap_or(false)
     }
     fn failed(chunk: Chunk, attempts: Vec<Attempt>) -> ChunkResult {
-        ChunkResult { chunk, output: None, hashes: BTreeMap::new(), overlap_hashes: BTreeMap::new(), slot_hashes: BTreeMap::new(), markers: Vec::new(), attempts, chain_hash: None, extradata_sha256: None, packets: None }
+        ChunkResult { chunk, output: None, hashes: BTreeMap::new(), overlap_hashes: BTreeMap::new(), slot_hashes: BTreeMap::new(), pcm_hashes: BTreeMap::new(), pcm_hash: None, audio_sample_frames: 0, markers: Vec::new(), attempts, chain_hash: None, extradata_sha256: None, packets: None }
     }
 }
 
@@ -130,9 +134,17 @@ fn encoder_thread(ring: &Ring, cfg: &EncoderConfig<'_>, chunk: Chunk, stall: Dur
                     slot_hashes.insert(slot.frame_index(), encode::hex(&h));
                 }
                 enc.video(slot.video(), cfg.width, n).map_err(|e| EngineError::new(&e.kind, e.message).at(expected))?;
-                if cfg.audio.is_some() && slot.audio_sample_frames() > 0 {
-                    let pts = crate::spec::FrameRate { num: cfg.fps_num as i64, den: cfg.fps_den as i64 }.samples_through(n, cfg.audio.unwrap().rate as i64);
-                    enc.audio(slot.audio(), slot.audio_sample_frames() as i32, pts).map_err(|e| EngineError::new(&e.kind, e.message).at(expected))?;
+                if let Some(audio) = cfg.audio {
+                    let fps = crate::spec::FrameRate { num: cfg.fps_num as i64, den: cfg.fps_den as i64 };
+                    let want = fps.samples_for(expected, audio.rate as i64);
+                    if slot.audio_sample_frames() as i64 != want {
+                        return Err(EngineError::new("AudioFrameCount", format!("ring slot for frame {expected} holds {} sample frames, expected {want}", slot.audio_sample_frames())).at(expected));
+                    }
+                    // Chunk-local pts from absolute sample positions: the per-frame
+                    // counts of 60000/1001 differ (800 or 801), so S(start+n) - S(start),
+                    // not S(n), keeps consecutive packets contiguous.
+                    let pts = fps.samples_through(expected, audio.rate as i64) - fps.samples_through(chunk.start, audio.rate as i64);
+                    enc.audio(slot.audio(), want as i32, pts).map_err(|e| EngineError::new(&e.kind, e.message).at(expected))?;
                 }
                 busy += t.elapsed().as_secs_f64() * 1000.0;
                 n += 1;
@@ -165,17 +177,31 @@ fn render_once(spec: &Spec, plan: &Plan, chunk: Chunk, executable: &Path, work_d
     let partial = chunks_dir.join(format!("chunk_{:02}.partial.{ext}", chunk.index));
     let final_path = chunks_dir.join(format!("chunk_{:02}.{ext}", chunk.index));
     let (w, h) = spec.viewport.output_size();
-    let ring = Arc::new(
-        Ring::create(RingGeometry { width: w, height: h, slots: spec.max_queued_frames, audio_rate: 0, audio_channels: 0, audio_format: AUDIO_FORMAT_NONE, audio_frames_per_slot: 0 })
-            .map_err(|e| EngineError::new("LaunchFailed", format!("ring: {e}")))?,
-    );
+    let audio_cfg = spec.audio.capture.then(|| AudioConfig { rate: spec.audio.rate as i32, channels: spec.audio.channels as i32, sample_format: if spec.audio.sample_format_s16 { 1 } else { 2 } });
+    let geometry = if spec.audio.capture {
+        let fps = spec.frame_rate;
+        // The longest interval plus one frame of slack.
+        let per_slot = (fps.den * spec.audio.rate + fps.num - 1) / fps.num + 1;
+        RingGeometry {
+            width: w,
+            height: h,
+            slots: spec.max_queued_frames,
+            audio_rate: spec.audio.rate as u32,
+            audio_channels: spec.audio.channels as u32,
+            audio_format: if spec.audio.sample_format_s16 { crate::shm::AUDIO_FORMAT_S16 } else { crate::shm::AUDIO_FORMAT_F32 },
+            audio_frames_per_slot: per_slot as u32,
+        }
+    } else {
+        RingGeometry { width: w, height: h, slots: spec.max_queued_frames, audio_rate: 0, audio_channels: 0, audio_format: AUDIO_FORMAT_NONE, audio_frames_per_slot: 0 }
+    };
+    let ring = Arc::new(Ring::create(geometry).map_err(|e| EngineError::new("LaunchFailed", format!("ring: {e}")))?);
     let mut session = CaptureSession::new(spec, work_dir, &name, SinkKind::Shm(Arc::clone(&ring)), init_scripts.to_vec());
     let t0 = Instant::now();
     let stall = Duration::from_secs_f64(spec.timeouts.sink_stall_ms / 1000.0);
     let cancel = Mutex::new(false);
     let codec = spec.encoder.clone();
     let fps = spec.frame_rate;
-    let cfg = EncoderConfig { spec: &codec, width: w, height: h, fps_num: fps.num as i32, fps_den: fps.den as i32, path: &partial, audio: None::<AudioConfig> };
+    let cfg = EncoderConfig { spec: &codec, width: w, height: h, fps_num: fps.num as i32, fps_den: fps.den as i32, path: &partial, audio: audio_cfg };
 
     let outcome: Result<(ChunkResult, EncoderOutcome), EngineError> = std::thread::scope(|scope| {
         let ring_for_encoder = Arc::clone(&ring);
@@ -202,7 +228,7 @@ fn render_once(spec: &Spec, plan: &Plan, chunk: Chunk, executable: &Path, work_d
                 if encoder.is_finished() {
                     return Err(EngineError::new("EncoderFailed", "encoder thread stopped before the chunk ended").at(f));
                 }
-                session.advance(true, false, true)?;
+                session.advance(true, spec.audio.capture, true)?;
             }
             attempt.timings.insert("captureS".into(), t_cap.elapsed().as_secs_f64());
             let overlap_end = if spec.verify.mode == "overlap" && !is_last { (chunk.end + spec.verify.overlap_frames).min(plan.stop_frame) } else { chunk.end };
@@ -222,12 +248,22 @@ fn render_once(spec: &Spec, plan: &Plan, chunk: Chunk, executable: &Path, work_d
             let eng = session.engine.as_ref().unwrap();
             let hashes: BTreeMap<i64, String> = (chunk.start..chunk.end).filter_map(|i| eng.hash_of(i).map(|h| (i, h.to_string()))).collect();
             let overlap: BTreeMap<i64, String> = (chunk.end..overlap_end).filter_map(|i| eng.hash_of(i).map(|h| (i, h.to_string()))).collect();
+            let pcm_hashes: BTreeMap<i64, String> = (chunk.start..chunk.end).filter_map(|i| eng.pcm_hash_of(i).map(|h| (i, h.to_string()))).collect();
+            if spec.audio.capture {
+                let want = spec.frame_rate.samples_through(chunk.end, spec.audio.rate) - spec.frame_rate.samples_through(chunk.start, spec.audio.rate);
+                if finish.audio_sample_frames != want {
+                    return Err(EngineError::new("AudioFrameCount", format!("engine wrote {} audio sample frames for the chunk, expected {want}", finish.audio_sample_frames)).with(finish.raw.clone()));
+                }
+            }
             Ok(ChunkResult {
                 chunk,
                 output: None,
                 hashes,
                 overlap_hashes: overlap,
                 slot_hashes: BTreeMap::new(),
+                pcm_hashes,
+                pcm_hash: finish.pcm_hash.clone(),
+                audio_sample_frames: finish.audio_sample_frames,
                 markers: session.markers.clone(),
                 attempts: Vec::new(),
                 chain_hash: finish.chain_hash.clone(),
@@ -252,7 +288,10 @@ fn render_once(spec: &Spec, plan: &Plan, chunk: Chunk, executable: &Path, work_d
         }
         match (driven, enc_outcome) {
             (Ok(r), Ok(e)) => Ok((r, e)),
-            (Err(e), _) => Err(e),
+            // An encoder failure stalls the ring and surfaces in the driver as a
+            // timeout; the encoder's error is the cause, so it wins.
+            (Err(drive_err), Err(enc_err)) => Err(enc_err.with(serde_json::json!({"driver": drive_err.to_json()}))),
+            (Err(e), Ok(_)) => Err(e),
             (Ok(_), Err(e)) => Err(e),
         }
     });
@@ -271,6 +310,10 @@ fn render_once(spec: &Spec, plan: &Plan, chunk: Chunk, executable: &Path, work_d
     if enc.frames != chunk.frames() || enc.stats.video_packets != chunk.frames() {
         let _ = std::fs::remove_file(&partial);
         return Err(EngineError::new("EncoderFrameCount", format!("encoder saw {} frames and wrote {} packets for {} frames", enc.frames, enc.stats.video_packets, chunk.frames())));
+    }
+    if spec.audio.capture && enc.stats.audio_sample_frames != result.audio_sample_frames {
+        let _ = std::fs::remove_file(&partial);
+        return Err(EngineError::new("AudioFrameCount", format!("encoder received {} audio sample frames, engine reported {}", enc.stats.audio_sample_frames, result.audio_sample_frames)));
     }
     for (f, h) in &enc.slot_hashes {
         if let Some(eh) = result.hashes.get(f) {
@@ -326,14 +369,26 @@ pub fn join_chunks(spec: &Spec, plan: &Plan, results: &[ChunkResult], out_dir: &
     let final_path = out_dir.join(format!("capture.{ext}"));
     let inputs: Vec<JoinInput<'_>> = results
         .iter()
-        .map(|r| JoinInput { path: r.output.as_deref().expect("ok chunk"), first_frame: r.chunk.start, frames: r.chunk.frames(), audio_sample_frames: 0 })
+        .map(|r| JoinInput {
+            path: r.output.as_deref().expect("ok chunk"),
+            first_frame: r.chunk.start,
+            frames: r.chunk.frames(),
+            audio_sample_frames: if spec.audio.capture { spec.frame_rate.samples_through(r.chunk.end, spec.audio.rate) - spec.frame_rate.samples_through(r.chunk.start, spec.audio.rate) } else { 0 },
+        })
         .collect();
+    let expected_audio = if spec.audio.capture { spec.frame_rate.samples_through(plan.stop_frame, spec.audio.rate) - spec.frame_rate.samples_through(plan.start_frame, spec.audio.rate) } else { 0 };
     let stats = encode::join(&inputs, plan.start_frame, &final_path, &spec.encoder.container, spec.frame_rate.num as i32, spec.frame_rate.den as i32, spec.audio.rate as i32)
         .map_err(|e| EngineError::new(&e.kind, e.message))?;
     if stats.video_packets != plan.total_frames() {
         return Err(EngineError::new("JoinMismatch", format!("joined {} packets for {} frames", stats.video_packets, plan.total_frames())));
     }
+    if stats.audio_sample_frames != expected_audio {
+        return Err(EngineError::new("JoinMismatch", format!("joined {} audio sample frames, expected {expected_audio}", stats.audio_sample_frames)));
+    }
     let probe = encode::probe_file(&final_path).map_err(|e| EngineError::new(&e.kind, e.message))?;
+    if spec.audio.capture && probe.audio_sample_frames != expected_audio {
+        return Err(EngineError::new("JoinMismatch", format!("final file holds {} audio sample frames, expected {expected_audio}", probe.audio_sample_frames)));
+    }
     if probe.video_packets != plan.total_frames() {
         return Err(EngineError::new("JoinMismatch", format!("final file holds {} packets for {} frames", probe.video_packets, plan.total_frames())));
     }

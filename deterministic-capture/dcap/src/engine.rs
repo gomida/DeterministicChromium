@@ -295,6 +295,9 @@ impl Engine {
         }
         entry.markers = result.markers.clone();
         entry.media = result.media.clone();
+        if entry.pcm_frame_hash.is_none() {
+            entry.pcm_frame_hash = result.pcm_frame_hash.clone();
+        }
         self.last_response = Some(result.clone());
         self.next_frame += 1;
         self.state = State::Capturing;
@@ -364,6 +367,10 @@ impl Engine {
     pub fn abort(&mut self) {
         let _ = self.session.send_timeout("DeterministicCapture.abort", json!({}), Duration::from_secs(10));
         self.state = State::Aborted;
+    }
+
+    pub fn pcm_hash_of(&self, frame: i64) -> Option<&str> {
+        self.completed.get(&frame).and_then(|f| f.pcm_frame_hash.as_deref())
     }
 
     pub fn hash_of(&self, frame: i64) -> Option<&str> {

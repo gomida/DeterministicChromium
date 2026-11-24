@@ -47,6 +47,8 @@ pub struct Plan {
     pub window_frames: Vec<i64>,
     /// frame -> canonical hash (window frames; all frames for `full`)
     pub hashes: BTreeMap<i64, String>,
+    /// frame -> pcmFrameHash of the interval (every frame when audio is captured)
+    pub pcm_hashes: BTreeMap<i64, String>,
     pub markers: Vec<Value>,
     pub media_events: Vec<Value>,
     pub action_log: ActionLog,
@@ -69,6 +71,7 @@ impl Plan {
             "chunks": self.chunks.iter().map(|c| json!({"index": c.index, "start": c.start, "end": c.end})).collect::<Vec<_>>(),
             "windowFrames": self.window_frames,
             "hashes": self.hashes.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
+            "pcmHashes": self.pcm_hashes.len(),
             "markers": self.markers,
             "mediaEvents": self.media_events,
             "actionLog": self.action_log.to_json(),
@@ -91,6 +94,7 @@ impl Plan {
             chunks,
             window_frames: Vec::new(),
             hashes: BTreeMap::new(),
+            pcm_hashes: BTreeMap::new(),
             markers: Vec::new(),
             media_events: Vec::new(),
             action_log: spec_input_actions(spec),
@@ -333,9 +337,13 @@ pub fn run_plan_pass(spec: &Spec, executable: &Path, work_dir: &Path, scenario: 
         };
         let finish = session.engine.as_mut().unwrap().finish(Duration::from_secs_f64(spec.timeouts.encoder_finish))?;
         let mut hashes = BTreeMap::new();
+        let mut pcm_hashes = BTreeMap::new();
         for (idx, fr) in &session.engine.as_ref().unwrap().completed {
             if let Some(h) = &fr.frame_hash {
                 hashes.insert(*idx, h.clone());
+            }
+            if let Some(h) = &fr.pcm_frame_hash {
+                pcm_hashes.insert(*idx, h.clone());
             }
         }
         if stop_frame != provisional_stop || start_frame != provisional_start || scenario.boundaries(&session.markers, &options).is_some() {
@@ -356,6 +364,7 @@ pub fn run_plan_pass(spec: &Spec, executable: &Path, work_dir: &Path, scenario: 
             chunks: chunks.clone(),
             window_frames: windows.iter().copied().collect(),
             hashes,
+            pcm_hashes,
             markers: session.markers.clone(),
             media_events: session.media_events.clone(),
             action_log: log.clone(),

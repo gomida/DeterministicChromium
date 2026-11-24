@@ -41,6 +41,12 @@ struct Fake {
     crash: Option<(String, i64)>,
     pending_hashes: Vec<Value>,
     state: &'static str,
+    // Audio device format from configure; PCM is synthesized per frame.
+    audio_rate: i64,
+    audio_channels: i64,
+    audio_s16: bool,
+    audio_total: i64,
+    pcm_chain: String,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -91,7 +97,31 @@ impl Fake {
         (q + if 2 * r > self.fps_num as i128 { 1 } else { 0 }) as i64
     }
 
-    fn advance_one(&mut self, capture_video: bool, hash: bool) -> Result<Value, String> {
+    /// Device sample frames in frames [0, index): floor(index * rate * den / num).
+    fn samples_through(&self, index: i64) -> i64 {
+        ((index as i128 * self.audio_rate as i128 * self.fps_den as i128) / self.fps_num as i128) as i64
+    }
+
+    /// Deterministic PCM for one frame: a function of the absolute sample position.
+    fn frame_audio(&self, index: i64) -> (Vec<u8>, i64) {
+        let start = self.samples_through(index);
+        let frames = self.samples_through(index + 1) - start;
+        let mut bytes = Vec::with_capacity((frames * self.audio_channels * if self.audio_s16 { 2 } else { 4 }) as usize);
+        for k in 0..frames {
+            let p = start + k;
+            for c in 0..self.audio_channels {
+                let v = (((p * 7919 + c * 1301) % 20000) - 10000) as f32 / 10000.0;
+                if self.audio_s16 {
+                    bytes.extend_from_slice(&((v * 32767.0).round() as i16).to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        (bytes, frames)
+    }
+
+    fn advance_one(&mut self, capture_video: bool, capture_audio: bool, hash: bool) -> Result<Value, String> {
         let index = self.next_frame;
         if let Some((name, frame)) = &self.crash {
             if *name == self.name && *frame == index {
@@ -101,6 +131,19 @@ impl Fake {
         let pixels = self.frame_pixels(index);
         let digest: [u8; 32] = Sha256::digest(&pixels).into();
         let frame_hash = hex(&digest);
+        let (audio, audio_frames) = self.frame_audio(index);
+        let pcm_frame_hash = hex(&Sha256::digest(&audio));
+        {
+            let mut h = Sha256::new();
+            h.update(self.pcm_chain.as_bytes());
+            h.update(pcm_frame_hash.as_bytes());
+            self.pcm_chain = hex(&h.finalize());
+        }
+        let ring_has_audio = self.producer.as_ref().map(|p| p.geometry.audio_format != 0).unwrap_or(false);
+        let (slot_audio, slot_audio_frames): (&[u8], u32) = if capture_audio && ring_has_audio { (&audio, audio_frames as u32) } else { (&[], 0) };
+        if capture_audio {
+            self.audio_total += audio_frames;
+        }
         if capture_video {
             if let Some(exp) = self.expected_frames {
                 if self.frames_written >= exp {
@@ -108,7 +151,7 @@ impl Fake {
                 }
             }
             if let Some(p) = &self.producer {
-                if !p.publish(index, self.frame_time_us(index + 1), &pixels, Some(&digest), &[], 0, Duration::from_secs(60)) {
+                if !p.publish(index, self.frame_time_us(index + 1), &pixels, Some(&digest), slot_audio, slot_audio_frames, Duration::from_secs(60)) {
                     return Err("SinkStalled: consumer did not release a ring slot".into());
                 }
             } else if let Some(f) = &mut self.file_sink {
@@ -132,7 +175,7 @@ impl Fake {
         self.state = "capturing";
         Ok(json!({
             "frameIndex": index, "virtualTimeMs": self.frame_time_us(index + 1) as f64 / 1000.0, "hasSurface": true, "hasDamage": true,
-            "reusedReadback": false, "surfaceWarmed": index == 0, "audioSampleFrames": 0, "markers": markers, "media": [],
+            "reusedReadback": false, "surfaceWarmed": index == 0, "audioSampleFrames": audio_frames, "pcmFrameHash": pcm_frame_hash, "markers": markers, "media": [],
             "timings": {"grantMs": 0.1, "beginFrameMs": 0.5, "queueDepth": 0, "sinkQueued": 0}, "completed": completed, "warnings": [],
         }))
     }
@@ -144,7 +187,7 @@ impl Fake {
             "pixelFormats": ["bgra8-premul"], "colorSpaces": ["srgb"], "frameSinks": ["shm", "file", "null"],
             "audio": {"sampleFormats": ["s16"], "deviceFormat": {"rate": 48000, "channels": 2, "framesPerBuffer": 480}},
             "hash": ["sha256-bgra8-premul"],
-            "features": [{"name": "pipelinedAdvance", "version": 1}, {"name": "advanceRange", "version": 1}, {"name": "shmSink", "version": 1}, {"name": "canonicalBgra", "version": 1}, {"name": "markers", "version": 1}],
+            "features": [{"name": "pipelinedAdvance", "version": 1}, {"name": "advanceRange", "version": 1}, {"name": "shmSink", "version": 1}, {"name": "canonicalBgra", "version": 1}, {"name": "markers", "version": 1}, {"name": "prepare", "version": 1}, {"name": "audioRender", "version": 1}],
             "limits": {"maxTargets": 1, "maxQueuedFrames": 64},
             "gpu": {"glRenderer": renderer()},
         })
@@ -197,6 +240,9 @@ impl Fake {
                 }
                 self.fps_num = config["frameRate"]["num"].as_i64().unwrap_or(60);
                 self.fps_den = config["frameRate"]["den"].as_i64().unwrap_or(1);
+                self.audio_rate = config["audio"]["deviceFormat"]["rate"].as_i64().unwrap_or(48000);
+                self.audio_channels = config["audio"]["deviceFormat"]["channels"].as_i64().unwrap_or(2);
+                self.audio_s16 = config["audio"]["sampleFormat"].as_str().unwrap_or("s16") == "s16";
                 let sink = &config["frameSink"];
                 self.expected_frames = sink["expectedFrames"].as_i64();
                 match sink["type"].as_str().unwrap_or("null") {
@@ -231,7 +277,7 @@ impl Fake {
                 if idx != self.next_frame {
                     return Err(format!("FrameIndexMismatch: expected frame {}", self.next_frame));
                 }
-                self.advance_one(params["captureVideo"].as_bool().unwrap_or(true), params["hash"].as_bool().unwrap_or(true))
+                self.advance_one(params["captureVideo"].as_bool().unwrap_or(true), params["captureAudio"].as_bool().unwrap_or(true), params["hash"].as_bool().unwrap_or(true))
             }
             "DeterministicCapture.advanceRange" => {
                 if !self.configured {
@@ -243,9 +289,10 @@ impl Fake {
                     return Err(format!("FrameIndexMismatch: expected frame {}", self.next_frame));
                 }
                 let hash = params["hash"].as_bool().unwrap_or(false);
+                let capture_audio = params["captureAudio"].as_bool().unwrap_or(false);
                 let mut frames = Vec::new();
                 while self.next_frame < to {
-                    frames.push(self.advance_one(false, hash)?);
+                    frames.push(self.advance_one(false, capture_audio, hash)?);
                 }
                 Ok(json!({"frames": frames, "nextFrameIndex": self.next_frame}))
             }
@@ -258,7 +305,8 @@ impl Fake {
                 self.state = if complete { "finished" } else { "failed" };
                 Ok(json!({
                     "status": if complete { "complete" } else { "failed" }, "framesWritten": self.frames_written, "expectedFrames": self.expected_frames,
-                    "reusedFrames": 0, "audioSampleFrames": 0, "chainHash": if self.chain.is_empty() { Value::Null } else { json!(self.chain) },
+                    "reusedFrames": 0, "audioSampleFrames": self.audio_total, "pcmHash": if self.pcm_chain.is_empty() { Value::Null } else { json!(self.pcm_chain) },
+                    "chainHash": if self.chain.is_empty() { Value::Null } else { json!(self.chain) },
                     "histograms": {"beginFrameMs": {"count": self.next_frame, "p50": 0.5}}, "gpuProcessCrashes": 0,
                     "completed": std::mem::take(&mut self.pending_hashes),
                 }))
@@ -330,6 +378,11 @@ fn main() {
         diverge: name_and_frame("DCAP_FAKE_DIVERGE"),
         crash: name_and_frame("DCAP_FAKE_CRASH"),
         pending_hashes: Vec::new(),
+        audio_rate: 48000,
+        audio_channels: 2,
+        audio_s16: true,
+        audio_total: 0,
+        pcm_chain: String::new(),
         state: "unconfigured",
     };
     let mut reader = BufReader::new(input);

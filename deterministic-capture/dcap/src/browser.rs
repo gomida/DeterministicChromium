@@ -81,6 +81,10 @@ pub fn launch_plan(spec: &Spec, executable: &Path, work_dir: &Path, worker: &str
     args.push(format!("--user-data-dir={}", profile.display()));
     args.push(format!("--window-size={},{}", spec.viewport.width, spec.viewport.height));
     args.push(format!("--lang={}", spec.determinism.locale));
+    // Renderer-side capture audio sinks render at this device format (DESIGN.md 4.6).
+    // 128 frames per buffer: AudioContext.currentTime then reaches the first
+    // render quantum at or past T (DESIGN.md 4.6).
+    args.push(format!("--deterministic-capture-audio={},{},128", spec.audio.rate, spec.audio.channels));
     args.push("about:blank".into());
     let mut env: HashMap<String, String> = std::env::vars().collect();
     for (k, v) in backend_env(&spec.backend) {

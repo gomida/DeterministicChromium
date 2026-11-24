@@ -61,6 +61,8 @@ pub fn verify(plan: &Plan, results: &[ChunkResult], mode: &str) -> VerifyResult 
     for r in results.iter().filter(|r| r.ok()) {
         if mode == "boundaries" || mode == "full" {
             compared += compare(plan.hashes.keys().copied().filter(|f| r.chunk.start <= *f && *f < r.chunk.end), &plan.hashes, &r.hashes, mode, Some(r.chunk.index), &mut mismatches);
+            // The plan pass hashes PCM for every frame, so audio verification is complete in both modes.
+            compared += compare(plan.pcm_hashes.keys().copied().filter(|f| r.chunk.start <= *f && *f < r.chunk.end), &plan.pcm_hashes, &r.pcm_hashes, "pcm", Some(r.chunk.index), &mut mismatches);
         }
         if mode == "overlap" && !r.overlap_hashes.is_empty() {
             if let Some(next) = by_start.get(&r.chunk.end).filter(|n| n.ok()) {

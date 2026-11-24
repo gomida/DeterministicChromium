@@ -90,6 +90,7 @@ pub fn build_report(r: &ReportInputs<'_>) -> std::io::Result<Value> {
             "index": c.chunk.index, "start": c.chunk.start, "end": c.chunk.end, "frames": c.chunk.frames(), "ok": c.ok(),
             "output": c.output, "outputSha256": c.output.as_deref().and_then(file_sha256),
             "packets": c.packets, "extradataSha256": c.extradata_sha256, "chainHash": c.chain_hash, "hashFile": hash_path,
+            "audioSampleFrames": c.audio_sample_frames, "pcmHash": c.pcm_hash,
             "attempts": c.attempts.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
         }));
     }

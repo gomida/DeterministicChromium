@@ -467,7 +467,12 @@ pub fn load_spec(raw: Value) -> Result<Spec, SpecError> {
         sample_format_s16: sample_format == "s16",
     };
 
-    let encoder = encoder_spec(d.get("encoder"))?;
+    let mut encoder = encoder_spec(d.get("encoder"))?;
+    // PCM in MP4 is non-standard and FLAC in MP4 is experimental in ffmpeg;
+    // MOV carries both with the same exact timestamps (DESIGN.md 13.4).
+    if audio.capture && encoder.container == "mp4" {
+        encoder.container = "mov".to_string();
+    }
 
     let par = d.get("parallel").map(|v| obj(v, "parallel")).transpose()?.unwrap_or(&empty);
     only(par, &["workers", "chunks"], "parallel")?;

@@ -155,6 +155,34 @@ fn crashing_engine_is_retried_and_attributed() {
 }
 
 #[test]
+fn audio_capture_joins_exact_sample_counts_and_verifies_pcm() {
+    let out = temp_dir("audio");
+    let mut spec = base_spec(&out, 50);
+    spec["audio"] = json!({"capture": true});
+    spec["parallel"] = json!({"workers": 2});
+    spec["verify"] = json!({"mode": "full"});
+    let run = render(&spec, &out, &[]);
+    assert_eq!(run.status, 0, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    let report = run.report.expect("report written");
+    assert_eq!(report["status"], "complete", "{}", report["failure"]);
+    // 50 frames of 60000/1001 at 48 kHz: floor(50 * 48000 * 1001 / 60000) sample frames.
+    assert_eq!(report["join"]["audioSampleFrames"], 40040);
+    assert_eq!(report["join"]["packets"], 50);
+    let final_path = PathBuf::from(report["join"]["final"].as_str().unwrap());
+    assert_eq!(final_path.extension().unwrap(), "mov", "PCM audio moves the default container to MOV");
+    let chunks = report["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 2);
+    let total: i64 = chunks.iter().map(|c| c["audioSampleFrames"].as_i64().unwrap()).sum();
+    assert_eq!(total, 40040);
+    assert!(chunks.iter().all(|c| c["pcmHash"].is_string()));
+    let verify = &report["verify"][0];
+    assert_eq!(verify["ok"], true, "{}", verify);
+    assert!(verify["compared"].as_i64().unwrap() >= 100, "video and PCM hashes compared for every frame: {}", verify["compared"]);
+    assert_eq!(report["plan"]["pcmHashes"], 50);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
 fn validate_rejects_unknown_keys() {
     let out = temp_dir("validate");
     let mut spec = base_spec(&out, 5);
