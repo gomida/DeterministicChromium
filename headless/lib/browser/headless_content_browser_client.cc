@@ -340,6 +340,8 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
         embedder_support::kOriginTrialDisabledFeatures,
         embedder_support::kOriginTrialPublicKey,
         switches::kAllowVideoCodecs,
+        // The renderer installs the capture agent and audio sinks when set.
+        switches::kDeterministicCapture,
         switches::kDisablePDFTagging,
     };
     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);

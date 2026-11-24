@@ -6,6 +6,7 @@
 
 #include <string_view>
 
+#include "base/base_switches.h"
 #include "base/files/file_util.h"
 #include "base/logging.h"
 #include "base/strings/string_number_conversions.h"
@@ -15,6 +16,7 @@
 #include "components/headless/screen_info/headless_screen_info.h"
 #include "components/viz/common/switches.h"
 #include "content/public/common/content_switches.h"
+#include "media/base/media_switches.h"
 #include "headless/public/switches.h"
 #include "net/http/http_util.h"
 #include "net/proxy_resolution/proxy_config.h"
@@ -52,6 +54,41 @@ void HandleDeterministicModeSwitch(base::CommandLine& command_line) {
   // Renderer flags
   AppendSwitchMaybe(command_line, ::switches::kDisableThreadedAnimation);
   AppendSwitchMaybe(command_line, ::switches::kDisableCheckerImaging);
+}
+
+
+void AppendCommaListSwitch(base::CommandLine& command_line,
+                           std::string_view switch_constant,
+                           std::string_view values) {
+  std::string merged = command_line.GetSwitchValueASCII(switch_constant);
+  if (!merged.empty()) {
+    merged += ",";
+  }
+  merged += values;
+  command_line.AppendSwitchASCII(switch_constant, merged);
+}
+
+// --deterministic-capture: everything the DeterministicCapture domain needs
+// from the command line, so the controller passes one switch. Features that
+// read real time or add a second process to the media path are turned off.
+void HandleDeterministicCaptureSwitch(base::CommandLine& command_line) {
+  DCHECK(command_line.HasSwitch(switches::kDeterministicCapture));
+  AppendSwitchMaybe(command_line, switches::kDeterministicMode);
+  HandleDeterministicModeSwitch(command_line);
+  AppendSwitchMaybe(command_line, switches::kBlockNewWebContents);
+  // Audio: fake output device only; the renderer-side capture sinks render on
+  // demand. Autoplay must not wait for a user gesture.
+  AppendSwitchMaybe(command_line, ::switches::kDisableAudioOutput);
+  if (!command_line.HasSwitch(::switches::kAutoplayPolicy)) {
+    command_line.AppendSwitchASCII(::switches::kAutoplayPolicy,
+                                   "no-user-gesture-required");
+  }
+  // Software video decoders are bit-exact for a given build.
+  AppendSwitchMaybe(command_line, ::switches::kDisableAcceleratedVideoDecode);
+  AppendCommaListSwitch(
+      command_line, ::switches::kDisableFeatures,
+      "AudioServiceOutOfProcess,MediaSessionService,IsolateOrigins,"
+      "site-per-process,BackForwardCache,Prerender2,PaintHolding");
 }
 
 bool HandleRemoteDebuggingPort(base::CommandLine& command_line,
@@ -196,6 +233,15 @@ base::FilePath EnsureDirectoryExists(const base::FilePath& file_path) {
 
 bool HandleCommandLineSwitches(base::CommandLine& command_line,
                                HeadlessBrowser::Options& options) {
+  if (command_line.HasSwitch(switches::kDeterministicCapture)) {
+    if (command_line.HasSwitch(::switches::kSitePerProcess)) {
+      LOG(ERROR) << "Deterministic capture is not compatible with --"
+                 << ::switches::kSitePerProcess << " switch.";
+      return false;
+    }
+    HandleDeterministicCaptureSwitch(command_line);
+  }
+
   if (command_line.HasSwitch(switches::kDeterministicMode)) {
     if (command_line.HasSwitch(::switches::kSitePerProcess)) {
       LOG(ERROR) << "Deterministic mode is not compatible with --"

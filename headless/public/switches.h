@@ -37,6 +37,12 @@ inline constexpr char kCrashDumpsDir[] = "crash-dumps-dir";
 // (experimental).
 inline constexpr char kDeterministicMode[] = "deterministic-mode";
 
+// Deterministic capture engine (experimental, DeterministicChromium). Implies
+// --deterministic-mode plus the audio, media and process flags the
+// DeterministicCapture DevTools domain requires. See
+// deterministic-capture/DESIGN.md in the project repository.
+inline constexpr char kDeterministicCapture[] = "deterministic-capture";
+
 // Whether cookies stored as part of user profile are encrypted.
 inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
 
