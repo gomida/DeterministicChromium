@@ -1,0 +1,2753 @@
+diff --git a/headless/BUILD.gn b/headless/BUILD.gn
+index c7a1c81aa3..dfc1a56d8f 100644
+--- a/headless/BUILD.gn
++++ b/headless/BUILD.gn
+@@ -190,6 +190,8 @@ inspector_protocol_generate("protocol_sources") {
+   outputs = [
+     "lib/browser/protocol/browser.cc",
+     "lib/browser/protocol/browser.h",
++    "lib/browser/protocol/deterministic_capture.cc",
++    "lib/browser/protocol/deterministic_capture.h",
+     "lib/browser/protocol/emulation.cc",
+     "lib/browser/protocol/emulation.h",
+     "lib/browser/protocol/headless_experimental.cc",
+@@ -332,6 +334,15 @@ source_set("headless_browser") {
+     "lib/browser/headless_screen.h",
+     "lib/browser/headless_screen_orientation_delegate.cc",
+     "lib/browser/headless_screen_orientation_delegate.h",
++    "lib/browser/capture/canonical_hash.cc",
++    "lib/browser/capture/canonical_hash.h",
++    "lib/browser/capture/capture_session.cc",
++    "lib/browser/capture/capture_session.h",
++    "lib/browser/capture/raw_frame_sink.cc",
++    "lib/browser/capture/raw_frame_sink.h",
++    "lib/browser/capture/shm_ring.h",
++    "lib/browser/capture/virtual_time_owner.cc",
++    "lib/browser/capture/virtual_time_owner.h",
+     "lib/browser/headless_web_contents_impl.cc",
+     "lib/browser/headless_web_contents_impl.h",
+     "lib/browser/headless_window.cc",
+@@ -341,6 +352,8 @@ source_set("headless_browser") {
+     "lib/browser/headless_window_tree_host.h",
+     "lib/browser/protocol/browser_handler.cc",
+     "lib/browser/protocol/browser_handler.h",
++    "lib/browser/protocol/deterministic_capture_handler.cc",
++    "lib/browser/protocol/deterministic_capture_handler.h",
+     "lib/browser/protocol/domain_handler.h",
+     "lib/browser/protocol/emulation_handler.cc",
+     "lib/browser/protocol/emulation_handler.h",
+diff --git a/headless/DEPS b/headless/DEPS
+index dac478a457..f24949a9d3 100644
+--- a/headless/DEPS
++++ b/headless/DEPS
+@@ -10,6 +10,7 @@ include_rules = [
+   "+content/public/renderer",
+   "+content/public/common",
+   "+content/public/test",
++  "+gpu/config",
+   "+mojo/public",
+   "+net",
+   "+printing/buildflags",
+diff --git a/headless/lib/browser/DEPS b/headless/lib/browser/DEPS
+index 0e16ca5bb2..c9b9a89f4c 100644
+--- a/headless/lib/browser/DEPS
++++ b/headless/lib/browser/DEPS
+@@ -14,6 +14,9 @@ include_rules = [
+   "+services/proxy_resolver/public/mojom",
+   "+storage/browser/quota",
+   "+storage/common/quota",
++  "+crypto/hash.h",
++  "+third_party/libyuv",
++  "+gpu/config",
+   "+third_party/skia/include",
+   "+third_party/blink/public/mojom/quota",
+   "+third_party/blink/public/mojom/badging",
+diff --git a/headless/lib/browser/capture/canonical_hash.cc b/headless/lib/browser/capture/canonical_hash.cc
+new file mode 100644
+index 0000000000..72d070ed33
+--- /dev/null
++++ b/headless/lib/browser/capture/canonical_hash.cc
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/browser/capture/canonical_hash.h"
++
++#include <string.h>
++
++#include <vector>
++
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "crypto/hash.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++
++namespace headless::capture {
++
++namespace {
++
++// Visits each canonical row. The readback bitmap is N32 premultiplied, which
++// is BGRA on every desktop build; rows are then taken in place. Any other
++// color type goes through Skia one row at a time (no full-frame copy).
++template <typename RowFn>
++bool ForEachCanonicalRow(const SkBitmap& bitmap, RowFn fn) {
++  const int width = bitmap.width();
++  const int height = bitmap.height();
++  if (width <= 0 || height <= 0 || !bitmap.getPixels()) {
++    return false;
++  }
++  const size_t row_bytes = static_cast<size_t>(width) * 4;
++  if (IsCanonicalLayout(bitmap)) {
++    for (int y = 0; y < height; ++y) {
++      fn(base::span<const uint8_t>(
++          static_cast<const uint8_t*>(bitmap.getAddr(0, y)), row_bytes));
++    }
++    return true;
++  }
++  std::vector<uint8_t> row(row_bytes);
++  const SkImageInfo info = SkImageInfo::Make(
++      width, 1, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
++  for (int y = 0; y < height; ++y) {
++    if (!bitmap.readPixels(info, row.data(), row_bytes, 0, y)) {
++      return false;
++    }
++    fn(base::span<const uint8_t>(row));
++  }
++  return true;
++}
++
++}  // namespace
++
++size_t CanonicalBytes(int width, int height) {
++  if (width <= 0 || height <= 0) {
++    return 0;
++  }
++  return static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
++}
++
++bool IsCanonicalLayout(const SkBitmap& bitmap) {
++  return bitmap.colorType() == kBGRA_8888_SkColorType &&
++         bitmap.alphaType() == kPremul_SkAlphaType && bitmap.getPixels();
++}
++
++std::optional<Sha256Digest> Sha256OfBitmap(const SkBitmap& bitmap) {
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  const bool ok = ForEachCanonicalRow(
++      bitmap, [&hasher](base::span<const uint8_t> row) { hasher.Update(row); });
++  if (!ok) {
++    return std::nullopt;
++  }
++  Sha256Digest digest;
++  hasher.Finish(digest);
++  return digest;
++}
++
++bool CopyCanonical(const SkBitmap& bitmap, base::span<uint8_t> dst) {
++  if (dst.size() != CanonicalBytes(bitmap.width(), bitmap.height())) {
++    return false;
++  }
++  size_t offset = 0;
++  return ForEachCanonicalRow(bitmap, [&](base::span<const uint8_t> row) {
++    memcpy(dst.data() + offset, row.data(), row.size());
++    offset += row.size();
++  });
++}
++
++std::string HexLower(const Sha256Digest& digest) {
++  return base::ToLowerASCII(base::HexEncode(digest));
++}
++
++std::string Sha256Hex(base::span<const uint8_t> bytes) {
++  return HexLower(crypto::hash::Sha256(bytes));
++}
++
++std::string ChainHash(const std::string& chain, const std::string& frame_hash) {
++  const std::string input = chain + frame_hash;
++  return HexLower(crypto::hash::Sha256(std::string_view(input)));
++}
++
++}  // namespace headless::capture
+diff --git a/headless/lib/browser/capture/canonical_hash.h b/headless/lib/browser/capture/canonical_hash.h
+new file mode 100644
+index 0000000000..429ce580d9
+--- /dev/null
++++ b/headless/lib/browser/capture/canonical_hash.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_CAPTURE_CANONICAL_HASH_H_
++#define HEADLESS_LIB_BROWSER_CAPTURE_CANONICAL_HASH_H_
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++
++#include "base/containers/span.h"
++
++class SkBitmap;
++
++namespace headless::capture {
++
++// Canonical pixel form of a captured frame (DESIGN.md 4.3): 8-bit
++// premultiplied BGRA in memory byte order B,G,R,A (Skia N32 on desktop
++// builds), rows packed without padding, sRGB. Hashes and sinks use this form
++// directly from the readback bitmap; the browser converts nothing.
++inline constexpr char kCanonicalPixelFormat[] = "bgra8-premul";
++inline constexpr char kCanonicalHashName[] = "sha256-bgra8-premul";
++
++using Sha256Digest = std::array<uint8_t, 32>;
++
++size_t CanonicalBytes(int width, int height);
++
++// True when the bitmap's memory already is the canonical layout, so rows can
++// be hashed and copied in place.
++bool IsCanonicalLayout(const SkBitmap& bitmap);
++
++// SHA-256 over the canonical bytes, row by row, without an intermediate copy
++// when the layout already matches. nullopt when the bitmap has no pixels or
++// an unsupported color type.
++std::optional<Sha256Digest> Sha256OfBitmap(const SkBitmap& bitmap);
++
++// Copies the canonical bytes into |dst| (exactly CanonicalBytes()). Returns
++// false on a size or format mismatch.
++bool CopyCanonical(const SkBitmap& bitmap, base::span<uint8_t> dst);
++
++std::string HexLower(const Sha256Digest& digest);
++std::string Sha256Hex(base::span<const uint8_t> bytes);
++std::string ChainHash(const std::string& chain, const std::string& frame_hash);
++
++}  // namespace headless::capture
++
++#endif  // HEADLESS_LIB_BROWSER_CAPTURE_CANONICAL_HASH_H_
+diff --git a/headless/lib/browser/capture/capture_session.cc b/headless/lib/browser/capture/capture_session.cc
+new file mode 100644
+index 0000000000..d85dcaeba3
+--- /dev/null
++++ b/headless/lib/browser/capture/capture_session.cc
+@@ -0,0 +1,648 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/browser/capture/capture_session.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
++#include "headless/lib/browser/capture/canonical_hash.h"
++#include "headless/lib/browser/headless_web_contents_impl.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++
++namespace headless::capture {
++
++namespace {
++
++constexpr char kProtocolVersion[] = "2.1";
++
++double Percentile(std::vector<double> values, double p) {
++  if (values.empty()) {
++    return 0.0;
++  }
++  std::sort(values.begin(), values.end());
++  const size_t index = std::min(
++      values.size() - 1, static_cast<size_t>(values.size() * p / 100.0));
++  return values[index];
++}
++
++base::DictValue Histogram(const std::vector<double>& values) {
++  base::DictValue h;
++  h.Set("count", static_cast<int>(values.size()));
++  h.Set("p50", Percentile(values, 50));
++  h.Set("p95", Percentile(values, 95));
++  h.Set("p99", Percentile(values, 99));
++  h.Set("max", values.empty() ? 0.0 : *std::max_element(values.begin(), values.end()));
++  return h;
++}
++
++base::DictValue SinkErrorDict(const SinkError& error) {
++  base::DictValue d;
++  d.Set("frameIndex", static_cast<double>(error.frame_index));
++  d.Set("errno", error.error_number);
++  d.Set("peerClosed", error.peer_closed);
++  d.Set("bytesIntoFrame", static_cast<double>(error.bytes_into_frame));
++  d.Set("framesFullyWritten", static_cast<double>(error.frames_fully_written));
++  d.Set("message", error.message);
++  return d;
++}
++
++}  // namespace
++
++std::string CaptureSession::Error::Render() const {
++  return kind + ": " + message;
++}
++
++// static
++const char* CaptureSession::StateName(State state) {
++  switch (state) {
++    case State::kUnconfigured:
++      return "unconfigured";
++    case State::kConfigured:
++      return "configured";
++    case State::kCapturing:
++      return "capturing";
++    case State::kFinished:
++      return "finished";
++    case State::kFailed:
++      return "failed";
++    case State::kAborted:
++      return "aborted";
++  }
++  return "unknown";
++}
++
++CaptureSession::CaptureSession(content::WebContents* web_contents)
++    : content::WebContentsUserData<CaptureSession>(*web_contents),
++      web_contents_(web_contents),
++      worker_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
++           base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN})) {}
++
++CaptureSession::~CaptureSession() = default;
++
++int64_t CaptureSession::FrameOffsetMicros(int64_t frame_index) const {
++  // T_n = round_half_down(n * den * 1e6 / num), computed from the index.
++  const int64_t numerator = frame_index * frame_rate_.den * 1000000;
++  const int64_t quotient = numerator / frame_rate_.num;
++  const int64_t remainder = numerator % frame_rate_.num;
++  return quotient + (2 * remainder > frame_rate_.num ? 1 : 0);
++}
++
++base::TimeTicks CaptureSession::FrameTicks(int64_t frame_index) const {
++  // Every frame, including frame 0, is preceded by a grant of one frame
++  // interval: the document cannot load or paint while virtual time is paused,
++  // so T_n = base + offset(n + 1) and the grant for frame n is
++  // offset(n + 1) - offset(n).
++  return base::TimeTicks() + base::Milliseconds(virtual_time_ticks_base_ms_) +
++         base::Microseconds(FrameOffsetMicros(frame_index + 1));
++}
++
++void CaptureSession::Fail(Error error) {
++  if (!last_error_) {
++    last_error_ = error;
++  }
++  state_ = State::kFailed;
++}
++
++std::optional<CaptureSession::Error> CaptureSession::CheckState(
++    const char* command) const {
++  if (state_ == State::kFailed && last_error_) {
++    return last_error_;
++  }
++  if (state_ != State::kConfigured && state_ != State::kCapturing) {
++    return Error{"NotConfigured",
++                 std::string(command) + " in state " + StateName(state_)};
++  }
++  return std::nullopt;
++}
++
++// ---- configure --------------------------------------------------------------
++
++void CaptureSession::Configure(base::DictValue config,
++                               ResultCallback callback) {
++  if (state_ == State::kCapturing) {
++    std::move(callback).Run(Error{"AlreadyStarted", "capture already started"},
++                            base::DictValue());
++    return;
++  }
++  if (state_ != State::kUnconfigured && state_ != State::kConfigured) {
++    std::move(callback).Run(Error{"NotConfigured", std::string("configure in state ") + StateName(state_)},
++                            base::DictValue());
++    return;
++  }
++  // Feature negotiation: everything this build implements.
++  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"};
++  if (const base::ListValue* required = config.FindList("requiredFeatures")) {
++    for (const base::Value& feature : *required) {
++      const std::string* name = feature.GetIfString();
++      bool found = false;
++      for (const char* implemented : kImplemented) {
++        if (name && *name == implemented) {
++          found = true;
++        }
++      }
++      if (!found) {
++        std::move(callback).Run(
++            Error{"UnknownFeature", "required feature not available: " + (name ? *name : "?")},
++            base::DictValue());
++        return;
++      }
++    }
++  }
++  if (const base::DictValue* rate = config.FindDict("frameRate")) {
++    frame_rate_.num = rate->FindInt("num").value_or(60);
++    frame_rate_.den = rate->FindInt("den").value_or(1);
++    if (frame_rate_.num <= 0 || frame_rate_.den <= 0) {
++      std::move(callback).Run(Error{"InvalidViewport", "frameRate must be positive"}, base::DictValue());
++      return;
++    }
++  }
++  RawFrameSink::Config sink_config;
++  if (const base::DictValue* sink = config.FindDict("frameSink")) {
++    const std::string* type = sink->FindString("type");
++    if (type && *type == "shm") {
++      sink_config.type = RawFrameSink::Type::kShm;
++      sink_config.ring_fd = sink->FindInt("ringFd").value_or(-1);
++      sink_config.ready_fd = sink->FindInt("readyFd").value_or(-1);
++      sink_config.free_fd = sink->FindInt("freeFd").value_or(-1);
++    } else if (type && *type == "file") {
++      sink_config.type = RawFrameSink::Type::kFile;
++    } else if (type && *type != "null") {
++      std::move(callback).Run(Error{"InvalidParameters", "frameSink.type must be shm, file or null"},
++                              base::DictValue());
++      return;
++    }
++    if (const std::string* path = sink->FindString("path")) {
++      sink_config.path = *path;
++    }
++    if (std::optional<int> expected = sink->FindInt("expectedFrames")) {
++      sink_config.expected_frames = *expected;
++      expected_frames_ = *expected;
++    }
++    max_queued_frames_ = sink->FindInt("maxQueuedFrames").value_or(8);
++    sink_config.max_queued_frames = max_queued_frames_;
++    stall_timeout_ = base::Milliseconds(sink->FindInt("stallTimeoutMs").value_or(60000));
++    sink_config.stall_timeout = stall_timeout_;
++  }
++  sink_wants_frames_ = sink_config.type != RawFrameSink::Type::kNull;
++  sink_ = std::make_unique<RawFrameSink>(sink_config);
++  effective_config_ = config.Clone();
++  effective_config_.Set("protocolVersion", kProtocolVersion);
++  effective_config_.Set("pixelFormat", kCanonicalPixelFormat);
++  // Opening maps the ring or creates the file; keep it off the UI thread.
++  worker_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce([](RawFrameSink* sink) { return sink->Open(); }, base::Unretained(sink_.get())),
++      base::BindOnce(&CaptureSession::OnSinkOpened, weak_factory_.GetWeakPtr(),
++                     std::move(config), std::move(callback)));
++}
++
++void CaptureSession::OnSinkOpened(base::DictValue config,
++                                  ResultCallback callback,
++                                  std::optional<SinkError> error) {
++  if (error) {
++    std::move(callback).Run(Error{"SinkNotConnected", error->message, SinkErrorDict(*error)},
++                            base::DictValue());
++    return;
++  }
++  double initial_virtual_time_s = 1700000000.0;
++  if (const base::DictValue* vt = config.FindDict("virtualTime")) {
++    if (std::optional<double> ms = vt->FindDouble("initialVirtualTime")) {
++      initial_virtual_time_s = *ms / 1000.0;
++    }
++  }
++  if (!virtual_time_) {
++    virtual_time_ = std::make_unique<VirtualTimeOwner>(web_contents_);
++  }
++  virtual_time_->Enable(
++      initial_virtual_time_s,
++      base::BindOnce(&CaptureSession::OnVirtualTimeEnabled, weak_factory_.GetWeakPtr(),
++                     effective_config_.Clone(), std::move(callback)));
++}
++
++void CaptureSession::OnVirtualTimeEnabled(base::DictValue effective,
++                                          ResultCallback callback,
++                                          std::optional<std::string> error,
++                                          base::DictValue result) {
++  if (error) {
++    std::move(callback).Run(Error{"VirtualTimeOwned", *error}, base::DictValue());
++    return;
++  }
++  virtual_time_ticks_base_ms_ = result.FindDouble("virtualTimeTicksBase").value_or(0.0);
++  effective.Set("virtualTimeTicksBase", virtual_time_ticks_base_ms_);
++  effective_config_ = effective.Clone();
++  state_ = State::kConfigured;
++  next_frame_ = 0;
++  base::DictValue response;
++  response.Set("effective", std::move(effective));
++  response.Set("virtualTimeTicksBase", virtual_time_ticks_base_ms_);
++  std::move(callback).Run(std::nullopt, std::move(response));
++}
++
++// ---- advance ------------------------------------------------------------------
++
++void CaptureSession::Advance(base::DictValue params, ResultCallback callback) {
++  if (std::optional<Error> error = CheckState("advance")) {
++    std::move(callback).Run(error, base::DictValue());
++    return;
++  }
++  const int64_t frame_index = params.FindInt("frameIndex").value_or(-1);
++  if (frame_index == last_response_frame_ && last_response_frame_ >= 0) {
++    // The controller lost our response; replay it (DESIGN.md 4.3).
++    std::move(callback).Run(std::nullopt, last_response_.Clone());
++    return;
++  }
++  if (frame_index != next_frame_) {
++    base::DictValue details;
++    details.Set("expected", static_cast<double>(next_frame_));
++    std::move(callback).Run(
++        Error{"FrameIndexMismatch", "expected frame " + base::NumberToString(next_frame_), std::move(details)},
++        base::DictValue());
++    return;
++  }
++  if (deferred_) {
++    std::move(callback).Run(Error{"FrameIndexMismatch", "previous advance is still in flight"}, base::DictValue());
++    return;
++  }
++  auto pending = std::make_unique<PendingAdvance>();
++  pending->frame_index = frame_index;
++  pending->capture_video = params.FindBool("captureVideo").value_or(true);
++  pending->capture_audio = params.FindBool("captureAudio").value_or(true);
++  pending->hash = params.FindBool("hash").value_or(true);
++  pending->started = base::TimeTicks::Now();
++  pending->callback = std::move(callback);
++  RunAdvance(std::move(pending));
++}
++
++void CaptureSession::RunAdvance(std::unique_ptr<PendingAdvance> pending) {
++  state_ = State::kCapturing;
++  const int64_t budget_us = FrameOffsetMicros(pending->frame_index + 1) -
++                            FrameOffsetMicros(pending->frame_index);
++  virtual_time_->Grant(
++      budget_us / 1000.0,
++      base::BindOnce(&CaptureSession::OnGranted, weak_factory_.GetWeakPtr(),
++                     std::move(pending)));
++}
++
++void CaptureSession::OnGranted(std::unique_ptr<PendingAdvance> pending,
++                               std::optional<std::string> error) {
++  pending->after_grant = base::TimeTicks::Now();
++  grant_ms_.push_back((pending->after_grant - pending->started).InMillisecondsF());
++  if (error) {
++    Error err{"VirtualTimeStall", *error};
++    Fail(err);
++    std::move(pending->callback).Run(err, base::DictValue());
++    return;
++  }
++  // TODO(patch 5): wake non-main renderer threads, quiesce media transitions,
++  // render audio to T, collect markers (CaptureAgent.Prepare).
++  IssueBeginFrame(std::move(pending));
++}
++
++void CaptureSession::IssueBeginFrame(std::unique_ptr<PendingAdvance> pending) {
++  HeadlessWebContentsImpl* headless_contents = HeadlessWebContentsImpl::From(web_contents_);
++  if (!headless_contents || !headless_contents->begin_frame_control_enabled()) {
++    Error err{"NotConfigured", "BeginFrameControl is not enabled on this target"};
++    Fail(err);
++    std::move(pending->callback).Run(err, base::DictValue());
++    return;
++  }
++  const int64_t index = pending->frame_index;
++  const base::TimeTicks frame_time = FrameTicks(index);
++  const base::TimeDelta interval = base::Microseconds(FrameOffsetMicros(index + 1) - FrameOffsetMicros(index));
++  const bool wants_readback = pending->capture_video || pending->hash;
++  PendingAdvance* raw = pending.get();
++  headless_contents->BeginFrame(
++      frame_time, frame_time + interval, interval, /*animate_only=*/false,
++      wants_readback,
++      base::BindOnce(&CaptureSession::OnFrameFinished, weak_factory_.GetWeakPtr(),
++                     std::move(pending)));
++  (void)raw;
++}
++
++void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
++                                     bool has_damage,
++                                     std::unique_ptr<SkBitmap> bitmap,
++                                     std::string error) {
++  pending->after_begin_frame = base::TimeTicks::Now();
++  begin_frame_ms_.push_back((pending->after_begin_frame - pending->after_grant).InMillisecondsF());
++  if (!error.empty()) {
++    Error err{"RendererCrashed", "BeginFrame failed: " + error};
++    Fail(err);
++    std::move(pending->callback).Run(err, base::DictValue());
++    return;
++  }
++  const bool wants_readback = pending->capture_video || pending->hash;
++  const int64_t index = pending->frame_index;
++  bool reused = false;
++  bool has_surface = true;
++  std::shared_ptr<const SkBitmap> frame_bitmap;
++  if (wants_readback && (!bitmap || bitmap->drawsNothing()) &&
++      !pending->retried_for_surface && index == next_frame_) {
++    // The copy request is issued before the BeginFrame and needs an existing
++    // surface; the first frame after navigation has none. Now that this
++    // BeginFrame produced one, repeat the BeginFrame at the same frame time
++    // with the copy request so frame 0 is captured too.
++    content::RenderWidgetHostView* view = web_contents_->GetRenderWidgetHostView();
++    if (view && view->IsSurfaceAvailableForCopy()) {
++      pending->retried_for_surface = true;
++      // This callback runs inside HeadlessWebContentsImpl's PendingFrame
++      // teardown, which still counts as a pending frame; re-enter later.
++      content::GetUIThreadTaskRunner({})->PostTask(
++          FROM_HERE, base::BindOnce(&CaptureSession::IssueBeginFrame,
++                                    weak_factory_.GetWeakPtr(), std::move(pending)));
++      return;
++    }
++  }
++  if (wants_readback) {
++    if (bitmap && !bitmap->drawsNothing()) {
++      // The readback bitmap is kept as-is (shared memory from viz, N32
++      // premultiplied); hashing and the sink copy run on the worker directly
++      // from it. No canonical copy on the UI thread (DESIGN.md 13.2).
++      width_ = bitmap->width();
++      height_ = bitmap->height();
++      frame_bitmap = std::shared_ptr<const SkBitmap>(std::move(bitmap));
++      cached_bitmap_ = frame_bitmap;
++      cached_bitmap_frame_ = index;
++    } else if (!has_damage && cached_bitmap_ && cached_bitmap_frame_ == index - 1) {
++      frame_bitmap = cached_bitmap_;
++      cached_bitmap_frame_ = index;
++      reused = true;
++      ++reused_frames_;
++    } else {
++      has_surface = false;
++      if (pending->capture_video) {
++        Error err{"NoSurface", "no readback for frame " + base::NumberToString(index)};
++        Fail(err);
++        std::move(pending->callback).Run(err, base::DictValue());
++        return;
++      }
++    }
++  }
++  if (frame_bitmap) {
++    ++inflight_;
++    const bool write = pending->capture_video && sink_wants_frames_;
++    const bool hash = pending->hash;
++    const int64_t virtual_time_us = FrameOffsetMicros(index + 1);
++    worker_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](std::shared_ptr<const SkBitmap> frame, int64_t index, int64_t virtual_time_us,
++               bool hash, bool write, RawFrameSink* sink) {
++              Processed out{index};
++              const base::TimeTicks t0 = base::TimeTicks::Now();
++              std::optional<Sha256Digest> digest;
++              if (hash) {
++                digest = Sha256OfBitmap(*frame);
++                if (digest) {
++                  out.frame_hash = HexLower(*digest);
++                } else {
++                  out.sink_error = SinkError{index, 0, false, 0, 0, "NoSurface: readback bitmap could not be hashed"};
++                }
++              }
++              const base::TimeTicks t1 = base::TimeTicks::Now();
++              out.hash = t1 - t0;
++              if (write && !out.sink_error) {
++                RawFrameSink::Frame slot;
++                slot.frame_index = index;
++                slot.virtual_time_us = virtual_time_us;
++                slot.bitmap = std::move(frame);
++                slot.hash = digest;
++                out.sink_error = sink->Write(slot);
++                out.sink = base::TimeTicks::Now() - t1;
++              }
++              return out;
++            },
++            frame_bitmap, index, virtual_time_us, hash, write, base::Unretained(sink_.get())),
++        base::BindOnce(&CaptureSession::OnFrameProcessed, weak_factory_.GetWeakPtr()));
++    if (pending->capture_video) {
++      ++frames_written_;
++    }
++  }
++  next_frame_ = index + 1;
++  if (inflight_ > max_queued_frames_) {
++    // Backpressure: hold the response until the worker catches up.
++    deferred_ = std::move(pending);
++    deferred_has_damage_ = has_damage;
++    deferred_has_surface_ = has_surface;
++    deferred_reused_ = reused;
++    return;
++  }
++  Respond(std::move(pending), has_damage, has_surface, reused);
++}
++
++void CaptureSession::OnFrameProcessed(Processed processed) {
++  --inflight_;
++  hash_ms_.push_back(processed.hash.InMillisecondsF());
++  sink_ms_.push_back(processed.sink.InMillisecondsF());
++  if (!processed.frame_hash.empty()) {
++    chain_hash_ = ChainHash(chain_hash_, processed.frame_hash);
++    processed.chain_hash = chain_hash_;
++  }
++  if (processed.sink_error && !first_sink_error_) {
++    first_sink_error_ = processed.sink_error;
++    Fail(Error{"SinkClosed", processed.sink_error->message, SinkErrorDict(*processed.sink_error)});
++  }
++  completed_.push_back(std::move(processed));
++  MaybeRespondDeferred();
++}
++
++void CaptureSession::MaybeRespondDeferred() {
++  if (deferred_ && inflight_ <= max_queued_frames_) {
++    std::unique_ptr<PendingAdvance> pending = std::move(deferred_);
++    Respond(std::move(pending), deferred_has_damage_, deferred_has_surface_, deferred_reused_);
++  }
++}
++
++base::ListValue CaptureSession::TakeCompleted() {
++  base::ListValue list;
++  for (const Processed& p : completed_) {
++    base::DictValue d;
++    d.Set("frameIndex", static_cast<double>(p.frame_index));
++    if (!p.frame_hash.empty()) {
++      d.Set("frameHash", p.frame_hash);
++      d.Set("chainHash", p.chain_hash);
++    }
++    d.Set("hashMs", p.hash.InMillisecondsF());
++    d.Set("sinkMs", p.sink.InMillisecondsF());
++    if (p.sink_error) {
++      d.Set("sinkError", SinkErrorDict(*p.sink_error));
++    }
++    list.Append(std::move(d));
++  }
++  completed_.clear();
++  return list;
++}
++
++void CaptureSession::Respond(std::unique_ptr<PendingAdvance> pending,
++                             bool has_damage,
++                             bool has_surface,
++                             bool reused) {
++  if (first_sink_error_ && last_error_) {
++    std::move(pending->callback).Run(last_error_, base::DictValue());
++    return;
++  }
++  const int64_t index = pending->frame_index;
++  base::DictValue r;
++  r.Set("frameIndex", static_cast<double>(index));
++  r.Set("virtualTimeMs", FrameOffsetMicros(index + 1) / 1000.0);
++  r.Set("hasSurface", has_surface);
++  r.Set("hasDamage", has_damage);
++  r.Set("reusedReadback", reused);
++  r.Set("surfaceWarmed", pending->retried_for_surface);
++  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
++  r.Set("markers", base::ListValue());  // TODO(patch 5)
++  r.Set("media", base::ListValue());    // TODO(patch 5)
++  base::DictValue timings;
++  timings.Set("grantMs", (pending->after_grant - pending->started).InMillisecondsF());
++  timings.Set("beginFrameMs", (pending->after_begin_frame - pending->after_grant).InMillisecondsF());
++  timings.Set("queueDepth", inflight_);
++  timings.Set("sinkQueued", sink_ ? static_cast<double>(sink_->frames_queued()) : 0.0);
++  r.Set("timings", std::move(timings));
++  r.Set("completed", TakeCompleted());
++  r.Set("warnings", base::ListValue());
++  last_response_ = r.Clone();
++  last_response_frame_ = index;
++  std::move(pending->callback).Run(std::nullopt, std::move(r));
++}
++
++// ---- advanceRange -------------------------------------------------------------
++
++void CaptureSession::AdvanceRange(base::DictValue params, ResultCallback callback) {
++  if (std::optional<Error> error = CheckState("advanceRange")) {
++    std::move(callback).Run(error, base::DictValue());
++    return;
++  }
++  const int64_t from = params.FindInt("fromFrameIndex").value_or(next_frame_);
++  const int64_t to = params.FindInt("toFrameIndex").value_or(next_frame_);
++  if (from != next_frame_) {
++    std::move(callback).Run(Error{"FrameIndexMismatch", "expected frame " + base::NumberToString(next_frame_)},
++                            base::DictValue());
++    return;
++  }
++  RangeStep(std::move(params), to, base::ListValue(), std::move(callback), std::nullopt, base::DictValue());
++}
++
++void CaptureSession::RangeStep(base::DictValue params,
++                               int64_t to_frame,
++                               base::ListValue frames,
++                               ResultCallback callback,
++                               std::optional<Error> error,
++                               base::DictValue frame_result) {
++  if (!frame_result.empty()) {
++    frames.Append(std::move(frame_result));
++  }
++  if (error) {
++    base::DictValue details = error->details.Clone();
++    details.Set("lastCompletedFrameIndex", static_cast<double>(next_frame_ - 1));
++    std::move(callback).Run(Error{error->kind, error->message, std::move(details)}, base::DictValue());
++    return;
++  }
++  if (next_frame_ >= to_frame) {
++    base::DictValue r;
++    r.Set("frames", std::move(frames));
++    r.Set("nextFrameIndex", static_cast<double>(next_frame_));
++    std::move(callback).Run(std::nullopt, std::move(r));
++    return;
++  }
++  auto pending = std::make_unique<PendingAdvance>();
++  pending->frame_index = next_frame_;
++  pending->capture_video = false;
++  pending->capture_audio = params.FindBool("captureAudio").value_or(false);
++  pending->hash = params.FindBool("hash").value_or(false);
++  pending->started = base::TimeTicks::Now();
++  pending->callback = base::BindOnce(&CaptureSession::RangeStep, weak_factory_.GetWeakPtr(),
++                                     params.Clone(), to_frame, std::move(frames), std::move(callback));
++  // RangeStep may run from a frame-finished callback; start the next frame
++  // from a fresh task so the previous PendingFrame is gone.
++  content::GetUIThreadTaskRunner({})->PostTask(
++      FROM_HERE, base::BindOnce(&CaptureSession::RunAdvance, weak_factory_.GetWeakPtr(),
++                                std::move(pending)));
++}
++
++// ---- finish / abort / state ---------------------------------------------------
++
++void CaptureSession::Finish(ResultCallback callback) {
++  if (state_ == State::kUnconfigured) {
++    std::move(callback).Run(Error{"NotConfigured", "finish before configure"}, base::DictValue());
++    return;
++  }
++  // Drain the conversion sequence, then close the sink on it.
++  worker_->PostTaskAndReply(
++      FROM_HERE, base::DoNothing(),
++      base::BindOnce(&CaptureSession::OnDrained, weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void CaptureSession::OnDrained(ResultCallback callback) {
++  std::optional<SinkError> close_error = sink_ ? sink_->Close() : std::nullopt;
++  if (close_error && !first_sink_error_) {
++    first_sink_error_ = close_error;
++  }
++  const int64_t written = sink_ ? sink_->frames_written() : frames_written_;
++  const bool complete = state_ != State::kFailed && state_ != State::kAborted &&
++                        (expected_frames_ < 0 || written == expected_frames_);
++  if (!complete && state_ != State::kFailed && state_ != State::kAborted) {
++    Fail(Error{"IncompleteOutput", "engine wrote " + base::NumberToString(written) + " of " +
++                                       base::NumberToString(expected_frames_) + " frames"});
++  }
++  base::DictValue r;
++  r.Set("status", complete ? "complete" : "failed");
++  r.Set("framesWritten", static_cast<double>(written));
++  if (expected_frames_ >= 0) {
++    r.Set("expectedFrames", static_cast<double>(expected_frames_));
++  }
++  r.Set("reusedFrames", static_cast<double>(reused_frames_));
++  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
++  if (!chain_hash_.empty()) {
++    r.Set("chainHash", chain_hash_);
++  }
++  base::DictValue histograms;
++  histograms.Set("grantMs", Histogram(grant_ms_));
++  histograms.Set("beginFrameMs", Histogram(begin_frame_ms_));
++  histograms.Set("hashMs", Histogram(hash_ms_));
++  histograms.Set("sinkMs", Histogram(sink_ms_));
++  r.Set("histograms", std::move(histograms));
++  r.Set("gpuProcessCrashes", gpu_process_crashes_);
++  if (first_sink_error_) {
++    r.Set("firstSinkError", SinkErrorDict(*first_sink_error_));
++  }
++  r.Set("completed", TakeCompleted());
++  if (complete) {
++    state_ = State::kFinished;
++  }
++  std::move(callback).Run(std::nullopt, std::move(r));
++}
++
++void CaptureSession::Abort() {
++  if (sink_) {
++    sink_->Close(/*aborted=*/true);
++  }
++  state_ = State::kAborted;
++}
++
++base::DictValue CaptureSession::GetState() const {
++  base::DictValue d;
++  d.Set("state", StateName(state_));
++  d.Set("nextFrameIndex", static_cast<double>(next_frame_));
++  if (last_error_) {
++    base::DictValue err;
++    err.Set("kind", last_error_->kind);
++    err.Set("message", last_error_->message);
++    err.Set("details", last_error_->details.Clone());
++    d.Set("lastError", std::move(err));
++  }
++  return d;
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(CaptureSession);
++
++}  // namespace headless::capture
+diff --git a/headless/lib/browser/capture/capture_session.h b/headless/lib/browser/capture/capture_session.h
+new file mode 100644
+index 0000000000..474f0fb574
+--- /dev/null
++++ b/headless/lib/browser/capture/capture_session.h
+@@ -0,0 +1,203 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_CAPTURE_CAPTURE_SESSION_H_
++#define HEADLESS_LIB_BROWSER_CAPTURE_CAPTURE_SESSION_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "headless/lib/browser/capture/raw_frame_sink.h"
++#include "headless/lib/browser/capture/virtual_time_owner.h"
++
++class SkBitmap;
++
++namespace headless {
++class HeadlessWebContentsImpl;
++}
++
++namespace headless::capture {
++
++// Per-target state of a deterministic capture (DESIGN.md 4.2-4.3). Lives on
++// the UI thread as WebContents user data; conversion, hashing and sink
++// writes run on a blocking sequence so the UI thread never waits on the
++// consumer.
++class CaptureSession : public content::WebContentsUserData<CaptureSession> {
++ public:
++  enum class State {
++    kUnconfigured,
++    kConfigured,
++    kCapturing,
++    kFinished,
++    kFailed,
++    kAborted,
++  };
++
++  // Typed error with the same vocabulary as the controller (DESIGN.md 4.3).
++  struct Error {
++    std::string kind;
++    std::string message;
++    base::DictValue details;
++
++    Error() = default;
++    Error(std::string kind_in,
++          std::string message_in,
++          base::DictValue details_in = base::DictValue())
++        : kind(std::move(kind_in)),
++          message(std::move(message_in)),
++          details(std::move(details_in)) {}
++    // base::DictValue is move-only; errors are copied into callbacks and
++    // kept as the sticky last error, so copy explicitly through Clone().
++    Error(const Error& other)
++        : kind(other.kind),
++          message(other.message),
++          details(other.details.Clone()) {}
++    Error& operator=(const Error& other) {
++      kind = other.kind;
++      message = other.message;
++      details = other.details.Clone();
++      return *this;
++    }
++    Error(Error&&) = default;
++    Error& operator=(Error&&) = default;
++
++    std::string Render() const;  // "Kind: message" for Response::ServerError
++  };
++
++  using ResultCallback = base::OnceCallback<void(std::optional<Error>, base::DictValue)>;
++
++  ~CaptureSession() override;
++
++  void Configure(base::DictValue config, ResultCallback callback);
++  void Advance(base::DictValue params, ResultCallback callback);
++  void AdvanceRange(base::DictValue params, ResultCallback callback);
++  void Finish(ResultCallback callback);
++  void Abort();
++  base::DictValue GetState() const;
++
++  State state() const { return state_; }
++  bool OwnsVirtualTime() const { return state_ != State::kUnconfigured; }
++  bool IsOwnerClient(const content::DevToolsAgentHostClient* client) const {
++    return virtual_time_ && client == virtual_time_.get();
++  }
++
++  static const char* StateName(State state);
++
++ private:
++  friend class content::WebContentsUserData<CaptureSession>;
++  struct FrameConfig {
++    int64_t num = 60;
++    int64_t den = 1;
++  };
++  struct Processed {
++    int64_t frame_index;
++    std::string frame_hash;
++    std::string chain_hash;
++    std::optional<SinkError> sink_error;
++    base::TimeDelta hash;
++    base::TimeDelta sink;
++  };
++  struct PendingAdvance {
++    int64_t frame_index;
++    bool capture_video;
++    bool capture_audio;
++    bool hash;
++    base::TimeTicks started;
++    base::TimeTicks after_grant;
++    base::TimeTicks after_begin_frame;
++    // Set when the surface did not exist before this frame's BeginFrame and a
++    // second BeginFrame at the same frame time was issued to obtain readback
++    // (only ever the first frame; DESIGN.md 4.3 step 8).
++    bool retried_for_surface = false;
++    ResultCallback callback;
++  };
++
++  explicit CaptureSession(content::WebContents* web_contents);
++
++  base::TimeTicks FrameTicks(int64_t frame_index) const;
++  int64_t FrameOffsetMicros(int64_t frame_index) const;
++  void Fail(Error error);
++  std::optional<Error> CheckState(const char* command) const;
++
++  // Configure steps.
++  void OnSinkOpened(base::DictValue config, ResultCallback callback, std::optional<SinkError> error);
++  void OnVirtualTimeEnabled(base::DictValue effective, ResultCallback callback,
++                            std::optional<std::string> error, base::DictValue result);
++
++  // Advance steps (DESIGN.md 4.3, steps 1, 6, 7, 8; steps 2-5 land with the
++  // renderer agent).
++  void RunAdvance(std::unique_ptr<PendingAdvance> pending);
++  void OnGranted(std::unique_ptr<PendingAdvance> pending, std::optional<std::string> error);
++  void IssueBeginFrame(std::unique_ptr<PendingAdvance> pending);
++  void OnFrameFinished(std::unique_ptr<PendingAdvance> pending, bool has_damage,
++                       std::unique_ptr<SkBitmap> bitmap, std::string error);
++  void OnFrameProcessed(Processed processed);
++  void Respond(std::unique_ptr<PendingAdvance> pending, bool has_damage, bool has_surface, bool reused);
++  void MaybeRespondDeferred();
++  base::ListValue TakeCompleted();
++
++  // AdvanceRange drives RunAdvance in a loop.
++  void RangeStep(base::DictValue params, int64_t to_frame, base::ListValue frames, ResultCallback callback,
++                 std::optional<Error> error, base::DictValue frame_result);
++
++  void OnDrained(ResultCallback callback);
++
++  raw_ptr<content::WebContents> web_contents_;
++  State state_ = State::kUnconfigured;
++  std::optional<Error> last_error_;
++  base::DictValue effective_config_;
++  FrameConfig frame_rate_;
++  double virtual_time_ticks_base_ms_ = 0.0;
++  int64_t next_frame_ = 0;
++  int64_t expected_frames_ = -1;
++  int max_queued_frames_ = 8;
++  base::TimeDelta stall_timeout_ = base::Seconds(60);
++  int width_ = 0;
++  int height_ = 0;
++
++  std::unique_ptr<VirtualTimeOwner> virtual_time_;
++  std::unique_ptr<RawFrameSink> sink_;
++  bool sink_wants_frames_ = false;
++  scoped_refptr<base::SequencedTaskRunner> worker_;
++
++  // Pipelining: frames whose conversion is in flight, and processed results
++  // not yet reported to the controller.
++  int inflight_ = 0;
++  std::vector<Processed> completed_;
++  std::string chain_hash_;
++  std::shared_ptr<const SkBitmap> cached_bitmap_;
++  int64_t cached_bitmap_frame_ = -1;
++  std::unique_ptr<PendingAdvance> deferred_;   // waiting for queue space
++  bool deferred_has_damage_ = false;
++  bool deferred_has_surface_ = false;
++  bool deferred_reused_ = false;
++  base::DictValue last_response_;
++  int64_t last_response_frame_ = -1;
++  int64_t frames_written_ = 0;
++  int64_t reused_frames_ = 0;
++  int gpu_process_crashes_ = 0;
++  std::optional<SinkError> first_sink_error_;
++  std::vector<double> grant_ms_;
++  std::vector<double> begin_frame_ms_;  // grant to frame-finished; includes the GPU readback
++  std::vector<double> hash_ms_;
++  std::vector<double> sink_ms_;
++
++  base::WeakPtrFactory<CaptureSession> weak_factory_{this};
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace headless::capture
++
++#endif  // HEADLESS_LIB_BROWSER_CAPTURE_CAPTURE_SESSION_H_
+diff --git a/headless/lib/browser/capture/raw_frame_sink.cc b/headless/lib/browser/capture/raw_frame_sink.cc
+new file mode 100644
+index 0000000000..c7b058208f
+--- /dev/null
++++ b/headless/lib/browser/capture/raw_frame_sink.cc
+@@ -0,0 +1,355 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/browser/capture/raw_frame_sink.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <utility>
++
++#include "base/posix/eintr_wrapper.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
++#include "headless/lib/browser/capture/shm_ring.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++
++namespace headless::capture {
++
++namespace {
++
++template <typename T>
++T LoadAcquire(const uint8_t* base, size_t offset) {
++  return __atomic_load_n(reinterpret_cast<const T*>(base + offset),
++                         __ATOMIC_ACQUIRE);
++}
++
++template <typename T>
++void StoreRelease(uint8_t* base, size_t offset, T value) {
++  __atomic_store_n(reinterpret_cast<T*>(base + offset), value,
++                   __ATOMIC_RELEASE);
++}
++
++template <typename T>
++T LoadPlain(const uint8_t* base, size_t offset) {
++  T value;
++  memcpy(&value, base + offset, sizeof(T));
++  return value;
++}
++
++template <typename T>
++void StorePlain(uint8_t* base, size_t offset, T value) {
++  memcpy(base + offset, &value, sizeof(T));
++}
++
++bool SignalEventFd(int fd) {
++  const uint64_t one = 1;
++  return HANDLE_EINTR(write(fd, &one, sizeof(one))) == static_cast<ssize_t>(sizeof(one));
++}
++
++// Waits until the eventfd is readable or the deadline passes; consumes the
++// counter. Returns false on timeout or error.
++bool WaitEventFd(int fd, base::TimeTicks deadline) {
++  for (;;) {
++    const base::TimeDelta remaining = deadline - base::TimeTicks::Now();
++    if (remaining <= base::TimeDelta()) {
++      return false;
++    }
++    pollfd pfd{fd, POLLIN, 0};
++    const int rc = HANDLE_EINTR(poll(&pfd, 1, static_cast<int>(remaining.InMilliseconds()) + 1));
++    if (rc < 0) {
++      return false;
++    }
++    if (rc == 0) {
++      continue;
++    }
++    uint64_t count = 0;
++    const ssize_t n = HANDLE_EINTR(read(fd, &count, sizeof(count)));
++    if (n == static_cast<ssize_t>(sizeof(count))) {
++      return true;
++    }
++    if (n < 0 && errno != EAGAIN) {
++      return false;
++    }
++  }
++}
++
++}  // namespace
++
++RawFrameSink::RawFrameSink(Config config)
++    : config_(std::move(config)), has_data_(&lock_), has_space_(&lock_) {}
++
++RawFrameSink::~RawFrameSink() {
++  Close(/*aborted=*/true);
++  if (ring_) {
++    munmap(ring_, ring_size_);
++    ring_ = nullptr;
++  }
++}
++
++std::optional<SinkError> RawFrameSink::Open() {
++  switch (config_.type) {
++    case Type::kNull:
++      return std::nullopt;
++    case Type::kFile:
++      fd_ = HANDLE_EINTR(
++          open(config_.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
++      if (fd_ < 0) {
++        return SinkError{-1, errno, false, 0, 0, "SinkNotConnected: open failed"};
++      }
++      return std::nullopt;
++    case Type::kShm:
++      return OpenRing();
++  }
++  return std::nullopt;
++}
++
++std::optional<SinkError> RawFrameSink::OpenRing() {
++  if (config_.ring_fd < 0 || config_.ready_fd < 0 || config_.free_fd < 0) {
++    return SinkError{-1, 0, false, 0, 0, "SinkNotConnected: shm sink needs ringFd, readyFd and freeFd"};
++  }
++  struct stat st;
++  if (fstat(config_.ring_fd, &st) != 0 || st.st_size < static_cast<off_t>(ring::kHeaderBytes)) {
++    return SinkError{-1, errno, false, 0, 0, "SinkNotConnected: ring descriptor is not a mapping"};
++  }
++  ring_size_ = static_cast<size_t>(st.st_size);
++  void* mapped = mmap(nullptr, ring_size_, PROT_READ | PROT_WRITE, MAP_SHARED, config_.ring_fd, 0);
++  if (mapped == MAP_FAILED) {
++    return SinkError{-1, errno, false, 0, 0, "SinkNotConnected: mmap of the ring failed"};
++  }
++  ring_ = static_cast<uint8_t*>(mapped);
++  if (LoadPlain<uint64_t>(ring_, ring::kOffMagic) != ring::kMagic ||
++      LoadPlain<uint32_t>(ring_, ring::kOffVersion) != ring::kVersion) {
++    return SinkError{-1, 0, false, 0, 0, "SinkNotConnected: ring magic or version mismatch"};
++  }
++  if (LoadPlain<uint32_t>(ring_, ring::kOffPixelFormat) != ring::kPixelFormatBgra8Premul) {
++    return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring pixel format is not bgra8-premul"};
++  }
++  slot_count_ = LoadPlain<uint32_t>(ring_, ring::kOffSlotCount);
++  slot_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffSlotBytes);
++  video_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffVideoBytes);
++  ring_width_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffWidth));
++  ring_height_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffHeight));
++  const uint64_t needed = ring::kHeaderBytes + static_cast<uint64_t>(slot_count_) * slot_bytes_;
++  if (slot_count_ == 0 || slot_bytes_ < ring::kSlotHeaderBytes + video_bytes_ || needed > ring_size_ ||
++      video_bytes_ != CanonicalBytes(ring_width_, ring_height_)) {
++    return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring geometry is inconsistent"};
++  }
++  return std::nullopt;
++}
++
++std::optional<SinkError> RawFrameSink::Write(const Frame& frame) {
++  switch (config_.type) {
++    case Type::kNull: {
++      base::AutoLock lock(lock_);
++      ++frames_written_;
++      return std::nullopt;
++    }
++    case Type::kFile:
++      return WriteFile(frame);
++    case Type::kShm:
++      return WriteRing(frame);
++  }
++  return std::nullopt;
++}
++
++std::optional<SinkError> RawFrameSink::WriteRing(const Frame& frame) {
++  base::AutoLock lock(lock_);
++  if (error_) {
++    return error_;
++  }
++  if (config_.expected_frames && frames_written_ >= *config_.expected_frames) {
++    error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                       "IncompleteOutput: more frames than expectedFrames"};
++    return error_;
++  }
++  if (!frame.bitmap || frame.bitmap->width() != ring_width_ || frame.bitmap->height() != ring_height_) {
++    error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                       "InvalidViewport: frame size differs from the ring geometry"};
++    return error_;
++  }
++  const base::TimeTicks deadline = base::TimeTicks::Now() + config_.stall_timeout;
++  const uint64_t produced = LoadAcquire<uint64_t>(ring_, ring::kOffProduced);
++  for (;;) {
++    const uint64_t consumed = LoadAcquire<uint64_t>(ring_, ring::kOffConsumed);
++    if (produced - consumed < slot_count_) {
++      break;
++    }
++    if (!WaitEventFd(config_.free_fd, deadline)) {
++      error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                         "SinkStalled: consumer did not release a ring slot"};
++      return error_;
++    }
++  }
++  uint8_t* slot = ring_ + ring::kHeaderBytes + (produced % slot_count_) * slot_bytes_;
++  StorePlain<int64_t>(slot, ring::kSlotFrameIndex, frame.frame_index);
++  StorePlain<int64_t>(slot, ring::kSlotVirtualTimeUs, frame.virtual_time_us);
++  StorePlain<uint32_t>(slot, ring::kSlotFlags, ring::kFlagVideo);
++  StorePlain<uint32_t>(slot, ring::kSlotAudioFrames, 0);
++  StorePlain<uint64_t>(slot, ring::kSlotVideoBytes, video_bytes_);
++  if (frame.hash) {
++    memcpy(slot + ring::kSlotHash, frame.hash->data(), frame.hash->size());
++    StorePlain<uint32_t>(slot, ring::kSlotHashPresent, 1);
++  } else {
++    memset(slot + ring::kSlotHash, 0, 32);
++    StorePlain<uint32_t>(slot, ring::kSlotHashPresent, 0);
++  }
++  if (!CopyCanonical(*frame.bitmap, base::span<uint8_t>(slot + ring::kSlotVideoData, video_bytes_))) {
++    error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                       "NoSurface: readback bitmap could not be copied"};
++    return error_;
++  }
++  StoreRelease<uint64_t>(ring_, ring::kOffProduced, produced + 1);
++  ++frames_written_;
++  if (!SignalEventFd(config_.ready_fd)) {
++    error_ = SinkError{frame.frame_index, errno, errno == EPIPE, 0, frames_written_,
++                       "SinkClosed: consumer eventfd write failed"};
++    return error_;
++  }
++  return std::nullopt;
++}
++
++std::optional<SinkError> RawFrameSink::WriteFile(const Frame& frame) {
++  if (!frame.bitmap) {
++    return SinkError{frame.frame_index, 0, false, 0, frames_written(), "NoSurface: no bitmap"};
++  }
++  auto bytes = std::make_shared<std::vector<uint8_t>>(
++      CanonicalBytes(frame.bitmap->width(), frame.bitmap->height()));
++  if (!CopyCanonical(*frame.bitmap, base::span<uint8_t>(*bytes))) {
++    return SinkError{frame.frame_index, 0, false, 0, frames_written(), "NoSurface: readback bitmap could not be copied"};
++  }
++  base::AutoLock lock(lock_);
++  if (error_) {
++    return error_;
++  }
++  if (config_.expected_frames &&
++      frames_written_ + static_cast<int64_t>(queue_.size()) >= *config_.expected_frames) {
++    error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                       "IncompleteOutput: more frames than expectedFrames"};
++    return error_;
++  }
++  if (!thread_started_) {
++    thread_started_ = base::PlatformThread::Create(0, this, &thread_);
++    if (!thread_started_) {
++      error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                         "SinkStalled: writer thread did not start"};
++      return error_;
++    }
++  }
++  const base::TimeTicks deadline = base::TimeTicks::Now() + config_.stall_timeout;
++  while (!error_ && static_cast<int>(queue_.size()) >= config_.max_queued_frames) {
++    const base::TimeDelta remaining = deadline - base::TimeTicks::Now();
++    if (remaining <= base::TimeDelta()) {
++      error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
++                         "SinkStalled: file writer did not drain the queue"};
++      return error_;
++    }
++    has_space_.TimedWait(remaining);
++  }
++  if (error_) {
++    return error_;
++  }
++  queue_.push_back(Pending{frame.frame_index, std::move(bytes)});
++  has_data_.Signal();
++  return std::nullopt;
++}
++
++std::optional<SinkError> RawFrameSink::Close(bool aborted) {
++  {
++    base::AutoLock lock(lock_);
++    stop_ = true;
++    has_data_.Broadcast();
++    has_space_.Broadcast();
++  }
++  if (thread_started_) {
++    base::PlatformThread::Join(thread_);
++    thread_started_ = false;
++  }
++  if (fd_ >= 0) {
++    IGNORE_EINTR(close(fd_));
++    fd_ = -1;
++  }
++  if (ring_ && !closed_) {
++    closed_ = true;
++    if (aborted) {
++      StoreRelease<uint32_t>(ring_, ring::kOffProducerError, 1);
++    }
++    StoreRelease<uint32_t>(ring_, ring::kOffClosed, 1);
++    SignalEventFd(config_.ready_fd);
++  }
++  base::AutoLock lock(lock_);
++  return error_;
++}
++
++int64_t RawFrameSink::frames_written() const {
++  base::AutoLock lock(lock_);
++  return frames_written_;
++}
++
++int64_t RawFrameSink::frames_queued() const {
++  base::AutoLock lock(lock_);
++  if (config_.type == Type::kShm && ring_) {
++    return static_cast<int64_t>(LoadAcquire<uint64_t>(ring_, ring::kOffProduced) -
++                                LoadAcquire<uint64_t>(ring_, ring::kOffConsumed));
++  }
++  return static_cast<int64_t>(queue_.size());
++}
++
++void RawFrameSink::ThreadMain() {
++  base::PlatformThread::SetName("DeterministicCaptureSink");
++  for (;;) {
++    Pending pending;
++    {
++      base::AutoLock lock(lock_);
++      while (queue_.empty() && !stop_) {
++        has_data_.Wait();
++      }
++      if (queue_.empty()) {
++        return;  // stop_ and drained
++      }
++      pending = std::move(queue_.front());
++      queue_.pop_front();
++    }
++    SinkError error;
++    const bool ok = WriteAll(pending, &error);
++    base::AutoLock lock(lock_);
++    if (!ok) {
++      if (!error_) {
++        error_ = error;
++      }
++      queue_.clear();
++      has_space_.Broadcast();
++      return;
++    }
++    ++frames_written_;
++    has_space_.Signal();
++  }
++}
++
++bool RawFrameSink::WriteAll(const Pending& pending, SinkError* error) {
++  const uint8_t* data = pending.bytes->data();
++  size_t remaining = pending.bytes->size();
++  int64_t written_total = 0;
++  while (remaining > 0) {
++    const ssize_t written = HANDLE_EINTR(write(fd_, data, remaining));
++    if (written < 0) {
++      *error = SinkError{pending.frame_index, errno, errno == EPIPE,
++                         written_total, frames_written_,
++                         errno == EPIPE ? "SinkClosed: consumer closed the file"
++                                        : "SinkClosed: write failed"};
++      return false;
++    }
++    data += written;
++    remaining -= static_cast<size_t>(written);
++    written_total += written;
++  }
++  return true;
++}
++
++}  // namespace headless::capture
+diff --git a/headless/lib/browser/capture/raw_frame_sink.h b/headless/lib/browser/capture/raw_frame_sink.h
+new file mode 100644
+index 0000000000..7a9e88ee67
+--- /dev/null
++++ b/headless/lib/browser/capture/raw_frame_sink.h
+@@ -0,0 +1,129 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_CAPTURE_RAW_FRAME_SINK_H_
++#define HEADLESS_LIB_BROWSER_CAPTURE_RAW_FRAME_SINK_H_
++
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr_exclusion.h"
++#include "base/synchronization/condition_variable.h"
++#include "base/synchronization/lock.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
++#include "headless/lib/browser/capture/canonical_hash.h"
++
++class SkBitmap;
++
++namespace headless::capture {
++
++struct SinkError {
++  int64_t frame_index = -1;
++  int error_number = 0;
++  bool peer_closed = false;
++  int64_t bytes_into_frame = 0;
++  int64_t frames_fully_written = 0;
++  std::string message;
++};
++
++// Destination of canonical frames (DESIGN.md 4.4 and 13.3).
++//   shm:  a shared-memory ring created by the controller; the frame is copied
++//         once into a free slot on the calling (worker) thread, which blocks
++//         while the ring is full, up to stall_timeout.
++//   file: packed canonical BGRA appended to a file through a writer thread
++//         (debugging and tests).
++//   null: frames are counted and dropped.
++// Never writes more than expected_frames.
++class RawFrameSink : public base::PlatformThread::Delegate {
++ public:
++  enum class Type { kNull, kFile, kShm };
++
++  struct Config {
++    Type type = Type::kNull;
++    std::string path;      // kFile
++    int ring_fd = -1;      // kShm: mapping
++    int ready_fd = -1;     // kShm: eventfd signalled after publishing a slot
++    int free_fd = -1;      // kShm: eventfd signalled by the consumer per release
++    std::optional<int64_t> expected_frames;
++    int max_queued_frames = 8;
++    base::TimeDelta stall_timeout = base::Seconds(60);
++  };
++
++  struct Frame {
++    int64_t frame_index = 0;
++    int64_t virtual_time_us = 0;
++    std::shared_ptr<const SkBitmap> bitmap;
++    std::optional<Sha256Digest> hash;
++  };
++
++  explicit RawFrameSink(Config config);
++  RawFrameSink(const RawFrameSink&) = delete;
++  RawFrameSink& operator=(const RawFrameSink&) = delete;
++  ~RawFrameSink() override;
++
++  // Opens the destination: creates the file, or maps and validates the ring.
++  std::optional<SinkError> Open();
++
++  // Writes one frame. May block (file: queue full; shm: ring full) up to
++  // stall_timeout. Returns the first error observed, if any.
++  std::optional<SinkError> Write(const Frame& frame);
++
++  // Finishes the stream: drains the file queue and closes the descriptor, or
++  // marks the ring closed and wakes the consumer. |aborted| marks the stream
++  // incomplete for the consumer.
++  std::optional<SinkError> Close(bool aborted = false);
++
++  int64_t frames_written() const;
++  int64_t frames_queued() const;
++  // Ring geometry for validation by the session (0 when not a ring).
++  int ring_width() const { return ring_width_; }
++  int ring_height() const { return ring_height_; }
++
++ private:
++  struct Pending {
++    int64_t frame_index;
++    std::shared_ptr<const std::vector<uint8_t>> bytes;
++  };
++
++  std::optional<SinkError> OpenRing();
++  std::optional<SinkError> WriteRing(const Frame& frame);
++  std::optional<SinkError> WriteFile(const Frame& frame);
++
++  // base::PlatformThread::Delegate:
++  void ThreadMain() override;
++  bool WriteAll(const Pending& pending, SinkError* error);
++
++  const Config config_;
++  int fd_ = -1;
++  base::PlatformThreadHandle thread_;
++  bool thread_started_ = false;
++
++  // Ring state (kShm). The mapping is mmap(2) memory owned by this object,
++  // not a PartitionAlloc allocation, so raw_ptr does not apply.
++  RAW_PTR_EXCLUSION uint8_t* ring_ = nullptr;
++  size_t ring_size_ = 0;
++  uint32_t slot_count_ = 0;
++  uint64_t slot_bytes_ = 0;
++  uint64_t video_bytes_ = 0;
++  int ring_width_ = 0;
++  int ring_height_ = 0;
++  bool closed_ = false;
++
++  mutable base::Lock lock_;
++  base::ConditionVariable has_data_;
++  base::ConditionVariable has_space_;
++  std::deque<Pending> queue_;
++  bool stop_ = false;
++  std::optional<SinkError> error_;
++  int64_t frames_written_ = 0;
++};
++
++}  // namespace headless::capture
++
++#endif  // HEADLESS_LIB_BROWSER_CAPTURE_RAW_FRAME_SINK_H_
+diff --git a/headless/lib/browser/capture/shm_ring.h b/headless/lib/browser/capture/shm_ring.h
+new file mode 100644
+index 0000000000..aa2228a5e2
+--- /dev/null
++++ b/headless/lib/browser/capture/shm_ring.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_CAPTURE_SHM_RING_H_
++#define HEADLESS_LIB_BROWSER_CAPTURE_SHM_RING_H_
++
++#include <cstddef>
++#include <cstdint>
++
++// Layout of the shared-memory frame ring between the engine (producer) and
++// the controller's encoder (consumer). The controller creates the mapping,
++// fills the header and passes three descriptors at launch: the ring, a
++// "ready" eventfd the producer signals after publishing a slot and a "free"
++// eventfd the consumer signals after releasing one. All integers are
++// little-endian. The Rust side (deterministic-capture/dcap/src/shm.rs)
++// mirrors these constants; change both together and bump kVersion.
++namespace headless::capture::ring {
++
++inline constexpr uint64_t kMagic = 0x31474E5250414344ULL;  // "DCAPRNG1"
++inline constexpr uint32_t kVersion = 1;
++inline constexpr size_t kHeaderBytes = 4096;
++inline constexpr size_t kSlotHeaderBytes = 256;
++
++// Header fields (byte offsets).
++inline constexpr size_t kOffMagic = 0;               // u64
++inline constexpr size_t kOffVersion = 8;             // u32
++inline constexpr size_t kOffSlotCount = 12;          // u32
++inline constexpr size_t kOffSlotBytes = 16;          // u64, multiple of 4096
++inline constexpr size_t kOffWidth = 24;              // u32
++inline constexpr size_t kOffHeight = 28;             // u32
++inline constexpr size_t kOffStride = 32;             // u32, == width * 4
++inline constexpr size_t kOffPixelFormat = 36;        // u32, kPixelFormatBgra8Premul
++inline constexpr size_t kOffAudioRate = 40;          // u32
++inline constexpr size_t kOffAudioChannels = 44;      // u32
++inline constexpr size_t kOffAudioFormat = 48;        // u32, 0 none, 1 s16, 2 f32
++inline constexpr size_t kOffAudioFramesPerSlot = 52; // u32
++inline constexpr size_t kOffVideoBytes = 56;         // u64, == stride * height
++inline constexpr size_t kOffAudioBytes = 64;         // u64, audio capacity per slot
++inline constexpr size_t kOffProduced = 128;          // u64 atomic, slots published
++inline constexpr size_t kOffConsumed = 192;          // u64 atomic, slots released
++inline constexpr size_t kOffClosed = 256;            // u32 atomic, producer finished
++inline constexpr size_t kOffProducerError = 260;     // u32 atomic, 1 = aborted/incomplete
++
++// Slot fields (byte offsets from the slot start; slot i starts at
++// kHeaderBytes + i * slot_bytes).
++inline constexpr size_t kSlotFrameIndex = 0;         // i64
++inline constexpr size_t kSlotVirtualTimeUs = 8;      // i64, frame time offset
++inline constexpr size_t kSlotFlags = 16;             // u32
++inline constexpr size_t kSlotAudioFrames = 20;       // u32, sample frames present
++inline constexpr size_t kSlotVideoBytes = 24;        // u64, bytes written
++inline constexpr size_t kSlotHash = 32;              // 32 bytes, SHA-256 of video
++inline constexpr size_t kSlotHashPresent = 64;       // u32
++inline constexpr size_t kSlotVideoData = kSlotHeaderBytes;  // then audio
++
++inline constexpr uint32_t kFlagVideo = 1u << 0;
++inline constexpr uint32_t kFlagAudio = 1u << 1;
++
++inline constexpr uint32_t kPixelFormatBgra8Premul = 1;
++inline constexpr uint32_t kAudioFormatNone = 0;
++inline constexpr uint32_t kAudioFormatS16 = 1;
++inline constexpr uint32_t kAudioFormatF32 = 2;
++
++}  // namespace headless::capture::ring
++
++#endif  // HEADLESS_LIB_BROWSER_CAPTURE_SHM_RING_H_
+diff --git a/headless/lib/browser/capture/virtual_time_owner.cc b/headless/lib/browser/capture/virtual_time_owner.cc
+new file mode 100644
+index 0000000000..e589da7359
+--- /dev/null
++++ b/headless/lib/browser/capture/virtual_time_owner.cc
+@@ -0,0 +1,134 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/browser/capture/virtual_time_owner.h"
++
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "content/public/browser/web_contents.h"
++
++namespace headless::capture {
++
++VirtualTimeOwner::VirtualTimeOwner(content::WebContents* web_contents)
++    : agent_host_(content::DevToolsAgentHost::GetOrCreateFor(web_contents)) {}
++
++VirtualTimeOwner::~VirtualTimeOwner() {
++  if (attached_ && agent_host_) {
++    agent_host_->DetachClient(this);
++  }
++}
++
++void VirtualTimeOwner::Enable(double initial_virtual_time_seconds,
++                              ResultCallback callback) {
++  if (!attached_) {
++    attached_ = agent_host_->AttachClient(this);
++    if (!attached_) {
++      std::move(callback).Run("VirtualTimeOwned: could not attach the engine's DevTools client",
++                              base::DictValue());
++      return;
++    }
++  }
++  base::DictValue params;
++  params.Set("policy", "pause");
++  params.Set("initialVirtualTime", initial_virtual_time_seconds);
++  Send("Emulation.setVirtualTimePolicy", std::move(params), std::move(callback));
++}
++
++void VirtualTimeOwner::Grant(double budget_ms, GrantCallback callback) {
++  if (grant_callback_) {
++    std::move(callback).Run("VirtualTimeStall: a grant is already pending");
++    return;
++  }
++  grant_callback_ = std::move(callback);
++  base::DictValue params;
++  params.Set("policy", "pauseIfNetworkFetchesPending");
++  params.Set("budget", budget_ms);
++  params.Set("maxVirtualTimeTaskStarvationCount", 0);
++  Send("Emulation.setVirtualTimePolicy", std::move(params),
++       base::BindOnce(
++           [](base::WeakPtr<VirtualTimeOwner> self,
++              std::optional<std::string> error, base::DictValue) {
++             if (self && error && self->grant_callback_) {
++               std::move(self->grant_callback_).Run(error);
++             }
++           },
++           weak_factory_.GetWeakPtr()));
++}
++
++void VirtualTimeOwner::Send(const std::string& method,
++                            base::DictValue params,
++                            ResultCallback callback) {
++  const int id = next_id_++;
++  base::DictValue message;
++  message.Set("id", id);
++  message.Set("method", method);
++  message.Set("params", std::move(params));
++  std::string json;
++  base::JSONWriter::Write(message, &json);
++  pending_[id] = std::move(callback);
++  agent_host_->DispatchProtocolMessage(this, base::as_byte_span(json));
++}
++
++void VirtualTimeOwner::DispatchProtocolMessage(
++    content::DevToolsAgentHost* agent_host,
++    base::span<const uint8_t> message) {
++  std::optional<base::Value> parsed = base::JSONReader::Read(
++      std::string_view(reinterpret_cast<const char*>(message.data()),
++                       message.size()),
++      base::JSON_PARSE_RFC);
++  if (!parsed || !parsed->is_dict()) {
++    return;
++  }
++  base::DictValue& dict = parsed->GetDict();
++  if (std::optional<int> id = dict.FindInt("id")) {
++    auto it = pending_.find(*id);
++    if (it == pending_.end()) {
++      return;
++    }
++    ResultCallback callback = std::move(it->second);
++    pending_.erase(it);
++    if (base::DictValue* error = dict.FindDict("error")) {
++      const std::string* text = error->FindString("message");
++      std::move(callback).Run(text ? *text : "protocol error", base::DictValue());
++      return;
++    }
++    base::DictValue* result = dict.FindDict("result");
++    std::move(callback).Run(std::nullopt,
++                            result ? std::move(*result) : base::DictValue());
++    return;
++  }
++  const std::string* method = dict.FindString("method");
++  if (method && *method == "Emulation.virtualTimeBudgetExpired" &&
++      grant_callback_) {
++    std::move(grant_callback_).Run(std::nullopt);
++  }
++}
++
++void VirtualTimeOwner::AgentHostClosed(content::DevToolsAgentHost* agent_host) {
++  attached_ = false;
++  if (grant_callback_) {
++    std::move(grant_callback_).Run("TargetDetached: agent host closed");
++  }
++  for (auto& [id, callback] : pending_) {
++    std::move(callback).Run("TargetDetached: agent host closed", base::DictValue());
++  }
++  pending_.clear();
++}
++
++bool VirtualTimeOwner::IsTrusted() {
++  return true;
++}
++
++bool VirtualTimeOwner::AllowUnsafeOperations() {
++  return true;
++}
++
++std::string VirtualTimeOwner::GetTypeForMetrics() {
++  return "Other";
++}
++
++}  // namespace headless::capture
+diff --git a/headless/lib/browser/capture/virtual_time_owner.h b/headless/lib/browser/capture/virtual_time_owner.h
+new file mode 100644
+index 0000000000..7dfa65c8ac
+--- /dev/null
++++ b/headless/lib/browser/capture/virtual_time_owner.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_CAPTURE_VIRTUAL_TIME_OWNER_H_
++#define HEADLESS_LIB_BROWSER_CAPTURE_VIRTUAL_TIME_OWNER_H_
++
++#include <map>
++#include <optional>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
++#include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/devtools_agent_host_client.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace headless::capture {
++
++// The engine's own DevTools client on the capturing target. It is the only
++// client allowed to call Emulation.setVirtualTimePolicy once a capture is
++// configured (DESIGN.md 4.2), because content's EmulationHandler has no
++// virtual-time code and the command must reach the renderer's
++// InspectorEmulationAgent through a session.
++class VirtualTimeOwner : public content::DevToolsAgentHostClient {
++ public:
++  using ResultCallback =
++      base::OnceCallback<void(std::optional<std::string> error,
++                              base::DictValue result)>;
++  using GrantCallback = base::OnceCallback<void(std::optional<std::string> error)>;
++
++  explicit VirtualTimeOwner(content::WebContents* web_contents);
++  VirtualTimeOwner(const VirtualTimeOwner&) = delete;
++  VirtualTimeOwner& operator=(const VirtualTimeOwner&) = delete;
++  ~VirtualTimeOwner() override;
++
++  // Attaches and sends setVirtualTimePolicy(pause, initialVirtualTime).
++  // The result carries `virtualTimeTicksBase` (milliseconds).
++  void Enable(double initial_virtual_time_seconds, ResultCallback callback);
++
++  // Grants `budget_ms` with pauseIfNetworkFetchesPending and no starvation
++  // bypass; `callback` runs when virtualTimeBudgetExpired arrives.
++  void Grant(double budget_ms, GrantCallback callback);
++
++  bool attached() const { return attached_; }
++
++  // content::DevToolsAgentHostClient:
++  void DispatchProtocolMessage(content::DevToolsAgentHost* agent_host,
++                               base::span<const uint8_t> message) override;
++  void AgentHostClosed(content::DevToolsAgentHost* agent_host) override;
++  bool IsTrusted() override;
++  bool AllowUnsafeOperations() override;
++  std::string GetTypeForMetrics() override;
++
++ private:
++  void Send(const std::string& method,
++            base::DictValue params,
++            ResultCallback callback);
++
++  scoped_refptr<content::DevToolsAgentHost> agent_host_;
++  bool attached_ = false;
++  int next_id_ = 1;
++  std::map<int, ResultCallback> pending_;
++  GrantCallback grant_callback_;
++  base::WeakPtrFactory<VirtualTimeOwner> weak_factory_{this};
++};
++
++}  // namespace headless::capture
++
++#endif  // HEADLESS_LIB_BROWSER_CAPTURE_VIRTUAL_TIME_OWNER_H_
+diff --git a/headless/lib/browser/command_line_handler.cc b/headless/lib/browser/command_line_handler.cc
+index a034144f44..d9184f145a 100644
+--- a/headless/lib/browser/command_line_handler.cc
++++ b/headless/lib/browser/command_line_handler.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/base_switches.h"
+ #include "base/files/file_util.h"
+ #include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -15,6 +16,7 @@
+ #include "components/headless/screen_info/headless_screen_info.h"
+ #include "components/viz/common/switches.h"
+ #include "content/public/common/content_switches.h"
++#include "media/base/media_switches.h"
+ #include "headless/public/switches.h"
+ #include "net/http/http_util.h"
+ #include "net/proxy_resolution/proxy_config.h"
+@@ -54,6 +56,41 @@ void HandleDeterministicModeSwitch(base::CommandLine& command_line) {
+   AppendSwitchMaybe(command_line, ::switches::kDisableCheckerImaging);
+ }
+ 
++
++void AppendCommaListSwitch(base::CommandLine& command_line,
++                           std::string_view switch_constant,
++                           std::string_view values) {
++  std::string merged = command_line.GetSwitchValueASCII(switch_constant);
++  if (!merged.empty()) {
++    merged += ",";
++  }
++  merged += values;
++  command_line.AppendSwitchASCII(switch_constant, merged);
++}
++
++// --deterministic-capture: everything the DeterministicCapture domain needs
++// from the command line, so the controller passes one switch. Features that
++// read real time or add a second process to the media path are turned off.
++void HandleDeterministicCaptureSwitch(base::CommandLine& command_line) {
++  DCHECK(command_line.HasSwitch(switches::kDeterministicCapture));
++  AppendSwitchMaybe(command_line, switches::kDeterministicMode);
++  HandleDeterministicModeSwitch(command_line);
++  AppendSwitchMaybe(command_line, switches::kBlockNewWebContents);
++  // Audio: fake output device only; the renderer-side capture sinks render on
++  // demand. Autoplay must not wait for a user gesture.
++  AppendSwitchMaybe(command_line, ::switches::kDisableAudioOutput);
++  if (!command_line.HasSwitch(::switches::kAutoplayPolicy)) {
++    command_line.AppendSwitchASCII(::switches::kAutoplayPolicy,
++                                   "no-user-gesture-required");
++  }
++  // Software video decoders are bit-exact for a given build.
++  AppendSwitchMaybe(command_line, ::switches::kDisableAcceleratedVideoDecode);
++  AppendCommaListSwitch(
++      command_line, ::switches::kDisableFeatures,
++      "AudioServiceOutOfProcess,MediaSessionService,IsolateOrigins,"
++      "site-per-process,BackForwardCache,Prerender2,PaintHolding");
++}
++
+ bool HandleRemoteDebuggingPort(base::CommandLine& command_line,
+                                HeadlessBrowser::Options& options) {
+   DCHECK(command_line.HasSwitch(::switches::kRemoteDebuggingPort));
+@@ -196,6 +233,15 @@ base::FilePath EnsureDirectoryExists(const base::FilePath& file_path) {
+ 
+ bool HandleCommandLineSwitches(base::CommandLine& command_line,
+                                HeadlessBrowser::Options& options) {
++  if (command_line.HasSwitch(switches::kDeterministicCapture)) {
++    if (command_line.HasSwitch(::switches::kSitePerProcess)) {
++      LOG(ERROR) << "Deterministic capture is not compatible with --"
++                 << ::switches::kSitePerProcess << " switch.";
++      return false;
++    }
++    HandleDeterministicCaptureSwitch(command_line);
++  }
++
+   if (command_line.HasSwitch(switches::kDeterministicMode)) {
+     if (command_line.HasSwitch(::switches::kSitePerProcess)) {
+       LOG(ERROR) << "Deterministic mode is not compatible with --"
+diff --git a/headless/lib/browser/headless_content_browser_client.cc b/headless/lib/browser/headless_content_browser_client.cc
+index 1db3bd21f4..7c6fa1425f 100644
+--- a/headless/lib/browser/headless_content_browser_client.cc
++++ b/headless/lib/browser/headless_content_browser_client.cc
+@@ -340,6 +340,8 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
+         embedder_support::kOriginTrialDisabledFeatures,
+         embedder_support::kOriginTrialPublicKey,
+         switches::kAllowVideoCodecs,
++        // The renderer installs the capture agent and audio sinks when set.
++        switches::kDeterministicCapture,
+         switches::kDisablePDFTagging,
+     };
+     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);
+diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.cc b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+new file mode 100644
+index 0000000000..4ecbc2b065
+--- /dev/null
++++ b/headless/lib/browser/protocol/deterministic_capture_handler.cc
+@@ -0,0 +1,363 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "headless/lib/browser/protocol/deterministic_capture_handler.h"
++
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "components/version_info/version_info.h"
++#include "content/public/browser/gpu_data_manager.h"
++#include "content/public/browser/web_contents.h"
++#include "gpu/config/gpu_info.h"
++#include "headless/lib/browser/capture/canonical_hash.h"
++#include "headless/lib/browser/capture/capture_session.h"
++#include "headless/lib/browser/headless_browser_impl.h"
++#include "headless/public/switches.h"
++
++namespace headless::protocol {
++
++namespace {
++
++using capture::CaptureSession;
++
++std::unique_ptr<std::vector<String>> Strings(
++    std::initializer_list<const char*> values) {
++  auto result = std::make_unique<std::vector<String>>();
++  for (const char* value : values) {
++    result->push_back(value);
++  }
++  return result;
++}
++
++Response ToResponse(const CaptureSession::Error& error) {
++  return Response::ServerError(error.Render());
++}
++
++base::ListValue ListOf(const base::DictValue& dict, const char* key) {
++  const base::ListValue* list = dict.FindList(key);
++  return list ? list->Clone() : base::ListValue();
++}
++
++base::DictValue DictOf(const base::DictValue& dict, const char* key) {
++  const base::DictValue* value = dict.FindDict(key);
++  return value ? value->Clone() : base::DictValue();
++}
++
++}  // namespace
++
++DeterministicCaptureHandler::DeterministicCaptureHandler(
++    HeadlessBrowserImpl* browser,
++    content::WebContents* web_contents)
++    : browser_(browser), web_contents_(web_contents) {}
++
++DeterministicCaptureHandler::~DeterministicCaptureHandler() = default;
++
++void DeterministicCaptureHandler::Wire(UberDispatcher* dispatcher) {
++  frontend_ =
++      std::make_unique<DeterministicCapture::Frontend>(dispatcher->channel());
++  DeterministicCapture::Dispatcher::wire(dispatcher, this);
++}
++
++Response DeterministicCaptureHandler::Disable() {
++  return Response::Success();
++}
++
++bool DeterministicCaptureHandler::ModeEnabled() const {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      switches::kDeterministicCapture);
++}
++
++Response DeterministicCaptureHandler::RequirePageSession() const {
++  if (!ModeEnabled()) {
++    return Response::ServerError(
++        "NotConfigured: browser was not started with --deterministic-capture");
++  }
++  if (!web_contents_) {
++    return Response::ServerError(
++        "NotConfigured: this command requires a page target session");
++  }
++  return Response::Success();
++}
++
++CaptureSession* DeterministicCaptureHandler::Session() {
++  if (!web_contents_) {
++    return nullptr;
++  }
++  CaptureSession::CreateForWebContents(web_contents_);
++  return CaptureSession::FromWebContents(web_contents_);
++}
++
++Response DeterministicCaptureHandler::GetCapabilities(
++    String* out_protocol_version,
++    String* out_patch_version,
++    bool* out_mode_enabled,
++    std::unique_ptr<protocol::DictionaryValue>* out_chromium,
++    std::unique_ptr<protocol::DictionaryValue>* out_build,
++    std::unique_ptr<protocol::Array<String>>* out_pixel_formats,
++    std::unique_ptr<protocol::Array<String>>* out_color_spaces,
++    std::unique_ptr<protocol::Array<String>>* out_frame_sinks,
++    std::unique_ptr<protocol::DictionaryValue>* out_audio,
++    std::unique_ptr<protocol::Array<String>>* out_hash,
++    std::unique_ptr<protocol::Array<DeterministicCapture::Feature>>*
++        out_features,
++    std::unique_ptr<protocol::DictionaryValue>* out_limits,
++    std::unique_ptr<protocol::DictionaryValue>* out_gpu) {
++  *out_protocol_version = kProtocolVersion;
++  *out_patch_version = kPatchVersion;
++  *out_mode_enabled = ModeEnabled();
++
++  auto chromium = std::make_unique<base::DictValue>();
++  chromium->Set("version", std::string(version_info::GetVersionNumber()));
++  chromium->Set("lastChange", std::string(version_info::GetLastChange()));
++  *out_chromium = std::move(chromium);
++
++  auto build = std::make_unique<base::DictValue>();
++#if defined(OFFICIAL_BUILD)
++  build->Set("official", true);
++#else
++  build->Set("official", false);
++#endif
++#if DCHECK_IS_ON()
++  build->Set("dcheck", true);
++#else
++  build->Set("dcheck", false);
++#endif
++  *out_build = std::move(build);
++
++  *out_pixel_formats = Strings({capture::kCanonicalPixelFormat});
++  *out_color_spaces = Strings({"srgb"});
++  *out_frame_sinks = Strings({"shm", "file", "null"});
++
++  auto audio = std::make_unique<base::DictValue>();
++  base::ListValue sample_formats;
++  sample_formats.Append("s16");
++  audio->Set("sampleFormats", std::move(sample_formats));
++  base::DictValue device_format;
++  device_format.Set("rate", 48000);
++  device_format.Set("channels", 2);
++  device_format.Set("framesPerBuffer", 480);
++  audio->Set("deviceFormat", std::move(device_format));
++  *out_audio = std::move(audio);
++
++  *out_hash = Strings({capture::kCanonicalHashName});
++
++  // Features appear as the patch series lands them.
++  auto features =
++      std::make_unique<protocol::Array<DeterministicCapture::Feature>>();
++  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"}) {
++    features->push_back(DeterministicCapture::Feature::Create()
++                            .SetName(name)
++                            .SetVersion(1)
++                            .Build());
++  }
++  *out_features = std::move(features);
++
++  auto limits = std::make_unique<base::DictValue>();
++  limits->Set("maxTargets", 1);
++  limits->Set("maxQueuedFrames", 64);
++  *out_limits = std::move(limits);
++
++  auto gpu = std::make_unique<base::DictValue>();
++  const gpu::GPUInfo& info =
++      content::GpuDataManager::GetInstance()->GetGPUInfo();
++  gpu->Set("glRenderer", info.gl_renderer);
++  gpu->Set("glVersion", info.gl_version);
++  gpu->Set("glVendor", info.gl_vendor);
++  *out_gpu = std::move(gpu);
++  return Response::Success();
++}
++
++void DeterministicCaptureHandler::Configure(
++    std::unique_ptr<protocol::DictionaryValue> in_config,
++    std::unique_ptr<ConfigureCallback> callback) {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    callback->sendFailure(check);
++    return;
++  }
++  Session()->Configure(
++      std::move(*in_config),
++      base::BindOnce(
++          [](std::unique_ptr<ConfigureCallback> callback,
++             std::optional<CaptureSession::Error> error,
++             base::DictValue result) {
++            if (error) {
++              callback->sendFailure(ToResponse(*error));
++              return;
++            }
++            callback->sendSuccess(
++                std::make_unique<base::DictValue>(DictOf(result, "effective")),
++                result.FindDouble("virtualTimeTicksBase").value_or(0.0));
++          },
++          std::move(callback)));
++}
++
++void DeterministicCaptureHandler::Advance(
++    int in_frame_index,
++    std::optional<bool> in_capture_video,
++    std::optional<bool> in_capture_audio,
++    std::optional<bool> in_hash,
++    std::unique_ptr<protocol::Array<protocol::DictionaryValue>> in_inputs,
++    std::unique_ptr<AdvanceCallback> callback) {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    callback->sendFailure(check);
++    return;
++  }
++  base::DictValue params;
++  params.Set("frameIndex", in_frame_index);
++  params.Set("captureVideo", in_capture_video.value_or(true));
++  params.Set("captureAudio", in_capture_audio.value_or(true));
++  params.Set("hash", in_hash.value_or(true));
++  Session()->Advance(
++      std::move(params),
++      base::BindOnce(
++          [](std::unique_ptr<AdvanceCallback> callback,
++             std::optional<CaptureSession::Error> error,
++             base::DictValue r) {
++            if (error) {
++              callback->sendFailure(ToResponse(*error));
++              return;
++            }
++            auto markers = std::make_unique<protocol::Array<protocol::DictionaryValue>>();
++            for (base::Value& v : ListOf(r, "markers")) {
++              markers->push_back(std::make_unique<base::DictValue>(std::move(v.GetDict())));
++            }
++            auto media = std::make_unique<protocol::Array<protocol::DictionaryValue>>();
++            for (base::Value& v : ListOf(r, "media")) {
++              media->push_back(std::make_unique<base::DictValue>(std::move(v.GetDict())));
++            }
++            auto completed = std::make_unique<protocol::Array<protocol::DictionaryValue>>();
++            for (base::Value& v : ListOf(r, "completed")) {
++              completed->push_back(std::make_unique<base::DictValue>(std::move(v.GetDict())));
++            }
++            auto warnings = std::make_unique<std::vector<String>>();
++            for (const base::Value& v : ListOf(r, "warnings")) {
++              if (const std::string* s = v.GetIfString()) {
++                warnings->push_back(*s);
++              }
++            }
++            const std::string* pcm = r.FindString("pcmFrameHash");
++            callback->sendSuccess(
++                static_cast<int>(r.FindDouble("frameIndex").value_or(0)),
++                r.FindDouble("virtualTimeMs").value_or(0.0),
++                r.FindBool("hasSurface").value_or(false),
++                r.FindBool("hasDamage").value_or(false),
++                r.FindBool("reusedReadback").value_or(false),
++                static_cast<int>(r.FindDouble("audioSampleFrames").value_or(0)),
++                pcm ? std::optional<String>(*pcm) : std::nullopt,
++                std::move(markers), std::move(media),
++                std::make_unique<base::DictValue>(DictOf(r, "timings")),
++                std::move(completed), std::move(warnings));
++          },
++          std::move(callback)));
++}
++
++void DeterministicCaptureHandler::AdvanceRange(
++    int in_from_frame_index,
++    int in_to_frame_index,
++    std::optional<bool> in_capture_audio,
++    std::optional<bool> in_hash,
++    std::unique_ptr<AdvanceRangeCallback> callback) {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    callback->sendFailure(check);
++    return;
++  }
++  base::DictValue params;
++  params.Set("fromFrameIndex", in_from_frame_index);
++  params.Set("toFrameIndex", in_to_frame_index);
++  params.Set("captureAudio", in_capture_audio.value_or(false));
++  params.Set("hash", in_hash.value_or(false));
++  Session()->AdvanceRange(
++      std::move(params),
++      base::BindOnce(
++          [](std::unique_ptr<AdvanceRangeCallback> callback,
++             std::optional<CaptureSession::Error> error,
++             base::DictValue r) {
++            if (error) {
++              callback->sendFailure(ToResponse(*error));
++              return;
++            }
++            auto frames = std::make_unique<protocol::Array<protocol::DictionaryValue>>();
++            for (base::Value& v : ListOf(r, "frames")) {
++              frames->push_back(std::make_unique<base::DictValue>(std::move(v.GetDict())));
++            }
++            callback->sendSuccess(
++                std::move(frames),
++                static_cast<int>(r.FindDouble("nextFrameIndex").value_or(0)));
++          },
++          std::move(callback)));
++}
++
++void DeterministicCaptureHandler::Finish(
++    std::unique_ptr<FinishCallback> callback) {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    callback->sendFailure(check);
++    return;
++  }
++  Session()->Finish(base::BindOnce(
++      [](std::unique_ptr<FinishCallback> callback,
++         std::optional<CaptureSession::Error> error, base::DictValue r) {
++        if (error) {
++          callback->sendFailure(ToResponse(*error));
++          return;
++        }
++        auto completed = std::make_unique<protocol::Array<protocol::DictionaryValue>>();
++        for (base::Value& v : ListOf(r, "completed")) {
++          completed->push_back(std::make_unique<base::DictValue>(std::move(v.GetDict())));
++        }
++        const std::string* chain = r.FindString("chainHash");
++        const std::string* pcm = r.FindString("pcmHash");
++        std::optional<double> expected = r.FindDouble("expectedFrames");
++        std::unique_ptr<base::DictValue> first_sink_error;
++        if (const base::DictValue* err = r.FindDict("firstSinkError")) {
++          first_sink_error = std::make_unique<base::DictValue>(err->Clone());
++        }
++        callback->sendSuccess(
++            *r.FindString("status"),
++            static_cast<int>(r.FindDouble("framesWritten").value_or(0)),
++            expected ? std::optional<int>(static_cast<int>(*expected)) : std::nullopt,
++            static_cast<int>(r.FindDouble("reusedFrames").value_or(0)),
++            static_cast<int>(r.FindDouble("audioSampleFrames").value_or(0)),
++            chain ? std::optional<String>(*chain) : std::nullopt,
++            pcm ? std::optional<String>(*pcm) : std::nullopt,
++            std::make_unique<base::DictValue>(DictOf(r, "histograms")),
++            r.FindInt("gpuProcessCrashes").value_or(0), std::move(first_sink_error),
++            std::move(completed));
++      },
++      std::move(callback)));
++}
++
++Response DeterministicCaptureHandler::Abort() {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    return check;
++  }
++  Session()->Abort();
++  return Response::Success();
++}
++
++Response DeterministicCaptureHandler::GetState(
++    String* out_state,
++    int* out_next_frame_index,
++    std::unique_ptr<protocol::DictionaryValue>* out_last_error) {
++  Response check = RequirePageSession();
++  if (!check.IsSuccess()) {
++    return check;
++  }
++  base::DictValue state = Session()->GetState();
++  *out_state = *state.FindString("state");
++  *out_next_frame_index = static_cast<int>(state.FindDouble("nextFrameIndex").value_or(0));
++  if (const base::DictValue* err = state.FindDict("lastError")) {
++    *out_last_error = std::make_unique<base::DictValue>(err->Clone());
++  }
++  return Response::Success();
++}
++
++}  // namespace headless::protocol
+diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.h b/headless/lib/browser/protocol/deterministic_capture_handler.h
+new file mode 100644
+index 0000000000..8c8086adf1
+--- /dev/null
++++ b/headless/lib/browser/protocol/deterministic_capture_handler.h
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef HEADLESS_LIB_BROWSER_PROTOCOL_DETERMINISTIC_CAPTURE_HANDLER_H_
++#define HEADLESS_LIB_BROWSER_PROTOCOL_DETERMINISTIC_CAPTURE_HANDLER_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "headless/lib/browser/protocol/deterministic_capture.h"
++#include "headless/lib/browser/protocol/domain_handler.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace headless {
++class HeadlessBrowserImpl;
++namespace capture {
++class CaptureSession;
++}
++
++namespace protocol {
++
++// DevTools backend for the DeterministicCapture domain. One instance per
++// DevTools session; `web_contents_` is null on the browser session, where only
++// getCapabilities is available.
++class DeterministicCaptureHandler : public DomainHandler,
++                                    public DeterministicCapture::Backend {
++ public:
++  DeterministicCaptureHandler(HeadlessBrowserImpl* browser,
++                              content::WebContents* web_contents);
++  DeterministicCaptureHandler(const DeterministicCaptureHandler&) = delete;
++  DeterministicCaptureHandler& operator=(const DeterministicCaptureHandler&) =
++      delete;
++  ~DeterministicCaptureHandler() override;
++
++  // DomainHandler implementation.
++  void Wire(UberDispatcher* dispatcher) override;
++  Response Disable() override;
++
++  // DeterministicCapture::Backend implementation.
++  Response GetCapabilities(
++      String* out_protocol_version,
++      String* out_patch_version,
++      bool* out_mode_enabled,
++      std::unique_ptr<protocol::DictionaryValue>* out_chromium,
++      std::unique_ptr<protocol::DictionaryValue>* out_build,
++      std::unique_ptr<protocol::Array<String>>* out_pixel_formats,
++      std::unique_ptr<protocol::Array<String>>* out_color_spaces,
++      std::unique_ptr<protocol::Array<String>>* out_frame_sinks,
++      std::unique_ptr<protocol::DictionaryValue>* out_audio,
++      std::unique_ptr<protocol::Array<String>>* out_hash,
++      std::unique_ptr<protocol::Array<DeterministicCapture::Feature>>*
++          out_features,
++      std::unique_ptr<protocol::DictionaryValue>* out_limits,
++      std::unique_ptr<protocol::DictionaryValue>* out_gpu) override;
++  void Configure(std::unique_ptr<protocol::DictionaryValue> in_config,
++                 std::unique_ptr<ConfigureCallback> callback) override;
++  void Advance(int in_frame_index,
++               std::optional<bool> in_capture_video,
++               std::optional<bool> in_capture_audio,
++               std::optional<bool> in_hash,
++               std::unique_ptr<protocol::Array<protocol::DictionaryValue>>
++                   in_inputs,
++               std::unique_ptr<AdvanceCallback> callback) override;
++  void AdvanceRange(int in_from_frame_index,
++                    int in_to_frame_index,
++                    std::optional<bool> in_capture_audio,
++                    std::optional<bool> in_hash,
++                    std::unique_ptr<AdvanceRangeCallback> callback) override;
++  void Finish(std::unique_ptr<FinishCallback> callback) override;
++  Response Abort() override;
++  Response GetState(
++      String* out_state,
++      int* out_next_frame_index,
++      std::unique_ptr<protocol::DictionaryValue>* out_last_error) override;
++
++  static constexpr char kProtocolVersion[] = "2.1";
++  static constexpr char kPatchVersion[] = "2.1.0-p5";
++
++ private:
++  bool ModeEnabled() const;
++  Response RequirePageSession() const;
++  capture::CaptureSession* Session();
++
++  raw_ptr<HeadlessBrowserImpl> browser_;
++  raw_ptr<content::WebContents> web_contents_;
++  std::unique_ptr<DeterministicCapture::Frontend> frontend_;
++};
++
++}  // namespace protocol
++}  // namespace headless
++
++#endif  // HEADLESS_LIB_BROWSER_PROTOCOL_DETERMINISTIC_CAPTURE_HANDLER_H_
+diff --git a/headless/lib/browser/protocol/headless_devtools_session.cc b/headless/lib/browser/protocol/headless_devtools_session.cc
+index d4b4e11688..e511a89f9b 100644
+--- a/headless/lib/browser/protocol/headless_devtools_session.cc
++++ b/headless/lib/browser/protocol/headless_devtools_session.cc
+@@ -10,6 +10,8 @@
+ #include "content/public/browser/devtools_agent_host_client.h"
+ #include "content/public/browser/devtools_agent_host_client_channel.h"
+ #include "headless/lib/browser/protocol/browser_handler.h"
++#include "headless/lib/browser/capture/capture_session.h"
++#include "headless/lib/browser/protocol/deterministic_capture_handler.h"
+ #include "headless/lib/browser/protocol/emulation_handler.h"
+ #include "headless/lib/browser/protocol/headless_handler.h"
+ #include "headless/lib/browser/protocol/page_handler.h"
+@@ -27,8 +29,14 @@ HeadlessDevToolsSession::HeadlessDevToolsSession(
+   CHECK(client_channel_->GetClient()->IsTrusted())
+       << "Connection to headless requires a trusted client";
+   content::DevToolsAgentHost* agent_host = channel->GetAgentHost();
+-  if (agent_host->GetWebContents() &&
+-      agent_host->GetType() == content::DevToolsAgentHost::kTypePage) {
++  const bool is_page = agent_host->GetWebContents() &&
++                       agent_host->GetType() ==
++                           content::DevToolsAgentHost::kTypePage;
++  // DeterministicCapture.getCapabilities is available on every session; the
++  // capture commands need a page session.
++  AddHandler(std::make_unique<DeterministicCaptureHandler>(
++      browser_.get(), is_page ? agent_host->GetWebContents() : nullptr));
++  if (is_page) {
+     AddHandler(std::make_unique<HeadlessHandler>(browser_.get(),
+                                                  agent_host->GetWebContents()));
+     AddHandler(std::make_unique<PageHandler>(agent_host,
+@@ -63,6 +71,28 @@ void HeadlessDevToolsSession::HandleCommand(
+   // content::DevToolsSession receives this message first, so we may
+   // assume it's ok.
+   DCHECK(dispatchable.ok());
++  // Once a deterministic capture is configured, only the engine's own client
++  // may change renderer virtual time (DESIGN.md 4.2).
++  if (dispatchable.HasCallId() &&
++      crdtp::SpanEquals(crdtp::SpanFrom("Emulation.setVirtualTimePolicy"),
++                        dispatchable.Method())) {
++    content::WebContents* web_contents =
++        client_channel_->GetAgentHost()->GetWebContents();
++    auto* session =
++        web_contents ? capture::CaptureSession::FromWebContents(web_contents)
++                     : nullptr;
++    if (session && session->OwnsVirtualTime() &&
++        !session->IsOwnerClient(client_channel_->GetClient())) {
++      client_channel_->DispatchProtocolMessageToClient(
++          crdtp::CreateErrorResponse(
++              dispatchable.CallId(),
++              crdtp::DispatchResponse::ServerError(
++                  "VirtualTimeOwned: the DeterministicCapture session owns "
++                  "renderer virtual time"))
++              ->Serialize());
++      return;
++    }
++  }
+   dispatcher_.Dispatch(dispatchable);
+ }
+ 
+diff --git a/headless/protocol_config.json b/headless/protocol_config.json
+index ed40b42c3b..4d73dd8040 100644
+--- a/headless/protocol_config.json
++++ b/headless/protocol_config.json
+@@ -28,6 +28,10 @@
+                 "domain": "HeadlessExperimental",
+                 "async": ["beginFrame"]
+             },
++            {
++                "domain": "DeterministicCapture",
++                "async": ["configure", "advance", "advanceRange", "finish"]
++            },
+             {
+                 "domain": "Page",
+                 "include": ["printToPDF", "getAnnotatedPageContent"],
+diff --git a/headless/public/switches.h b/headless/public/switches.h
+index 1ab422fba4..b81b3fafe7 100644
+--- a/headless/public/switches.h
++++ b/headless/public/switches.h
+@@ -37,6 +37,12 @@ inline constexpr char kCrashDumpsDir[] = "crash-dumps-dir";
+ // (experimental).
+ inline constexpr char kDeterministicMode[] = "deterministic-mode";
+ 
++// Deterministic capture engine (experimental, DeterministicChromium). Implies
++// --deterministic-mode plus the audio, media and process flags the
++// DeterministicCapture DevTools domain requires. See
++// deterministic-capture/DESIGN.md in the project repository.
++inline constexpr char kDeterministicCapture[] = "deterministic-capture";
++
+ // Whether cookies stored as part of user profile are encrypted.
+ inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
+ 
+diff --git a/third_party/blink/public/devtools_protocol/BUILD.gn b/third_party/blink/public/devtools_protocol/BUILD.gn
+index 4a061691cb..98a2d63c8c 100644
+--- a/third_party/blink/public/devtools_protocol/BUILD.gn
++++ b/third_party/blink/public/devtools_protocol/BUILD.gn
+@@ -22,6 +22,7 @@ domains = [
+   "domains/DOMDebugger.pdl",
+   "domains/DOMSnapshot.pdl",
+   "domains/DOMStorage.pdl",
++  "domains/DeterministicCapture.pdl",
+   "domains/DeviceAccess.pdl",
+   "domains/DeviceOrientation.pdl",
+   "domains/DigitalCredentials.pdl",
+diff --git a/third_party/blink/public/devtools_protocol/browser_protocol.pdl b/third_party/blink/public/devtools_protocol/browser_protocol.pdl
+index 6545483183..1c6bdcff66 100644
+--- a/third_party/blink/public/devtools_protocol/browser_protocol.pdl
++++ b/third_party/blink/public/devtools_protocol/browser_protocol.pdl
+@@ -24,6 +24,7 @@ include domains/DOM.pdl
+ include domains/DOMDebugger.pdl
+ include domains/DOMSnapshot.pdl
+ include domains/DOMStorage.pdl
++include domains/DeterministicCapture.pdl
+ include domains/DeviceAccess.pdl
+ include domains/DeviceOrientation.pdl
+ include domains/DigitalCredentials.pdl
+diff --git a/third_party/blink/public/devtools_protocol/domains/DeterministicCapture.pdl b/third_party/blink/public/devtools_protocol/domains/DeterministicCapture.pdl
+new file mode 100644
+index 0000000000..d3d3b94f1d
+--- /dev/null
++++ b/third_party/blink/public/devtools_protocol/domains/DeterministicCapture.pdl
+@@ -0,0 +1,126 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# DeterministicChromium: frame-exact capture of a page into raw frames and PCM.
++# The contract is described in deterministic-capture/DESIGN.md. Only available
++# in headless_shell started with --deterministic-capture.
++
++experimental domain DeterministicCapture
++  depends on Page
++
++  # A feature of the engine and the version of its contract.
++  type Feature extends object
++    properties
++      string name
++      integer version
++
++  # Capabilities of this browser. Available on the browser session and on page
++  # sessions. modeEnabled is false when --deterministic-capture is absent; the
++  # other commands are then refused.
++  command getCapabilities
++    returns
++      string protocolVersion
++      string patchVersion
++      boolean modeEnabled
++      object chromium
++      object build
++      array of string pixelFormats
++      array of string colorSpaces
++      array of string frameSinks
++      object audio
++      array of string hash
++      array of Feature features
++      object limits
++      object gpu
++
++  # Configures the capture for this target before the captured document is
++  # navigated. Enables renderer virtual time through the engine's own session.
++  command configure
++    parameters
++      object config
++    returns
++      object effective
++      number virtualTimeTicksBase
++
++  # Advances exactly one frame: virtual-time grant, thread wake, quiescence,
++  # audio render, BeginFrame, readback. Responds after the BeginFrame; hashes of
++  # earlier frames arrive in `completed`.
++  command advance
++    parameters
++      integer frameIndex
++      optional boolean captureVideo
++      optional boolean captureAudio
++      optional boolean hash
++      optional array of object inputs
++    returns
++      integer frameIndex
++      number virtualTimeMs
++      boolean hasSurface
++      boolean hasDamage
++      boolean reusedReadback
++      integer audioSampleFrames
++      optional string pcmFrameHash
++      array of object markers
++      array of object media
++      object timings
++      array of object completed
++      array of string warnings
++
++  # Advances consecutive frames [fromFrameIndex, toFrameIndex) inside the
++  # browser without readback, for chunk pre-roll.
++  command advanceRange
++    parameters
++      integer fromFrameIndex
++      integer toFrameIndex
++      optional boolean captureAudio
++      optional boolean hash
++    returns
++      array of object frames
++      integer nextFrameIndex
++
++  # Closes the sinks and returns totals. Idempotent.
++  command finish
++    returns
++      string status
++      integer framesWritten
++      optional integer expectedFrames
++      integer reusedFrames
++      integer audioSampleFrames
++      optional string chainHash
++      optional string pcmHash
++      object histograms
++      integer gpuProcessCrashes
++      optional object firstSinkError
++      array of object completed
++
++  # Stops without totals; closes the sinks.
++  command abort
++
++  command getState
++    returns
++      string state
++      integer nextFrameIndex
++      optional object lastError
++
++  event sinkError
++    parameters
++      object error
++
++  event mediaWaiting
++    parameters
++      integer frameIndex
++      array of object players
++
++  event unsupportedApiUsed
++    parameters
++      string api
++      integer frameIndex
++
++  event gpuProcessLost
++    parameters
++      integer frameIndex
++
++  event rangeProgress
++    parameters
++      integer frameIndex
+diff --git a/third_party/blink/renderer/core/loader/document_load_timing.cc b/third_party/blink/renderer/core/loader/document_load_timing.cc
+index af6a5cb3ed..314498d449 100644
+--- a/third_party/blink/renderer/core/loader/document_load_timing.cc
++++ b/third_party/blink/renderer/core/loader/document_load_timing.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "third_party/blink/renderer/core/loader/document_load_timing.h"
+ 
++#include "base/command_line.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "services/network/public/mojom/timing_allow_origin.mojom-blink.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -128,6 +129,15 @@ void DocumentLoadTiming::SetNavigationStart(base::TimeTicks navigation_start) {
+   // navigationStart. We must set these to the current time if they haven't
+   // been set yet in order to have a valid reference time in both units.
+   EnsureReferenceTimesSet();
++  // DeterministicChromium: the embedder's navigationStart is browser-process
++  // wall time. Under --deterministic-capture the renderer runs on virtual time
++  // and every document, animation timeline and performance.timeOrigin must
++  // derive from it, so the time origin is the (frozen) virtual now instead.
++  // Otherwise animations are sampled at a per-run sub-millisecond offset.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "deterministic-capture")) {
++    navigation_start = base::TimeTicks::Now();
++  }
+   navigation_start_ = navigation_start;
+   TRACE_EVENT_MARK_WITH_TIMESTAMP2(
+       "blink.user_timing", "navigationStart", navigation_start_, "frame",
+diff --git a/third_party/blink/renderer/core/timing/time_clamper.cc b/third_party/blink/renderer/core/timing/time_clamper.cc
+index 9ce8552a9d..155e4d7cbd 100644
+--- a/third_party/blink/renderer/core/timing/time_clamper.cc
++++ b/third_party/blink/renderer/core/timing/time_clamper.cc
+@@ -7,6 +7,7 @@
+ #include <cmath>
+ 
+ #include "base/bit_cast.h"
++#include "base/command_line.h"
+ #include "base/rand_util.h"
+ 
+ namespace blink {
+@@ -15,7 +16,23 @@ namespace {
+ const int64_t kTenLowerDigitsMod = 10000000000;
+ }  // namespace
+ 
+-TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
++namespace {
++
++// DeterministicChromium: the clamping threshold is derived from a per-instance
++// random secret, so the 100 us rounding of performance.now() and of animation
++// timeline time differs between runs. Under --deterministic-capture the secret
++// is a constant; the web-visible resolution is unchanged.
++uint64_t ClamperSecret() {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "deterministic-capture")) {
++    return uint64_t{0x5DC0DE2026111CA9};
++  }
++  return base::RandUint64();
++}
++
++}  // namespace
++
++TimeClamper::TimeClamper() : secret_(ClamperSecret()) {}
+ 
+ // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
+ base::TimeDelta TimeClamper::ClampTimeResolution(

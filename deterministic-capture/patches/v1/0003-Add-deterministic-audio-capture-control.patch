@@ -1,0 +1,113 @@
+From 291e6fd347310dd910adc74d73435af83ce995c9 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <sunwoong.joo@samsung.com>
+Date: Tue, 14 Jul 2026 13:34:04 +0000
+Subject: [PATCH 3/3] Add deterministic audio capture control
+
+---
+ .../lib/browser/protocol/headless_handler.cc   | 18 +++++++++++++++---
+ .../lib/browser/protocol/headless_handler.h    |  1 +
+ .../domains/HeadlessExperimental.pdl           |  4 ++++
+ 3 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/headless/lib/browser/protocol/headless_handler.cc b/headless/lib/browser/protocol/headless_handler.cc
+index 861b9465e2..8a5a37f1e0 100644
+--- a/headless/lib/browser/protocol/headless_handler.cc
++++ b/headless/lib/browser/protocol/headless_handler.cc
+@@ -414,6 +414,7 @@ void OnBeginFrameFinished(
+     BitmapEncoder encoder,
+     base::TimeTicks frame_time_ticks,
+     base::TimeDelta interval,
++    bool capture_audio,
+     std::unique_ptr<HeadlessHandler::BeginFrameCallback> callback,
+     bool has_damage,
+     std::unique_ptr<SkBitmap> bitmap,
+@@ -422,7 +423,7 @@ void OnBeginFrameFinished(
+     callback->sendFailure(Response::ServerError(std::move(error_message)));
+     return;
+   }
+-  if (!encoder.is_null()) {
++  if (capture_audio) {
+     if (auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled()) {
+       std::optional<std::string> error =
+           audio_dump->CaptureInterval(frame_time_ticks, interval);
+@@ -497,6 +498,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+                                  std::optional<double> in_interval,
+                                  std::optional<bool> in_no_display_updates,
+                                  std::optional<bool> in_audio_only,
++                                 std::optional<bool> in_capture_audio,
+                                  std::unique_ptr<ScreenshotParams> screenshot,
+                                  std::unique_ptr<BeginFrameCallback> callback) {
+   auto& headless_contents =
+@@ -520,6 +522,8 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+   base::TimeDelta interval;
+   bool no_display_updates = in_no_display_updates.value_or(false);
+   bool audio_only = in_audio_only.value_or(false);
++  bool capture_audio =
++      in_capture_audio.value_or(!audio_only && screenshot != nullptr);
+ 
+   if (audio_only && screenshot) {
+     callback->sendFailure(Response::InvalidParams(
+@@ -549,9 +553,9 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+   base::TimeTicks deadline = frame_time_ticks + interval;
+ 
+   auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled();
+-  if (audio_only && !audio_dump) {
++  if ((audio_only || capture_audio) && !audio_dump) {
+     callback->sendFailure(Response::ServerError(
+-        "audioOnly beginFrame requires --headless-raw-audio-dump"));
++        "Deterministic audio beginFrame requires --headless-raw-audio-dump"));
+     return;
+   }
+   if (audio_dump) {
+@@ -580,6 +584,13 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+       return;
+     }
+     if (audio_only) {
++      if (capture_audio) {
++        error = audio_dump->CaptureInterval(frame_time_ticks, interval);
++        if (error.has_value()) {
++          callback->sendFailure(Response::ServerError(std::move(*error)));
++          return;
++        }
++      }
+       callback->sendSuccess(false, std::nullopt);
+       return;
+     }
+@@ -605,6 +616,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+       capture_screenshot,
+       base::BindOnce(&OnBeginFrameFinished, std::move(encoder),
+                      frame_time_ticks, interval,
++                     capture_audio,
+                      std::move(callback)));
+ }
+ 
+diff --git a/headless/lib/browser/protocol/headless_handler.h b/headless/lib/browser/protocol/headless_handler.h
+index b95d38c199..133a50ead5 100644
+--- a/headless/lib/browser/protocol/headless_handler.h
++++ b/headless/lib/browser/protocol/headless_handler.h
+@@ -41,6 +41,7 @@ class HeadlessHandler : public DomainHandler,
+       std::optional<double> in_interval,
+       std::optional<bool> no_display_updates,
+       std::optional<bool> audio_only,
++      std::optional<bool> capture_audio,
+       std::unique_ptr<HeadlessExperimental::ScreenshotParams> screenshot,
+       std::unique_ptr<BeginFrameCallback> callback) override;
+ 
+diff --git a/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl b/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
+index 2739266af0..bf1a7b8be1 100644
+--- a/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
++++ b/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
+@@ -41,6 +41,10 @@ experimental domain HeadlessExperimental
+       # Advances deterministic native audio without sending a renderer BeginFrame. False by
+       # default. Requires --headless-raw-audio-dump and cannot be combined with a screenshot.
+       optional boolean audioOnly
++      # Records deterministic native audio for this interval. Defaults to true for screenshot
++      # BeginFrames and false otherwise. May be combined with audioOnly to record without a
++      # renderer BeginFrame.
++      optional boolean captureAudio
+       # If set, a screenshot of the frame will be captured and returned in the response. Otherwise,
+       # no screenshot will be captured. Note that capturing a screenshot can fail, for example,
+       # during renderer initialization. In such a case, no screenshot data will be returned.
+-- 
+2.53.0
+

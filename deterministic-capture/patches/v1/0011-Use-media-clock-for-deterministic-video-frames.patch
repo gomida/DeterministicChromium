@@ -1,0 +1,345 @@
+From eeee3ae344072268418dcbc2f9630909119c649c Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <sunwoong.joo@samsung.com>
+Date: Wed, 8 Jul 2026 00:45:13 +0000
+Subject: [PATCH 11/13] Use media clock for deterministic video frames
+
+---
+ cc/layers/video_frame_provider.h              |  6 ++
+ cc/layers/video_frame_provider_client_impl.cc |  5 +-
+ cc/layers/video_frame_provider_client_impl.h  |  4 +-
+ cc/layers/video_layer_impl.cc                 |  5 +-
+ .../platform/media/video_frame_compositor.cc  | 86 +++++++++++++++----
+ .../platform/media/video_frame_compositor.h   | 12 ++-
+ .../platform/media/web_media_player_impl.cc   | 21 +++++
+ .../platform/media/web_media_player_impl.h    |  1 +
+ 8 files changed, 117 insertions(+), 23 deletions(-)
+
+diff --git a/cc/layers/video_frame_provider.h b/cc/layers/video_frame_provider.h
+index c12b63d14c..410ad54849 100644
+--- a/cc/layers/video_frame_provider.h
++++ b/cc/layers/video_frame_provider.h
+@@ -77,6 +77,12 @@ class CC_EXPORT VideoFrameProvider {
+   // otherwise. Aside from thread locks, the state won't change.
+   virtual bool HasCurrentFrame() = 0;
+ 
++  // Called immediately before a layer draw consumes GetCurrentFrame(). Most
++  // providers do not need this hook; deterministic capture providers use the
++  // draw BeginFrame deadline as the single frame-selection clock.
++  virtual void WillDrawCurrentFrame(base::TimeTicks deadline_min,
++                                    base::TimeTicks deadline_max) {}
++
+   // Returns the current frame, which may have been updated by a recent call to
+   // UpdateCurrentFrame(). A call to this method does not ensure that the frame
+   // will be rendered. A subsequent call to PutCurrentFrame() must be made if
+diff --git a/cc/layers/video_frame_provider_client_impl.cc b/cc/layers/video_frame_provider_client_impl.cc
+index 66d24ff8fb..b104678ecb 100644
+--- a/cc/layers/video_frame_provider_client_impl.cc
++++ b/cc/layers/video_frame_provider_client_impl.cc
+@@ -74,12 +74,15 @@ bool VideoFrameProviderClientImpl::Stopped() const {
+ }
+ 
+ scoped_refptr<media::VideoFrame>
+-VideoFrameProviderClientImpl::AcquireLockAndCurrentFrame() {
++VideoFrameProviderClientImpl::AcquireLockAndCurrentFrame(
++    base::TimeTicks deadline_min,
++    base::TimeTicks deadline_max) {
+   DCHECK(thread_checker_.CalledOnValidThread());
+   provider_lock_.Acquire();  // Balanced by call to ReleaseLock().
+   if (!provider_)
+     return nullptr;
+ 
++  provider_->WillDrawCurrentFrame(deadline_min, deadline_max);
+   return provider_->GetCurrentFrame();
+ }
+ 
+diff --git a/cc/layers/video_frame_provider_client_impl.h b/cc/layers/video_frame_provider_client_impl.h
+index aa1a60868a..5ec8e8e127 100644
+--- a/cc/layers/video_frame_provider_client_impl.h
++++ b/cc/layers/video_frame_provider_client_impl.h
+@@ -47,7 +47,9 @@ class CC_EXPORT VideoFrameProviderClientImpl
+   // Must be called on the impl thread while the main thread is blocked.
+   void Stop();
+ 
+-  scoped_refptr<media::VideoFrame> AcquireLockAndCurrentFrame()
++  scoped_refptr<media::VideoFrame> AcquireLockAndCurrentFrame(
++      base::TimeTicks deadline_min,
++      base::TimeTicks deadline_max)
+       EXCLUSIVE_LOCK_FUNCTION(provider_lock_);
+   void PutCurrentFrame() EXCLUSIVE_LOCKS_REQUIRED(provider_lock_);
+   void ReleaseLock() UNLOCK_FUNCTION(provider_lock_);
+diff --git a/cc/layers/video_layer_impl.cc b/cc/layers/video_layer_impl.cc
+index 483a4d070c..5606e4561e 100644
+--- a/cc/layers/video_layer_impl.cc
++++ b/cc/layers/video_layer_impl.cc
+@@ -89,7 +89,10 @@ bool VideoLayerImpl::WillDraw(DrawMode draw_mode,
+   // is the GPU process locking it. As the GPU process can't cause the
+   // destruction of the provider (calling StopUsingProvider), holding this
+   // lock should not cause a deadlock.
+-  frame_ = provider_client_impl_->AcquireLockAndCurrentFrame();
++  const auto& begin_frame_args = layer_tree_impl()->CurrentBeginFrameArgs();
++  frame_ = provider_client_impl_->AcquireLockAndCurrentFrame(
++      begin_frame_args.frame_time + begin_frame_args.interval,
++      begin_frame_args.frame_time + 2 * begin_frame_args.interval);
+ 
+   if (!frame_.get()) {
+     // Drop any resources used by the updater if there is no frame to display.
+diff --git a/third_party/blink/renderer/platform/media/video_frame_compositor.cc b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+index 99d3fd8bce..6ce96b7d23 100644
+--- a/third_party/blink/renderer/platform/media/video_frame_compositor.cc
++++ b/third_party/blink/renderer/platform/media/video_frame_compositor.cc
+@@ -10,6 +10,7 @@
+ #include <map>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/check.h"
+@@ -32,6 +33,7 @@
+ #include "base/trace_event/trace_event.h"
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "media/base/media_switches.h"
++#include "media/base/timestamp_constants.h"
+ #include "media/base/video_frame.h"
+ #include "net/base/filename_util.h"
+ #include "third_party/blink/renderer/platform/allow_discouraged_type.h"
+@@ -426,9 +428,16 @@ void VideoFrameCompositor::SetDeterministicVideoSourceUrl(
+   deterministic_video_source_url_ = std::move(source_url);
+   deterministic_video_is_looping_ = is_looping;
+   deterministic_video_last_begin_frame_time_ = base::TimeTicks();
+-  // Use the native source-load time as the media epoch so virtual-time
+-  // warm-forward before a chunk is reflected in deterministic frame selection.
+-  deterministic_video_epoch_ = base::TimeTicks::Now();
++}
++
++void VideoFrameCompositor::SetDeterministicVideoMediaTimeState(
++    base::TimeDelta media_time,
++    base::TimeTicks sample_ticks,
++    double playback_rate) {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  deterministic_video_media_time_ = media_time;
++  deterministic_video_media_time_sample_ticks_ = sample_ticks;
++  deterministic_video_playback_rate_ = playback_rate;
+ }
+ 
+ void VideoFrameCompositor::PutCurrentFrame() {
+@@ -451,6 +460,21 @@ bool VideoFrameCompositor::UpdateCurrentFrame(base::TimeTicks deadline_min,
+   return CallRender(deadline_min, deadline_max, RenderingMode::kNormal);
+ }
+ 
++void VideoFrameCompositor::WillDrawCurrentFrame(base::TimeTicks deadline_min,
++                                                base::TimeTicks deadline_max) {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  if (!IsDeterministicVideoEnabled()) {
++    return;
++  }
++  base::TimeDelta interval = deadline_max - deadline_min;
++  if (interval.is_positive()) {
++    // The visible <video> layer can draw a previously decoded frame without the
++    // VideoFrameSubmitter path. Capture must still use the current BeginFrame
++    // deadline so native pixels never leak into the recorded surface.
++    deterministic_video_last_begin_frame_time_ = deadline_min;
++  }
++}
++
+ scoped_refptr<media::VideoFrame>
+ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
+     scoped_refptr<media::VideoFrame> frame) {
+@@ -458,11 +482,14 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
+     return frame;
+   }
+ 
+-  // Manual startup submissions do not carry external beginFrame timing. Native
+-  // substitution starts only once capture beginFrame timing reaches this
+-  // provider; capture frames must never fall back after that point.
+   if (deterministic_video_last_begin_frame_time_.is_null()) {
+-    return frame;
++    if (deterministic_video_source_url_.empty()) {
++      return frame;
++    }
++    // Manual startup submissions do not carry BeginFrame timing. Drop them
++    // rather than exposing native pixels; visible capture draws set timing via
++    // WillDrawCurrentFrame() immediately before GetCurrentFrame().
++    return nullptr;
+   }
+ 
+   if (!frame) {
+@@ -474,18 +501,10 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
+                             "deterministic source URL");
+   }
+ 
+-  if (deterministic_video_epoch_.is_null()) {
+-    DeterministicVideoFatal("deterministic video epoch was not initialized");
+-  }
+-  if (deterministic_video_last_begin_frame_time_ < deterministic_video_epoch_) {
+-    DeterministicVideoFatal("beginFrame time moved backwards for deterministic "
+-                            "video source: " +
+-                            deterministic_video_source_url_);
+-  }
+-
+   const int fps = DeterministicVideoFps();
+-  const base::TimeDelta local_time =
+-      deterministic_video_last_begin_frame_time_ - deterministic_video_epoch_;
++  // Use WebMediaPlayerImpl::GetCurrentTimeInternal() as the single media-time
++  // source. Do not fall back to frame timestamps or source-load epochs.
++  const base::TimeDelta local_time = GetDeterministicVideoMediaTime();
+   int64_t frame_index =
+       local_time.InMicroseconds() * static_cast<int64_t>(fps) /
+       base::Time::kMicrosecondsPerSecond;
+@@ -507,6 +526,37 @@ VideoFrameCompositor::GetDeterministicVideoFrameIfNeeded(
+   return ReadDeterministicVideoFrame(entry, frame_index, local_time, *frame);
+ }
+ 
++base::TimeDelta VideoFrameCompositor::GetDeterministicVideoMediaTime() {
++  DCHECK(task_runner_->BelongsToCurrentThread());
++  if (deterministic_video_media_time_ == media::kNoTimestamp ||
++      deterministic_video_media_time_sample_ticks_.is_null()) {
++    DeterministicVideoFatal("deterministic video media-time state is missing");
++  }
++  base::TimeDelta media_time = deterministic_video_media_time_;
++  if (deterministic_video_playback_rate_ != 0.0) {
++    if (deterministic_video_last_begin_frame_time_ <
++        deterministic_video_media_time_sample_ticks_) {
++      DeterministicVideoFatal("deterministic video beginFrame moved before "
++                              "the media-time sample");
++    }
++    // The media-time sample comes from WebMediaPlayerImpl::GetCurrentTimeInternal()
++    // on the main thread. Advance that single media clock by the same
++    // beginFrame timeline used for capture, instead of reading another video
++    // timestamp or falling back to source-load time.
++    media_time +=
++        (deterministic_video_last_begin_frame_time_ -
++         deterministic_video_media_time_sample_ticks_) *
++        deterministic_video_playback_rate_;
++  }
++  if (media_time == media::kNoTimestamp || media_time < base::TimeDelta() ||
++      media_time.is_inf()) {
++    DeterministicVideoFatal(base::StringPrintf(
++        "deterministic video media time is invalid: us=%" PRId64 " source=%s",
++        media_time.InMicroseconds(), deterministic_video_source_url_.c_str()));
++  }
++  return media_time;
++}
++
+ bool VideoFrameCompositor::HasCurrentFrame() {
+   DCHECK(task_runner_->BelongsToCurrentThread());
+   return static_cast<bool>(GetCurrentFrame());
+diff --git a/third_party/blink/renderer/platform/media/video_frame_compositor.h b/third_party/blink/renderer/platform/media/video_frame_compositor.h
+index de224cee08..bc298d1151 100644
+--- a/third_party/blink/renderer/platform/media/video_frame_compositor.h
++++ b/third_party/blink/renderer/platform/media/video_frame_compositor.h
+@@ -8,7 +8,6 @@
+ #include <string>
+ #include <utility>
+ 
+-#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/synchronization/lock.h"
+@@ -19,6 +18,7 @@
+ #include "base/timer/timer.h"
+ #include "cc/layers/surface_layer.h"
+ #include "cc/layers/video_frame_provider.h"
++#include "media/base/timestamp_constants.h"
+ #include "media/base/video_renderer_sink.h"
+ #include "third_party/blink/public/platform/web_media_player.h"
+ #include "third_party/blink/public/platform/web_video_frame_submitter.h"
+@@ -107,6 +107,8 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+       cc::VideoFrameProvider::Client* client) override;
+   bool UpdateCurrentFrame(base::TimeTicks deadline_min,
+                           base::TimeTicks deadline_max) override;
++  void WillDrawCurrentFrame(base::TimeTicks deadline_min,
++                            base::TimeTicks deadline_max) override;
+   bool HasCurrentFrame() override;
+   scoped_refptr<media::VideoFrame> GetCurrentFrame() override;
+   void PutCurrentFrame() override;
+@@ -130,6 +132,9 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+   // element remains intact; only compositor-supplied VideoFrame pixels may be
+   // replaced when explicit beginFrame timing is available.
+   void SetDeterministicVideoSourceUrl(std::string source_url, bool is_looping);
++  void SetDeterministicVideoMediaTimeState(base::TimeDelta media_time,
++                                           base::TimeTicks sample_ticks,
++                                           double playback_rate);
+ 
+   // If |client_| is not set, |callback_| is set, and |is_background_rendering_|
+   // is true, it requests a new frame from |callback_|. Uses the elapsed time
+@@ -238,6 +243,7 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+ 
+   scoped_refptr<media::VideoFrame> GetDeterministicVideoFrameIfNeeded(
+       scoped_refptr<media::VideoFrame> frame);
++  base::TimeDelta GetDeterministicVideoMediaTime();
+ 
+   // This will run tasks on the compositor thread. If
+   // kEnableSurfaceLayerForVideo is enabled, it will instead run tasks on the
+@@ -280,7 +286,9 @@ class PLATFORM_EXPORT VideoFrameCompositor : public media::VideoRendererSink,
+   std::string deterministic_video_source_url_;
+   bool deterministic_video_is_looping_ = false;
+   base::TimeTicks deterministic_video_last_begin_frame_time_;
+-  base::TimeTicks deterministic_video_epoch_;
++  base::TimeDelta deterministic_video_media_time_ = media::kNoTimestamp;
++  base::TimeTicks deterministic_video_media_time_sample_ticks_;
++  double deterministic_video_playback_rate_ = 0.0;
+ 
+   // Used to fulfill video.requestVideoFrameCallback() calls.
+   // See https://wicg.github.io/video-rvfc/.
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.cc b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+index 2e6b79e0b9..59e5e805b6 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.cc
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.cc
+@@ -940,6 +940,7 @@ void WebMediaPlayerImpl::DoLoad(LoadType load_type,
+           &VideoFrameCompositor::SetDeterministicVideoSourceUrl,
+           CrossThreadUnretained(compositor_.get()), GURL(url).spec(),
+           client_->IsLooping()));
++  UpdateDeterministicVideoMediaTimeState();
+   load_type_ = load_type;
+ 
+   ReportMetrics(load_type, url, media_log_.get());
+@@ -1447,6 +1448,25 @@ base::TimeDelta WebMediaPlayerImpl::GetCurrentTimeInternal() const {
+   return current_time;
+ }
+ 
++void WebMediaPlayerImpl::UpdateDeterministicVideoMediaTimeState() {
++  DCHECK(main_task_runner_->BelongsToCurrentThread());
++
++  const double effective_playback_rate =
++      paused_ || seeking_ || ready_state_ < kReadyStateHaveFutureData
++          ? 0.0
++          : playback_rate_;
++  // Sample the same media time exposed to HTMLMediaElement::currentTime on the
++  // main thread, then let the compositor advance that one clock by beginFrame
++  // time. This avoids a compositor->main-thread sync read during screenshot
++  // capture and keeps deterministic-video frame selection on a single source.
++  PostCrossThreadTask(
++      *vfc_task_runner_, FROM_HERE,
++      CrossThreadBindOnce(
++          &VideoFrameCompositor::SetDeterministicVideoMediaTimeState,
++          CrossThreadUnretained(compositor_.get()), GetCurrentTimeInternal(),
++          base::TimeTicks::Now(), effective_playback_rate));
++}
++
+ double WebMediaPlayerImpl::CurrentTime() const {
+   DCHECK(main_task_runner_->BelongsToCurrentThread());
+   DCHECK_NE(ready_state_, WebMediaPlayer::kReadyStateHaveNothing);
+@@ -3201,6 +3221,7 @@ void WebMediaPlayerImpl::UpdatePlayState() {
+         !paused_ && !seeking_ && !IsPageHidden() && !state.is_suspended &&
+         ready_state_ == kReadyStateHaveEnoughData);
+   }
++  UpdateDeterministicVideoMediaTimeState();
+ }
+ 
+ void WebMediaPlayerImpl::OnTimeUpdate() {
+diff --git a/third_party/blink/renderer/platform/media/web_media_player_impl.h b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+index e8c7095a88..2b1d72bb40 100644
+--- a/third_party/blink/renderer/platform/media/web_media_player_impl.h
++++ b/third_party/blink/renderer/platform/media/web_media_player_impl.h
+@@ -695,6 +695,7 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
+   // negative or kInfiniteDuration value. See http://crbug.com/40382058,
+   // http://crbug.com/41274857, and http://crbug.com/40533294 for reasons why.
+   base::TimeDelta GetCurrentTimeInternal() const;
++  void UpdateDeterministicVideoMediaTimeState();
+ 
+   // Called by the compositor the very first time a frame is received.
+   void OnFirstFrame(base::TimeTicks frame_time, bool is_frame_readable);
+-- 
+2.53.0
+

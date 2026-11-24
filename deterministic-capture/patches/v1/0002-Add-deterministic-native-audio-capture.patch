@@ -1,0 +1,844 @@
+From dbcaa0a0734c029897b65f0d0c021702e813dc92 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <sunwoong.joo@samsung.com>
+Date: Tue, 14 Jul 2026 10:09:40 +0000
+Subject: [PATCH 2/3] Add deterministic native audio capture
+
+---
+ headless/BUILD.gn                             |   1 +
+ .../lib/browser/protocol/headless_handler.cc  |  62 +++
+ .../lib/browser/protocol/headless_handler.h   |   1 +
+ media/audio/BUILD.gn                          |   2 +
+ media/audio/deterministic_audio_dump.cc       | 387 ++++++++++++++++++
+ media/audio/deterministic_audio_dump.h        | 117 ++++++
+ media/audio/fake_audio_output_stream.cc       |  39 +-
+ media/audio/fake_audio_output_stream.h        |  10 +
+ .../domains/HeadlessExperimental.pdl          |   3 +
+ 9 files changed, 620 insertions(+), 2 deletions(-)
+ create mode 100644 media/audio/deterministic_audio_dump.cc
+ create mode 100644 media/audio/deterministic_audio_dump.h
+
+diff --git a/headless/BUILD.gn b/headless/BUILD.gn
+index 621c6c3a35..a2fc4b4a01 100644
+--- a/headless/BUILD.gn
++++ b/headless/BUILD.gn
+@@ -396,6 +396,7 @@ source_set("headless_browser") {
+     "//content/public/app",
+     "//content/public/browser",
+     "//content/public/common",
++    "//media",
+     "//printing/buildflags",
+     "//services/cert_verifier/public/mojom",
+     "//services/device/public/cpp/geolocation",
+diff --git a/headless/lib/browser/protocol/headless_handler.cc b/headless/lib/browser/protocol/headless_handler.cc
+index 40667fab28..861b9465e2 100644
+--- a/headless/lib/browser/protocol/headless_handler.cc
++++ b/headless/lib/browser/protocol/headless_handler.cc
+@@ -23,6 +23,7 @@
+ #include "base/base_switches.h"
+ #include "base/check_deref.h"
+ #include "base/command_line.h"
++#include "base/feature_list.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/posix/eintr_wrapper.h"
+@@ -32,8 +33,11 @@
+ #include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "components/viz/common/switches.h"
+ #include "content/public/common/content_switches.h"
++#include "content/public/common/content_features.h"
+ #include "headless/lib/browser/headless_browser_impl.h"
+ #include "headless/lib/browser/headless_web_contents_impl.h"  // nogncheck http://crbug.com/1227378
++#include "media/audio/deterministic_audio_dump.h"
++#include "media/base/media_switches.h"
+ #include "third_party/libyuv/include/libyuv/convert_from_argb.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkImageInfo.h"
+@@ -408,6 +412,8 @@ GetEncoder(const std::string& format, int quality, bool optimize_for_speed) {
+ 
+ void OnBeginFrameFinished(
+     BitmapEncoder encoder,
++    base::TimeTicks frame_time_ticks,
++    base::TimeDelta interval,
+     std::unique_ptr<HeadlessHandler::BeginFrameCallback> callback,
+     bool has_damage,
+     std::unique_ptr<SkBitmap> bitmap,
+@@ -416,6 +422,16 @@ void OnBeginFrameFinished(
+     callback->sendFailure(Response::ServerError(std::move(error_message)));
+     return;
+   }
++  if (!encoder.is_null()) {
++    if (auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled()) {
++      std::optional<std::string> error =
++          audio_dump->CaptureInterval(frame_time_ticks, interval);
++      if (error.has_value()) {
++        callback->sendFailure(Response::ServerError(std::move(*error)));
++        return;
++      }
++    }
++  }
+   if (encoder.is_null()) {
+     callback->sendSuccess(has_damage, std::nullopt);
+     return;
+@@ -480,6 +496,7 @@ Response HeadlessHandler::Disable() {
+ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+                                  std::optional<double> in_interval,
+                                  std::optional<bool> in_no_display_updates,
++                                 std::optional<bool> in_audio_only,
+                                  std::unique_ptr<ScreenshotParams> screenshot,
+                                  std::unique_ptr<BeginFrameCallback> callback) {
+   auto& headless_contents =
+@@ -502,6 +519,13 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+   base::TimeTicks frame_time_ticks;
+   base::TimeDelta interval;
+   bool no_display_updates = in_no_display_updates.value_or(false);
++  bool audio_only = in_audio_only.value_or(false);
++
++  if (audio_only && screenshot) {
++    callback->sendFailure(Response::InvalidParams(
++        "audioOnly beginFrame cannot capture a screenshot"));
++    return;
++  }
+ 
+   if (in_frame_time_ticks.has_value()) {
+     frame_time_ticks =
+@@ -524,6 +548,43 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+ 
+   base::TimeTicks deadline = frame_time_ticks + interval;
+ 
++  auto* audio_dump = media::DeterministicAudioDump::GetIfEnabled();
++  if (audio_only && !audio_dump) {
++    callback->sendFailure(Response::ServerError(
++        "audioOnly beginFrame requires --headless-raw-audio-dump"));
++    return;
++  }
++  if (audio_dump) {
++    const base::CommandLine* command_line =
++        base::CommandLine::ForCurrentProcess();
++    if (!command_line->HasSwitch(::switches::kDisableAudioOutput)) {
++      callback->sendFailure(Response::ServerError(
++          "Deterministic audio requires --disable-audio-output"));
++      return;
++    }
++    if (command_line->HasSwitch(::switches::kMuteAudio)) {
++      callback->sendFailure(Response::ServerError(
++          "Deterministic audio cannot be used with --mute-audio"));
++      return;
++    }
++    if (base::FeatureList::IsEnabled(features::kAudioServiceOutOfProcess)) {
++      callback->sendFailure(Response::ServerError(
++          "Deterministic audio requires "
++          "--disable-features=AudioServiceOutOfProcess"));
++      return;
++    }
++    std::optional<std::string> error =
++        audio_dump->AdvanceTo(frame_time_ticks);
++    if (error.has_value()) {
++      callback->sendFailure(Response::ServerError(std::move(*error)));
++      return;
++    }
++    if (audio_only) {
++      callback->sendSuccess(false, std::nullopt);
++      return;
++    }
++  }
++
+   BitmapEncoder encoder;
+   if (screenshot) {
+     ScreenshotParams& params = *screenshot;
+@@ -543,6 +604,7 @@ void HeadlessHandler::BeginFrame(std::optional<double> in_frame_time_ticks,
+       frame_time_ticks, deadline, interval, no_display_updates,
+       capture_screenshot,
+       base::BindOnce(&OnBeginFrameFinished, std::move(encoder),
++                     frame_time_ticks, interval,
+                      std::move(callback)));
+ }
+ 
+diff --git a/headless/lib/browser/protocol/headless_handler.h b/headless/lib/browser/protocol/headless_handler.h
+index dfd24df805..b95d38c199 100644
+--- a/headless/lib/browser/protocol/headless_handler.h
++++ b/headless/lib/browser/protocol/headless_handler.h
+@@ -40,6 +40,7 @@ class HeadlessHandler : public DomainHandler,
+       std::optional<double> in_frame_time_ticks,
+       std::optional<double> in_interval,
+       std::optional<bool> no_display_updates,
++      std::optional<bool> audio_only,
+       std::unique_ptr<HeadlessExperimental::ScreenshotParams> screenshot,
+       std::unique_ptr<BeginFrameCallback> callback) override;
+ 
+diff --git a/media/audio/BUILD.gn b/media/audio/BUILD.gn
+index fb3a0e1050..553af78994 100644
+--- a/media/audio/BUILD.gn
++++ b/media/audio/BUILD.gn
+@@ -111,6 +111,8 @@ source_set("audio") {
+     "audio_thread_impl.h",
+     "clockless_audio_sink.cc",
+     "clockless_audio_sink.h",
++    "deterministic_audio_dump.cc",
++    "deterministic_audio_dump.h",
+     "fake_audio_input_stream.cc",
+     "fake_audio_input_stream.h",
+     "fake_audio_log_factory.cc",
+diff --git a/media/audio/deterministic_audio_dump.cc b/media/audio/deterministic_audio_dump.cc
+new file mode 100644
+index 0000000000..1e0d5a5f95
+--- /dev/null
++++ b/media/audio/deterministic_audio_dump.cc
+@@ -0,0 +1,387 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/audio/deterministic_audio_dump.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <array>
++#include <limits>
++#include <utility>
++
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/no_destructor.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/run_loop.h"
++#include "base/task/sequenced_task_runner.h"
++#include "media/audio/fake_audio_output_stream.h"
++#include "media/base/audio_parameters.h"
++#include "media/base/audio_timestamp_helper.h"
++
++namespace media {
++
++namespace {
++
++constexpr char kHeadlessRawAudioDumpSwitch[] = "headless-raw-audio-dump";
++constexpr size_t kWavHeaderSize = 44;
++constexpr std::array<uint8_t, 4> kRiff = {'R', 'I', 'F', 'F'};
++constexpr std::array<uint8_t, 8> kWaveFormat = {'W', 'A', 'V', 'E',
++                                                'f', 'm', 't', ' '};
++constexpr std::array<uint8_t, 4> kData = {'d', 'a', 't', 'a'};
++
++bool WriteAllAt(int fd, base::span<const uint8_t> bytes, off_t offset) {
++  while (!bytes.empty()) {
++    const ssize_t written =
++        HANDLE_EINTR(pwrite(fd, bytes.data(), bytes.size(), offset));
++    if (written <= 0) {
++      return false;
++    }
++    bytes = bytes.subspan(static_cast<size_t>(written));
++    offset += written;
++  }
++  return true;
++}
++
++void WriteLittleEndian16(base::span<uint8_t> bytes,
++                         size_t offset,
++                         uint16_t value) {
++  bytes[offset] = value & 0xff;
++  bytes[offset + 1] = (value >> 8) & 0xff;
++}
++
++void WriteLittleEndian32(base::span<uint8_t> bytes,
++                         size_t offset,
++                         uint32_t value) {
++  bytes[offset] = value & 0xff;
++  bytes[offset + 1] = (value >> 8) & 0xff;
++  bytes[offset + 2] = (value >> 16) & 0xff;
++  bytes[offset + 3] = (value >> 24) & 0xff;
++}
++
++}  // namespace
++
++DeterministicAudioPump::DeterministicAudioPump(
++    scoped_refptr<base::SequencedTaskRunner> worker_task_runner)
++    : worker_task_runner_(std::move(worker_task_runner)) {}
++
++DeterministicAudioPump::~DeterministicAudioPump() = default;
++
++void DeterministicAudioPump::Activate(FakeAudioOutputStream* stream) {
++  base::AutoLock lock(stream_lock_);
++  CHECK(!stream_ || stream_ == stream);
++  stream_ = stream;
++}
++
++void DeterministicAudioPump::Deactivate(FakeAudioOutputStream* stream) {
++  base::AutoLock lock(stream_lock_);
++  if (stream_ == stream) {
++    stream_ = nullptr;
++  }
++}
++
++bool DeterministicAudioPump::PostPump(std::vector<int16_t>* samples,
++                                      base::RepeatingClosure done) {
++  return worker_task_runner_->PostTask(
++      FROM_HERE, base::BindOnce(&DeterministicAudioPump::PumpOnWorker,
++                                base::RetainedRef(this),
++                                base::Unretained(samples), std::move(done)));
++}
++
++void DeterministicAudioPump::PumpOnWorker(std::vector<int16_t>* samples,
++                                          base::RepeatingClosure done) {
++  {
++    base::AutoLock lock(stream_lock_);
++    if (stream_) {
++      stream_->PumpForDeterministicCapture(samples);
++    }
++  }
++  done.Run();
++}
++
++// static
++bool DeterministicAudioDump::IsEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      kHeadlessRawAudioDumpSwitch);
++}
++
++// static
++DeterministicAudioDump* DeterministicAudioDump::GetIfEnabled() {
++  if (!IsEnabled()) {
++    return nullptr;
++  }
++  static base::NoDestructor<DeterministicAudioDump> instance;
++  return instance.get();
++}
++
++DeterministicAudioDump::DeterministicAudioDump() = default;
++
++DeterministicAudioDump::~DeterministicAudioDump() {
++  if (output_fd_ >= 0) {
++    IGNORE_EINTR(close(output_fd_));
++  }
++}
++
++void DeterministicAudioDump::RegisterStream(
++    scoped_refptr<DeterministicAudioPump> pump,
++    const AudioParameters& params) {
++  base::AutoLock lock(stream_lock_);
++  if (params.sample_rate() <= 0 || params.channels() <= 0) {
++    stream_error_ = "Deterministic audio received an invalid output format";
++    return;
++  }
++  if (sample_rate_ == 0) {
++    sample_rate_ = params.sample_rate();
++    channels_ = params.channels();
++  } else if (params.sample_rate() != sample_rate_ ||
++             params.channels() != channels_) {
++    stream_error_ = "Deterministic audio output format changed from " +
++                    std::to_string(sample_rate_) + " Hz / " +
++                    std::to_string(channels_) + " channels to " +
++                    std::to_string(params.sample_rate()) + " Hz / " +
++                    std::to_string(params.channels()) + " channels";
++    return;
++  }
++  if (pump_ && pump_ != pump) {
++    stream_error_ =
++        "Deterministic audio supports one active output device at a time";
++    return;
++  }
++  pump_ = std::move(pump);
++}
++
++void DeterministicAudioDump::UnregisterStream(DeterministicAudioPump* pump) {
++  base::AutoLock lock(stream_lock_);
++  if (pump_.get() != pump) {
++    return;
++  }
++  pump_.reset();
++}
++
++int64_t DeterministicAudioDump::FrameAt(base::TimeTicks target) const {
++  CHECK(origin_.has_value());
++  if (target <= *origin_) {
++    return 0;
++  }
++  return AudioTimestampHelper::TimeToFrames(target - *origin_, sample_rate_);
++}
++
++std::optional<std::string> DeterministicAudioDump::AdvanceTo(
++    base::TimeTicks target) {
++  {
++    base::AutoLock lock(stream_lock_);
++    if (stream_error_.has_value()) {
++      return stream_error_;
++    }
++    if (sample_rate_ == 0 || channels_ == 0) {
++      return "Deterministic audio requires an active output stream before "
++             "the first beginFrame";
++    }
++  }
++  if (!origin_.has_value()) {
++    origin_ = target;
++  }
++  const int64_t target_frame = FrameAt(target);
++  std::optional<std::string> error = EnsureGeneratedThrough(target_frame);
++  if (error.has_value()) {
++    return error;
++  }
++  if (!recording_started_ && target_frame > consumed_frames_) {
++    ConsumeFrames(target_frame - consumed_frames_, nullptr);
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> DeterministicAudioDump::CaptureInterval(
++    base::TimeTicks start,
++    base::TimeDelta interval) {
++  if (interval <= base::TimeDelta()) {
++    return "Deterministic audio capture interval must be positive";
++  }
++  if (!origin_.has_value()) {
++    origin_ = start;
++  }
++
++  int64_t start_frame = FrameAt(start);
++  int64_t end_frame = FrameAt(start + interval);
++  if (end_frame <= start_frame) {
++    return "Deterministic audio capture interval contains no samples";
++  }
++
++  if (!recording_started_) {
++    std::optional<std::string> error = EnsureGeneratedThrough(start_frame);
++    if (error.has_value()) {
++      return error;
++    }
++    if (start_frame > consumed_frames_) {
++      ConsumeFrames(start_frame - consumed_frames_, nullptr);
++    }
++    recording_started_ = true;
++    capture_end_frame_ = start_frame;
++  } else {
++    const int64_t discontinuity = start_frame - capture_end_frame_;
++    if (discontinuity < -1 || discontinuity > 1) {
++      return "Deterministic audio capture timestamps are not contiguous: " +
++             std::to_string(discontinuity) + " sample frames";
++    }
++    start_frame = capture_end_frame_;
++  }
++
++  end_frame =
++      start_frame + AudioTimestampHelper::TimeToFrames(interval, sample_rate_);
++  std::optional<std::string> error = EnsureGeneratedThrough(end_frame);
++  if (error.has_value()) {
++    return error;
++  }
++
++  std::vector<int16_t> captured_samples;
++  ConsumeFrames(end_frame - consumed_frames_, &captured_samples);
++  error = WriteCapturedFrames(captured_samples);
++  if (error.has_value()) {
++    return error;
++  }
++  capture_end_frame_ = end_frame;
++  return std::nullopt;
++}
++
++std::optional<std::string> DeterministicAudioDump::EnsureGeneratedThrough(
++    int64_t target_frame) {
++  if (target_frame < 0) {
++    return "Deterministic audio target precedes its timeline origin";
++  }
++  while (generated_frames_ < target_frame) {
++    bool has_stream = false;
++    {
++      base::AutoLock lock(stream_lock_);
++      if (stream_error_.has_value()) {
++        return stream_error_;
++      }
++      has_stream = pump_ != nullptr;
++    }
++    if (!has_stream) {
++      AppendSilence(target_frame - generated_frames_);
++      break;
++    }
++    std::optional<std::string> error = PumpOneBuffer();
++    if (error.has_value()) {
++      return error;
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> DeterministicAudioDump::PumpOneBuffer() {
++  std::vector<int16_t> samples;
++  base::RunLoop run_loop(base::RunLoop::Type::kNestableTasksAllowed);
++  scoped_refptr<DeterministicAudioPump> pump;
++  {
++    base::AutoLock lock(stream_lock_);
++    if (stream_error_.has_value()) {
++      return stream_error_;
++    }
++    if (!pump_) {
++      return "Deterministic audio output stream disappeared while pumping";
++    }
++    pump = pump_;
++  }
++  if (!pump->PostPump(&samples, run_loop.QuitClosure())) {
++    return "Failed to post deterministic audio pump task";
++  }
++  run_loop.Run();
++
++  if (samples.empty() || samples.size() % channels_ != 0) {
++    return "Deterministic audio pump returned an invalid buffer";
++  }
++  const int64_t frames = samples.size() / channels_;
++  pending_samples_.insert(pending_samples_.end(), samples.begin(),
++                          samples.end());
++  generated_frames_ += frames;
++  return std::nullopt;
++}
++
++void DeterministicAudioDump::AppendSilence(int64_t frames) {
++  CHECK_GE(frames, 0);
++  pending_samples_.insert(pending_samples_.end(),
++                          static_cast<size_t>(frames * channels_), 0);
++  generated_frames_ += frames;
++}
++
++void DeterministicAudioDump::ConsumeFrames(int64_t frames,
++                                           std::vector<int16_t>* output) {
++  CHECK_GE(frames, 0);
++  const int64_t sample_count = frames * channels_;
++  CHECK_LE(sample_count, static_cast<int64_t>(pending_samples_.size()));
++  if (output) {
++    output->reserve(static_cast<size_t>(sample_count));
++  }
++  for (int64_t i = 0; i < sample_count; ++i) {
++    if (output) {
++      output->push_back(pending_samples_.front());
++    }
++    pending_samples_.pop_front();
++  }
++  consumed_frames_ += frames;
++}
++
++std::optional<std::string> DeterministicAudioDump::OpenOutputIfNeeded() {
++  if (output_fd_ >= 0) {
++    return std::nullopt;
++  }
++  const std::string path =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          kHeadlessRawAudioDumpSwitch);
++  if (path.empty()) {
++    return "Deterministic audio dump path is empty";
++  }
++  output_fd_ =
++      HANDLE_EINTR(open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0666));
++  if (output_fd_ < 0) {
++    return "Failed to open deterministic audio WAV output";
++  }
++  return RewriteWavHeader();
++}
++
++std::optional<std::string> DeterministicAudioDump::WriteCapturedFrames(
++    const std::vector<int16_t>& samples) {
++  std::optional<std::string> error = OpenOutputIfNeeded();
++  if (error.has_value()) {
++    return error;
++  }
++  const base::span<const uint8_t> bytes = base::as_bytes(base::span(samples));
++  if (bytes.size() >
++      std::numeric_limits<uint32_t>::max() - output_data_bytes_) {
++    return "Deterministic audio WAV output exceeds the RIFF size limit";
++  }
++  if (!WriteAllAt(output_fd_, bytes, kWavHeaderSize + output_data_bytes_)) {
++    return "Failed to write deterministic audio samples";
++  }
++  output_data_bytes_ += static_cast<uint32_t>(bytes.size());
++  return RewriteWavHeader();
++}
++
++std::optional<std::string> DeterministicAudioDump::RewriteWavHeader() {
++  std::array<uint8_t, kWavHeaderSize> header{};
++  base::span(header).subspan<0, 4>().copy_from(kRiff);
++  WriteLittleEndian32(header, 4, 36 + output_data_bytes_);
++  base::span(header).subspan<8, 8>().copy_from(kWaveFormat);
++  WriteLittleEndian32(header, 16, 16);
++  WriteLittleEndian16(header, 20, 1);
++  WriteLittleEndian16(header, 22, channels_);
++  WriteLittleEndian32(header, 24, sample_rate_);
++  WriteLittleEndian32(header, 28, sample_rate_ * channels_ * sizeof(int16_t));
++  WriteLittleEndian16(header, 32, channels_ * sizeof(int16_t));
++  WriteLittleEndian16(header, 34, 16);
++  base::span(header).subspan<36, 4>().copy_from(kData);
++  WriteLittleEndian32(header, 40, output_data_bytes_);
++  if (!WriteAllAt(output_fd_, header, 0)) {
++    return "Failed to update deterministic audio WAV header";
++  }
++  return std::nullopt;
++}
++
++}  // namespace media
+diff --git a/media/audio/deterministic_audio_dump.h b/media/audio/deterministic_audio_dump.h
+new file mode 100644
+index 0000000000..53ec338e75
+--- /dev/null
++++ b/media/audio/deterministic_audio_dump.h
+@@ -0,0 +1,117 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_AUDIO_DETERMINISTIC_AUDIO_DUMP_H_
++#define MEDIA_AUDIO_DETERMINISTIC_AUDIO_DUMP_H_
++
++#include <cstdint>
++#include <deque>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/synchronization/lock.h"
++#include "base/time/time.h"
++#include "media/base/media_export.h"
++
++namespace base {
++class SequencedTaskRunner;
++template <typename T>
++class NoDestructor;
++}  // namespace base
++
++namespace media {
++
++class AudioParameters;
++class FakeAudioOutputStream;
++
++// Ref-counted bridge which keeps posted worker tasks independent from output
++// stream registration changes on the audio-manager sequence.
++class MEDIA_EXPORT DeterministicAudioPump
++    : public base::RefCountedThreadSafe<DeterministicAudioPump> {
++ public:
++  explicit DeterministicAudioPump(
++      scoped_refptr<base::SequencedTaskRunner> worker_task_runner);
++
++  void Activate(FakeAudioOutputStream* stream);
++  void Deactivate(FakeAudioOutputStream* stream);
++  bool PostPump(std::vector<int16_t>* samples, base::RepeatingClosure done);
++
++ private:
++  friend class base::RefCountedThreadSafe<DeterministicAudioPump>;
++
++  ~DeterministicAudioPump();
++  void PumpOnWorker(std::vector<int16_t>* samples, base::RepeatingClosure done);
++
++  const scoped_refptr<base::SequencedTaskRunner> worker_task_runner_;
++  base::Lock stream_lock_;
++  raw_ptr<FakeAudioOutputStream> stream_ GUARDED_BY(stream_lock_) = nullptr;
++};
++
++// Pulls the final fake audio output from HeadlessExperimental.beginFrame and
++// writes the captured intervals to a PCM WAV file. The switch is intentionally
++// headless-specific, but this class lives beside FakeAudioOutputStream so the
++// browser process and in-process audio service share one controller.
++class MEDIA_EXPORT DeterministicAudioDump {
++ public:
++  static bool IsEnabled();
++  static DeterministicAudioDump* GetIfEnabled();
++
++  DeterministicAudioDump(const DeterministicAudioDump&) = delete;
++  DeterministicAudioDump& operator=(const DeterministicAudioDump&) = delete;
++
++  void RegisterStream(scoped_refptr<DeterministicAudioPump> pump,
++                      const AudioParameters& params);
++  void UnregisterStream(DeterministicAudioPump* pump);
++
++  // Advances native audio playback to |target| without recording. Generated
++  // samples are discarded at their exact timeline boundary, retaining any
++  // buffer overshoot for the next call.
++  std::optional<std::string> AdvanceTo(base::TimeTicks target);
++
++  // Records [start, start + interval). Calls must be contiguous after the
++  // first captured interval. One call corresponds to one captured video frame.
++  std::optional<std::string> CaptureInterval(base::TimeTicks start,
++                                             base::TimeDelta interval);
++
++ private:
++  friend class base::NoDestructor<DeterministicAudioDump>;
++
++  DeterministicAudioDump();
++  ~DeterministicAudioDump();
++
++  int64_t FrameAt(base::TimeTicks target) const;
++  std::optional<std::string> EnsureGeneratedThrough(int64_t target_frame);
++  std::optional<std::string> PumpOneBuffer();
++  void AppendSilence(int64_t frames);
++  void ConsumeFrames(int64_t frames, std::vector<int16_t>* output);
++  std::optional<std::string> OpenOutputIfNeeded();
++  std::optional<std::string> WriteCapturedFrames(
++      const std::vector<int16_t>& samples);
++  std::optional<std::string> RewriteWavHeader();
++
++  base::Lock stream_lock_;
++  scoped_refptr<DeterministicAudioPump> pump_ GUARDED_BY(stream_lock_);
++  std::optional<std::string> stream_error_ GUARDED_BY(stream_lock_);
++  int sample_rate_ = 0;
++  int channels_ = 0;
++
++  std::optional<base::TimeTicks> origin_;
++  int64_t generated_frames_ = 0;
++  int64_t consumed_frames_ = 0;
++  std::deque<int16_t> pending_samples_;
++  bool recording_started_ = false;
++  int64_t capture_end_frame_ = 0;
++
++  int output_fd_ = -1;
++  uint32_t output_data_bytes_ = 0;
++};
++
++}  // namespace media
++
++#endif  // MEDIA_AUDIO_DETERMINISTIC_AUDIO_DUMP_H_
+diff --git a/media/audio/fake_audio_output_stream.cc b/media/audio/fake_audio_output_stream.cc
+index 4ef935abbc..f8ef321658 100644
+--- a/media/audio/fake_audio_output_stream.cc
++++ b/media/audio/fake_audio_output_stream.cc
+@@ -7,22 +7,30 @@
+ #include "base/check.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/memory/ref_counted.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "media/audio/audio_manager_base.h"
++#include "media/audio/deterministic_audio_dump.h"
+ #include "media/base/audio_bus.h"
++#include "media/base/audio_sample_types.h"
+ 
+ namespace media {
+ 
+ // static
+ AudioOutputStream* FakeAudioOutputStream::MakeFakeStream(
+-    AudioManagerBase* manager, const AudioParameters& params) {
++    AudioManagerBase* manager,
++    const AudioParameters& params) {
+   return new FakeAudioOutputStream(manager, params);
+ }
+ 
+ FakeAudioOutputStream::FakeAudioOutputStream(AudioManagerBase* manager,
+                                              const AudioParameters& params)
+     : audio_manager_(manager),
++      params_(params),
++      worker_task_runner_(manager->GetWorkerTaskRunner()),
++      deterministic_audio_pump_(
++          base::MakeRefCounted<DeterministicAudioPump>(worker_task_runner_)),
+       fixed_data_delay_(FakeAudioWorker::ComputeFakeOutputDelay(params)),
+       callback_(nullptr),
+       fake_worker_(manager->GetWorkerTaskRunner(), params),
+@@ -38,15 +46,26 @@ bool FakeAudioOutputStream::Open() {
+   return true;
+ }
+ 
+-void FakeAudioOutputStream::Start(AudioSourceCallback* callback)  {
++void FakeAudioOutputStream::Start(AudioSourceCallback* callback) {
+   DCHECK(audio_manager_->GetTaskRunner()->BelongsToCurrentThread());
+   callback_ = callback;
++  if (auto* dump = DeterministicAudioDump::GetIfEnabled()) {
++    deterministic_audio_pump_->Activate(this);
++    dump->RegisterStream(deterministic_audio_pump_, params_);
++    return;
++  }
+   fake_worker_.Start(base::BindRepeating(&FakeAudioOutputStream::CallOnMoreData,
+                                          base::Unretained(this)));
+ }
+ 
+ void FakeAudioOutputStream::Stop() {
+   DCHECK(audio_manager_->GetTaskRunner()->BelongsToCurrentThread());
++  if (auto* dump = DeterministicAudioDump::GetIfEnabled()) {
++    dump->UnregisterStream(deterministic_audio_pump_.get());
++    deterministic_audio_pump_->Deactivate(this);
++    callback_ = nullptr;
++    return;
++  }
+   fake_worker_.Stop();
+   callback_ = nullptr;
+ }
+@@ -75,6 +94,22 @@ void FakeAudioOutputStream::CallOnMoreData(base::TimeTicks ideal_time,
+   callback_->OnMoreData(delay, now, {}, audio_bus_.get());
+ }
+ 
++void FakeAudioOutputStream::PumpForDeterministicCapture(
++    std::vector<int16_t>* samples) {
++  DCHECK(worker_task_runner_->RunsTasksInCurrentSequence());
++  DCHECK(callback_);
++  // The audio source uses delay_timestamp to estimate actual device latency.
++  // A begin-frame timestamp can run much faster than wall time, so exposing it
++  // here makes HTMLMediaElement playback treat decoded data as underflowed.
++  // There is also no hardware queue in dump mode, so report zero output delay.
++  // Sample progression remains driven solely by the number of pulls.
++  const base::TimeTicks now = base::TimeTicks::Now();
++  callback_->OnMoreData(base::TimeDelta(), now, {}, audio_bus_.get());
++  samples->resize(audio_bus_->frames() * audio_bus_->channels());
++  audio_bus_->ToInterleaved<SignedInt16SampleTypeTraits>(audio_bus_->frames(),
++                                                         samples->data());
++}
++
+ void FakeAudioOutputStream::SetMute(bool muted) {}
+ 
+ }  // namespace media
+diff --git a/media/audio/fake_audio_output_stream.h b/media/audio/fake_audio_output_stream.h
+index 6582775bd8..21000f1c83 100644
+--- a/media/audio/fake_audio_output_stream.h
++++ b/media/audio/fake_audio_output_stream.h
+@@ -6,8 +6,11 @@
+ #define MEDIA_AUDIO_FAKE_AUDIO_OUTPUT_STREAM_H_
+ 
+ #include <memory>
++#include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "media/audio/android/muteable_audio_output_stream.h"
+ #include "media/audio/audio_io.h"
+@@ -17,6 +20,7 @@
+ namespace media {
+ 
+ class AudioManagerBase;
++class DeterministicAudioPump;
+ 
+ // A fake implementation of AudioOutputStream.  Used for testing and when a real
+ // audio output device is unavailable or refusing output (e.g. remote desktop).
+@@ -39,6 +43,9 @@ class MEDIA_EXPORT FakeAudioOutputStream : public MuteableAudioOutputStream {
+   void Flush() override;
+   void SetMute(bool muted) override;
+ 
++  // Called by DeterministicAudioPump on the audio worker sequence.
++  void PumpForDeterministicCapture(std::vector<int16_t>* samples);
++
+  private:
+   FakeAudioOutputStream(AudioManagerBase* manager,
+                         const AudioParameters& params);
+@@ -48,6 +55,9 @@ class MEDIA_EXPORT FakeAudioOutputStream : public MuteableAudioOutputStream {
+   void CallOnMoreData(base::TimeTicks ideal_time, base::TimeTicks now);
+ 
+   const raw_ptr<AudioManagerBase> audio_manager_;
++  const AudioParameters params_;
++  const scoped_refptr<base::SequencedTaskRunner> worker_task_runner_;
++  const scoped_refptr<DeterministicAudioPump> deterministic_audio_pump_;
+   const base::TimeDelta fixed_data_delay_;
+   raw_ptr<AudioSourceCallback> callback_;
+   FakeAudioWorker fake_worker_;
+diff --git a/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl b/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
+index b67f57ac68..2739266af0 100644
+--- a/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
++++ b/third_party/blink/public/devtools_protocol/domains/HeadlessExperimental.pdl
+@@ -38,6 +38,9 @@ experimental domain HeadlessExperimental
+       # true, only side effects of the BeginFrame will be run, such as layout and animations, but
+       # any visual updates may not be visible on the display or in screenshots.
+       optional boolean noDisplayUpdates
++      # Advances deterministic native audio without sending a renderer BeginFrame. False by
++      # default. Requires --headless-raw-audio-dump and cannot be combined with a screenshot.
++      optional boolean audioOnly
+       # If set, a screenshot of the frame will be captured and returned in the response. Otherwise,
+       # no screenshot will be captured. Note that capturing a screenshot can fail, for example,
+       # during renderer initialization. In such a case, no screenshot data will be returned.
+-- 
+2.53.0
+
