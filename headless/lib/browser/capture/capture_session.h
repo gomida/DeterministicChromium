@@ -16,10 +16,14 @@
 #include "base/memory/weak_ptr.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
+#include "base/timer/timer.h"
 #include "base/values.h"
+#include "content/public/browser/global_routing_id.h"
 #include "content/public/browser/web_contents_user_data.h"
 #include "headless/lib/browser/capture/raw_frame_sink.h"
 #include "headless/lib/browser/capture/virtual_time_owner.h"
+#include "headless/public/mojom/capture_agent.mojom.h"
+#include "mojo/public/cpp/bindings/associated_remote.h"
 
 class SkBitmap;
 
@@ -115,7 +119,15 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
     bool hash;
     base::TimeTicks started;
     base::TimeTicks after_grant;
+    base::TimeTicks after_prepare;
     base::TimeTicks after_begin_frame;
+    // Filled by the renderer agent (DESIGN.md 4.3 steps 2-5).
+    base::ListValue markers;
+    base::ListValue media;
+    base::ListValue warnings;
+    double wake_ms = 0;
+    double quiesce_ms = 0;
+    double audio_ms = 0;
     // Set when the surface did not exist before this frame's BeginFrame and a
     // second BeginFrame at the same frame time was issued to obtain readback
     // (only ever the first frame; DESIGN.md 4.3 step 8).
@@ -139,6 +151,13 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
   // renderer agent).
   void RunAdvance(std::unique_ptr<PendingAdvance> pending);
   void OnGranted(std::unique_ptr<PendingAdvance> pending, std::optional<std::string> error);
+  // Steps 2-5 through the renderer's CaptureAgent. The pending advance is
+  // held in prepare_pending_ while the renderer works so a timeout or a
+  // renderer exit can still answer the controller.
+  void PrepareFrame(std::unique_ptr<PendingAdvance> pending);
+  void OnPrepared(int64_t frame_index, mojom::PrepareResultPtr result);
+  void OnPrepareTimeout();
+  void OnAgentDisconnected();
   void IssueBeginFrame(std::unique_ptr<PendingAdvance> pending);
   void OnFrameFinished(std::unique_ptr<PendingAdvance> pending, bool has_damage,
                        std::unique_ptr<SkBitmap> bitmap, std::string error);
@@ -167,6 +186,14 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
   int height_ = 0;
 
   std::unique_ptr<VirtualTimeOwner> virtual_time_;
+  mojo::AssociatedRemote<mojom::CaptureAgent> agent_;
+  content::GlobalRenderFrameHostId agent_frame_id_;
+  std::unique_ptr<PendingAdvance> prepare_pending_;
+  base::OneShotTimer prepare_timer_;
+  std::string marker_prefix_ = "dcap:";
+  bool collect_marks_ = true;
+  double media_wait_timeout_ms_ = 10000;
+  bool fail_on_media_wait_timeout_ = true;
   std::unique_ptr<RawFrameSink> sink_;
   bool sink_wants_frames_ = false;
   scoped_refptr<base::SequencedTaskRunner> worker_;
@@ -189,7 +216,10 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
   int gpu_process_crashes_ = 0;
   std::optional<SinkError> first_sink_error_;
   std::vector<double> grant_ms_;
-  std::vector<double> begin_frame_ms_;  // grant to frame-finished; includes the GPU readback
+  std::vector<double> prepare_ms_;      // grant to agent reply (wake + quiesce + audio + marks)
+  std::vector<double> wake_ms_;
+  std::vector<double> quiesce_ms_;
+  std::vector<double> begin_frame_ms_;  // prepare to frame-finished; includes the GPU readback
   std::vector<double> hash_ms_;
   std::vector<double> sink_ms_;
 

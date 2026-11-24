@@ -233,17 +233,26 @@ source_set("headless_common") {
   ]
 }
 
+mojom("capture_agent_mojom") {
+  sources = [ "public/mojom/capture_agent.mojom" ]
+  public_deps = [ "//mojo/public/mojom/base" ]
+}
+
 source_set("headless_renderer") {
   sources = [
     "lib/renderer/allowlist.cc",
     "lib/renderer/allowlist.h",
+    "lib/renderer/capture_agent.cc",
+    "lib/renderer/capture_agent.h",
     "lib/renderer/headless_content_renderer_client.cc",
     "lib/renderer/headless_content_renderer_client.h",
   ]
 
   deps = [
+    ":capture_agent_mojom",
     "//content/public/common",
     "//gin",
+    "//mojo/public/cpp/bindings",
     "//printing/buildflags",
     "//third_party/blink/public:blink",
     "//ui/gl",
@@ -381,6 +390,7 @@ source_set("headless_browser") {
 
   deps = [
     ":backend_cdp_bindings",
+    ":capture_agent_mojom",
     ":headless_common",
     "//base:base_static",
     "//build:branding_buildflags",

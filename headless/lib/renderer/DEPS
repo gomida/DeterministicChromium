@@ -2,6 +2,7 @@ include_rules = [
   "+components/printing/renderer",
   "+content/public/renderer",
   "+media/base",
+  "+mojo/public/cpp/bindings",
   "+printing",
   "+third_party/blink/public",
   "+v8/include",

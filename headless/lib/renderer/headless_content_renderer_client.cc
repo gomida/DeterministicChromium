@@ -12,6 +12,7 @@
 #include "content/public/common/web_identity.h"
 #include "content/public/renderer/render_thread.h"
 #include "headless/lib/common/headless_features.h"
+#include "headless/lib/renderer/capture_agent.h"
 #include "headless/public/switches.h"
 #include "media/base/video_codecs.h"
 #include "printing/buildflags/buildflags.h"
@@ -107,6 +108,10 @@ HeadlessContentRendererClient::~HeadlessContentRendererClient() = default;
 
 void HeadlessContentRendererClient::RenderFrameCreated(
     content::RenderFrame* render_frame) {
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          switches::kDeterministicCapture)) {
+    new CaptureAgent(render_frame);  // owned by the RenderFrame
+  }
 #if BUILDFLAG(ENABLE_PRINTING)
   new printing::PrintRenderFrameHelper(
       render_frame, std::make_unique<HeadlessPrintRenderFrameHelperDelegate>());

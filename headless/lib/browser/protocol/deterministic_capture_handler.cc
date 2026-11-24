@@ -148,7 +148,7 @@ Response DeterministicCaptureHandler::GetCapabilities(
   // Features appear as the patch series lands them.
   auto features =
       std::make_unique<protocol::Array<DeterministicCapture::Feature>>();
-  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"}) {
+  for (const char* name : {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"}) {
     features->push_back(DeterministicCapture::Feature::Create()
                             .SetName(name)
                             .SetVersion(1)

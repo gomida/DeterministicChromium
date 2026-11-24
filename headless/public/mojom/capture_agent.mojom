@@ -1,0 +1,58 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// DeterministicChromium: the browser's CaptureSession talks to the renderer's
+// CaptureAgent once per frame, between the virtual-time grant and the
+// BeginFrame (deterministic-capture/DESIGN.md 4.3 steps 2-5).
+module headless.mojom;
+
+struct PrepareParams {
+  // Frame about to be composited; its time is T_n = base + offset(n + 1).
+  int64 frame_index;
+  // offset(n + 1) - offset(n) in milliseconds; used to attribute marks.
+  double frame_interval_ms;
+  // Only performance marks whose name starts with this prefix are reported.
+  string marker_prefix;
+  bool collect_marks;
+  // Upper bound for the media quiescence wait.
+  double wait_timeout_ms;
+};
+
+struct CaptureMarker {
+  string name;
+  // "performanceMark"
+  string source;
+  // performance.now() at collection minus the mark's startTime, so the
+  // browser can attribute the mark to a frame without knowing timeOrigin.
+  double age_ms;
+};
+
+struct CaptureMediaState {
+  int32 player_id;
+  // "idle" | "playing" | "paused" | "ended" | "seeking" | "waiting"
+  string state;
+  double media_time_ms;
+  bool stable;
+  bool has_video;
+  bool has_audio;
+};
+
+struct PrepareResult {
+  array<CaptureMarker> markers;
+  array<CaptureMediaState> media;
+  double wake_ms;
+  double quiesce_ms;
+  double audio_ms;
+  // Players that were still unstable when wait_timeout_ms expired.
+  array<int32> timed_out_players;
+  array<string> warnings;
+};
+
+// Lives on the renderer main thread of every frame in a --deterministic-capture
+// renderer; the browser uses the primary main frame's instance.
+interface CaptureAgent {
+  // Wakes the media and compositor threads, waits for media pipelines to be
+  // stable, and collects marks. Never blocks the renderer main thread.
+  Prepare(PrepareParams params) => (PrepareResult result);
+};

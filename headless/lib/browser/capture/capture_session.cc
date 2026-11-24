@@ -12,10 +12,12 @@
 #include "base/task/sequenced_task_runner.h"
 #include "base/task/thread_pool.h"
 #include "content/public/browser/browser_thread.h"
+#include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
 #include "headless/lib/browser/capture/canonical_hash.h"
 #include "headless/lib/browser/headless_web_contents_impl.h"
+#include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
 #include "third_party/skia/include/core/SkBitmap.h"
 
 namespace headless::capture {
@@ -140,7 +142,7 @@ void CaptureSession::Configure(base::DictValue config,
     return;
   }
   // Feature negotiation: everything this build implements.
-  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra"};
+  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"};
   if (const base::ListValue* required = config.FindList("requiredFeatures")) {
     for (const base::Value& feature : *required) {
       const std::string* name = feature.GetIfString();
@@ -167,6 +169,38 @@ void CaptureSession::Configure(base::DictValue config,
     }
   }
   RawFrameSink::Config sink_config;
+  if (const base::DictValue* markers = config.FindDict("markers")) {
+    if (const std::string* prefix = markers->FindString("prefix")) {
+      marker_prefix_ = *prefix;
+    }
+    collect_marks_ = true;
+    if (const base::ListValue* sources = markers->FindList("sources")) {
+      collect_marks_ = false;
+      for (const base::Value& source : *sources) {
+        if (source.is_string() && source.GetString() == "performanceMark") {
+          collect_marks_ = true;
+        }
+      }
+    }
+  }
+  if (const base::DictValue* media = config.FindDict("media")) {
+    if (std::optional<double> ms = media->FindDouble("waitTimeoutMs")) {
+      media_wait_timeout_ms_ = *ms;
+    }
+    fail_on_media_wait_timeout_ = media->FindBool("failOnWaitTimeout").value_or(true);
+  }
+  base::DictValue effective_markers;
+  effective_markers.Set("prefix", marker_prefix_);
+  base::ListValue effective_sources;
+  if (collect_marks_) {
+    effective_sources.Append("performanceMark");
+  }
+  effective_markers.Set("sources", std::move(effective_sources));
+  effective_config_.Set("markers", std::move(effective_markers));
+  base::DictValue effective_media;
+  effective_media.Set("waitTimeoutMs", media_wait_timeout_ms_);
+  effective_media.Set("failOnWaitTimeout", fail_on_media_wait_timeout_);
+  effective_config_.Set("media", std::move(effective_media));
   if (const base::DictValue* sink = config.FindDict("frameSink")) {
     const std::string* type = sink->FindString("type");
     if (type && *type == "shm") {
@@ -303,9 +337,126 @@ void CaptureSession::OnGranted(std::unique_ptr<PendingAdvance> pending,
     std::move(pending->callback).Run(err, base::DictValue());
     return;
   }
-  // TODO(patch 5): wake non-main renderer threads, quiesce media transitions,
-  // render audio to T, collect markers (CaptureAgent.Prepare).
+  PrepareFrame(std::move(pending));
+}
+
+void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
+  content::RenderFrameHost* rfh = web_contents_->GetPrimaryMainFrame();
+  if (!rfh || !rfh->IsRenderFrameLive()) {
+    Error err{"RendererCrashed", "no live main frame for prepare"};
+    Fail(err);
+    std::move(pending->callback).Run(err, base::DictValue());
+    return;
+  }
+  if (!agent_.is_bound() || rfh->GetGlobalId() != agent_frame_id_) {
+    agent_.reset();
+    rfh->GetRemoteAssociatedInterfaces()->GetInterface(&agent_);
+    agent_.set_disconnect_handler(
+        base::BindOnce(&CaptureSession::OnAgentDisconnected, weak_factory_.GetWeakPtr()));
+    agent_frame_id_ = rfh->GetGlobalId();
+  }
+  const int64_t index = pending->frame_index;
+  auto params = mojom::PrepareParams::New();
+  params->frame_index = index;
+  params->frame_interval_ms =
+      (FrameOffsetMicros(index + 1) - FrameOffsetMicros(index)) / 1000.0;
+  params->marker_prefix = marker_prefix_;
+  params->collect_marks = collect_marks_;
+  params->wait_timeout_ms = media_wait_timeout_ms_;
+  prepare_pending_ = std::move(pending);
+  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
+                       base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
+  agent_->Prepare(std::move(params),
+                  base::BindOnce(&CaptureSession::OnPrepared, weak_factory_.GetWeakPtr(), index));
+}
+
+void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr result) {
+  if (!prepare_pending_ || prepare_pending_->frame_index != frame_index) {
+    return;  // answered already by a timeout or a disconnect
+  }
+  prepare_timer_.Stop();
+  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
+  pending->after_prepare = base::TimeTicks::Now();
+  prepare_ms_.push_back((pending->after_prepare - pending->after_grant).InMillisecondsF());
+  wake_ms_.push_back(result->wake_ms);
+  quiesce_ms_.push_back(result->quiesce_ms);
+  pending->wake_ms = result->wake_ms;
+  pending->quiesce_ms = result->quiesce_ms;
+  pending->audio_ms = result->audio_ms;
+  const double interval_ms =
+      (FrameOffsetMicros(frame_index + 1) - FrameOffsetMicros(frame_index)) / 1000.0;
+  for (const mojom::CaptureMarkerPtr& marker : result->markers) {
+    // A mark made during the grant for frame n (age < one interval) belongs
+    // to n; one made in frame n-1's rAF (age == one interval, +-0.1 ms of
+    // TimeClamper rounding) belongs to n-1. The quarter-millisecond slack
+    // keeps the rounding on the right side of the boundary.
+    int64_t frames_back = 0;
+    if (interval_ms > 0) {
+      frames_back = static_cast<int64_t>((marker->age_ms + 0.25) / interval_ms);
+    }
+    base::DictValue m;
+    m.Set("name", marker->name);
+    m.Set("frameIndex", static_cast<double>(std::max<int64_t>(0, frame_index - frames_back)));
+    m.Set("source", marker->source);
+    m.Set("ageMs", marker->age_ms);
+    pending->markers.Append(std::move(m));
+  }
+  for (const mojom::CaptureMediaStatePtr& media : result->media) {
+    base::DictValue m;
+    m.Set("playerId", media->player_id);
+    m.Set("state", media->state);
+    m.Set("mediaTimeMs", media->media_time_ms);
+    m.Set("stable", media->stable);
+    m.Set("hasVideo", media->has_video);
+    m.Set("hasAudio", media->has_audio);
+    pending->media.Append(std::move(m));
+  }
+  for (const std::string& warning : result->warnings) {
+    pending->warnings.Append(warning);
+  }
+  if (!result->timed_out_players.empty()) {
+    base::DictValue details;
+    base::ListValue players;
+    for (int32_t id : result->timed_out_players) {
+      players.Append(id);
+    }
+    details.Set("players", std::move(players));
+    details.Set("media", pending->media.Clone());
+    details.Set("frameIndex", static_cast<double>(frame_index));
+    if (fail_on_media_wait_timeout_) {
+      Error err{"MediaWaitTimeout", "media pipelines did not settle within the wait timeout", std::move(details)};
+      Fail(err);
+      std::move(pending->callback).Run(err, base::DictValue());
+      return;
+    }
+    pending->warnings.Append("MediaWaitTimeout: " + base::NumberToString(result->timed_out_players.size()) +
+                             " player(s) still unstable; continuing (media.failOnWaitTimeout=false)");
+  }
   IssueBeginFrame(std::move(pending));
+}
+
+void CaptureSession::OnPrepareTimeout() {
+  if (!prepare_pending_) {
+    return;
+  }
+  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
+  base::DictValue details;
+  details.Set("frameIndex", static_cast<double>(pending->frame_index));
+  Error err{"PrepareTimeout", "renderer did not answer CaptureAgent.Prepare", std::move(details)};
+  Fail(err);
+  std::move(pending->callback).Run(err, base::DictValue());
+}
+
+void CaptureSession::OnAgentDisconnected() {
+  agent_.reset();
+  if (!prepare_pending_) {
+    return;
+  }
+  prepare_timer_.Stop();
+  std::unique_ptr<PendingAdvance> pending = std::move(prepare_pending_);
+  Error err{"RendererCrashed", "CaptureAgent disconnected during prepare"};
+  Fail(err);
+  std::move(pending->callback).Run(err, base::DictValue());
 }
 
 void CaptureSession::IssueBeginFrame(std::unique_ptr<PendingAdvance> pending) {
@@ -334,7 +485,7 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
                                      std::unique_ptr<SkBitmap> bitmap,
                                      std::string error) {
   pending->after_begin_frame = base::TimeTicks::Now();
-  begin_frame_ms_.push_back((pending->after_begin_frame - pending->after_grant).InMillisecondsF());
+  begin_frame_ms_.push_back((pending->after_begin_frame - pending->after_prepare).InMillisecondsF());
   if (!error.empty()) {
     Error err{"RendererCrashed", "BeginFrame failed: " + error};
     Fail(err);
@@ -500,16 +651,20 @@ void CaptureSession::Respond(std::unique_ptr<PendingAdvance> pending,
   r.Set("reusedReadback", reused);
   r.Set("surfaceWarmed", pending->retried_for_surface);
   r.Set("audioSampleFrames", 0);  // TODO(patch 7)
-  r.Set("markers", base::ListValue());  // TODO(patch 5)
-  r.Set("media", base::ListValue());    // TODO(patch 5)
+  r.Set("markers", std::move(pending->markers));
+  r.Set("media", std::move(pending->media));
   base::DictValue timings;
   timings.Set("grantMs", (pending->after_grant - pending->started).InMillisecondsF());
-  timings.Set("beginFrameMs", (pending->after_begin_frame - pending->after_grant).InMillisecondsF());
+  timings.Set("prepareMs", (pending->after_prepare - pending->after_grant).InMillisecondsF());
+  timings.Set("wakeMs", pending->wake_ms);
+  timings.Set("quiesceMs", pending->quiesce_ms);
+  timings.Set("audioMs", pending->audio_ms);
+  timings.Set("beginFrameMs", (pending->after_begin_frame - pending->after_prepare).InMillisecondsF());
   timings.Set("queueDepth", inflight_);
   timings.Set("sinkQueued", sink_ ? static_cast<double>(sink_->frames_queued()) : 0.0);
   r.Set("timings", std::move(timings));
   r.Set("completed", TakeCompleted());
-  r.Set("warnings", base::ListValue());
+  r.Set("warnings", std::move(pending->warnings));
   last_response_ = r.Clone();
   last_response_frame_ = index;
   std::move(pending->callback).Run(std::nullopt, std::move(r));
@@ -607,6 +762,9 @@ void CaptureSession::OnDrained(ResultCallback callback) {
   }
   base::DictValue histograms;
   histograms.Set("grantMs", Histogram(grant_ms_));
+  histograms.Set("prepareMs", Histogram(prepare_ms_));
+  histograms.Set("wakeMs", Histogram(wake_ms_));
+  histograms.Set("quiesceMs", Histogram(quiesce_ms_));
   histograms.Set("beginFrameMs", Histogram(begin_frame_ms_));
   histograms.Set("hashMs", Histogram(hash_ms_));
   histograms.Set("sinkMs", Histogram(sink_ms_));
