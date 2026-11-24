@@ -78,7 +78,7 @@ class DeterministicCaptureHandler : public DomainHandler,
       std::unique_ptr<protocol::DictionaryValue>* out_last_error) override;
 
   static constexpr char kProtocolVersion[] = "2.1";
-  static constexpr char kPatchVersion[] = "2.1.0-p5";
+  static constexpr char kPatchVersion[] = "2.1.0-p10";
 
  private:
   bool ModeEnabled() const;
