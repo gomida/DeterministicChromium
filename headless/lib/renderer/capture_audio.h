@@ -5,6 +5,7 @@
 #ifndef HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
 #define HEADLESS_LIB_RENDERER_CAPTURE_AUDIO_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -78,7 +79,9 @@ class CaptureAudioEngine {
   CaptureAudioFormat format_;
   base::Thread thread_{"DcapAudio"};
   base::Lock lock_;
-  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks_;  // creation order
+  // Owned references: a sink stays mixable (as silence once stopped) until
+  // Stop() removes it, so the audio thread never dereferences a freed sink.
+  std::vector<scoped_refptr<CaptureAudioRendererSink>> sinks_;  // creation order
   std::vector<std::string> unsupported_;
   int64_t rendered_through_ = 0;  // audio thread only
 };
@@ -111,6 +114,7 @@ class CaptureAudioRendererSink : public media::SwitchableAudioRendererSink {
 
  private:
   ~CaptureAudioRendererSink() override;
+  void InitializeLocked(const media::AudioParameters& params, RenderCallback* callback);
   void RenderOneBuffer_Locked(base::TimeTicks now);
 
   const blink::WebAudioDeviceSourceType source_type_;
@@ -121,7 +125,7 @@ class CaptureAudioRendererSink : public media::SwitchableAudioRendererSink {
   bool initialized_ = false;
   bool started_ = false;
   bool playing_ = false;
-  double volume_ = 1.0;
+  std::atomic<double> volume_{1.0};  // set from the media thread while a mix may be running
   std::unique_ptr<media::AudioBus> render_bus_;     // source format
   std::unique_ptr<media::AudioBus> resampled_bus_;  // device rate, source channels
   std::unique_ptr<media::MultiChannelResampler> resampler_;

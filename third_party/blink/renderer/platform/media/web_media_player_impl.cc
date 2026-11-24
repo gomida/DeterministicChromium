@@ -655,6 +655,10 @@ WebMediaPlayerImpl::~WebMediaPlayerImpl() {
 }
 
 bool WebMediaPlayerImpl::CaptureIsStable() const {
+  // A failed pipeline will never complete its transition; seeking_ stays set.
+  if (network_state_ >= WebMediaPlayer::kNetworkStateFormatError) {
+    return true;
+  }
   if (pipeline_controller_->HasPendingOperation() || seeking_ ||
       pending_suspend_resume_cycle_ || is_pipeline_resuming_) {
     return false;
@@ -693,6 +697,7 @@ void WebMediaPlayerImpl::CaptureNoteTransition() {
         WebScopedVirtualTimePauser::VirtualTaskDuration::kInstant);
     capture_pauser_.PauseVirtualTime();
     capture_pauser_held_ = true;
+    capture_hold_started_ = base::subtle::TimeTicksNowIgnoringOverride();
   }
   capture_settle_rounds_ = 0;
   if (!capture_settle_probe_in_flight_) {
@@ -712,6 +717,13 @@ void WebMediaPlayerImpl::CapturePostSettleProbe() {
       base::BindOnce(&WebMediaPlayerImpl::CaptureSettleStep, weak_this_));
 }
 
+void WebMediaPlayerImpl::CaptureReleaseVirtualTime() {
+  if (capture_pauser_held_) {
+    capture_pauser_.UnpauseVirtualTime();
+    capture_pauser_held_ = false;
+  }
+}
+
 void WebMediaPlayerImpl::CaptureSettleStep() {
   DCHECK(main_task_runner_->BelongsToCurrentThread());
   capture_settle_probe_in_flight_ = false;
@@ -720,12 +732,22 @@ void WebMediaPlayerImpl::CaptureSettleStep() {
   }
   if (CaptureIsStable()) {
     if (++capture_settle_rounds_ >= 2) {
-      capture_pauser_.UnpauseVirtualTime();
-      capture_pauser_held_ = false;
+      CaptureReleaseVirtualTime();
       return;
     }
   } else {
     capture_settle_rounds_ = 0;
+    // A transition that cannot complete (stalled network, a decoder that never
+    // answers) must not freeze the whole renderer: give the controller its
+    // timeout back and let the quiescence report show the player as unstable.
+    constexpr base::TimeDelta kMaxHold = base::Seconds(20);
+    if (base::subtle::TimeTicksNowIgnoringOverride() - capture_hold_started_ > kMaxHold) {
+      MEDIA_LOG(WARNING, media_log_.get())
+          << "deterministic capture: media transition did not settle in 20 s; "
+             "releasing virtual time";
+      CaptureReleaseVirtualTime();
+      return;
+    }
   }
   CapturePostSettleProbe();
 }
@@ -2160,6 +2182,7 @@ void WebMediaPlayerImpl::OnError(media::PipelineStatus status) {
 
   if (suppress_destruction_errors_)
     return;
+  CaptureReleaseVirtualTime();  // the pending transition will not complete
 
 #if BUILDFLAG(IS_WIN)
   // An error or another hardware context reset (HCR) occurred within a very

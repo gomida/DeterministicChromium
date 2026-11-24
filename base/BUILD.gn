@@ -673,6 +673,7 @@ component("base") {
     "profiler/unwinder.h",
     "rand_util.cc",
     "rand_util.h",
+    "rand_util_deterministic_capture.h",
     "run_loop.cc",
     "run_loop.h",
     "sampling_heap_profiler/lock_free_address_hash_set.cc",

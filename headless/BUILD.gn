@@ -246,6 +246,8 @@ source_set("headless_renderer") {
     "lib/renderer/capture_agent.h",
     "lib/renderer/capture_audio.cc",
     "lib/renderer/capture_audio.h",
+    "lib/renderer/capture_random.cc",
+    "lib/renderer/capture_random.h",
     "lib/renderer/headless_content_renderer_client.cc",
     "lib/renderer/headless_content_renderer_client.h",
   ]

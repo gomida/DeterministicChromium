@@ -764,8 +764,10 @@ class PLATFORM_EXPORT WebMediaPlayerImpl
   void CaptureNoteTransition();
   void CapturePostSettleProbe();
   void CaptureSettleStep();
+  void CaptureReleaseVirtualTime();
   WebScopedVirtualTimePauser capture_pauser_;
   bool capture_pauser_held_ = false;
+  base::TimeTicks capture_hold_started_;  // real time
   bool capture_settle_probe_in_flight_ = false;
   int capture_settle_rounds_ = 0;
 

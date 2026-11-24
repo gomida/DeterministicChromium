@@ -324,13 +324,16 @@ void AudioRendererImpl::StartRendering_Locked() {
 
   sink_playing_ = true;
   capture_wait_cancelled_ = false;
+  if (capture_mode_) {
+    capture_weak_this_ = weak_factory_.GetWeakPtr();  // created on the media thread
+  }
   was_unmuted_ = was_unmuted_ || volume_ != 0;
   if (state_ == kReinitializingSink) {
     // Do not start the sink yet if the sink is reinitializing.
     return;
   }
   base::AutoUnlock auto_unlock(lock_);
-  if (volume_ || render_muted_audio_) {
+  if (volume_ || render_muted_audio_ || capture_mode_) {
     MaybeStartRealSink();
   } else {
     null_sink_->Play();
@@ -381,7 +384,7 @@ void AudioRendererImpl::StopRendering_Locked(
   }
 
   base::AutoUnlock auto_unlock(lock_);
-  if (volume_ || render_muted_audio_) {
+  if (volume_ || render_muted_audio_ || capture_mode_) {
     sink_->Pause(pause_reason);
   } else {
     null_sink_->Pause(pause_reason);
@@ -497,7 +500,7 @@ void AudioRendererImpl::Flush(base::OnceClosure callback) {
   // Flush |sink_| now.  |sink_| must only be accessed on |task_runner_| and not
   // be called under |lock_|.
   DCHECK(!sink_playing_);
-  if (volume_ || render_muted_audio_) {
+  if (volume_ || render_muted_audio_ || capture_mode_) {
     sink_->Flush();
   } else {
     null_sink_->Flush();
@@ -952,6 +955,12 @@ void AudioRendererImpl::SetVolume(float volume) {
   // Two cases to handle:
   //   1. Changing from muted to unmuted state.
   //   2. Unmuted startup case.
+  if (capture_mode_) {
+    // The capture sink is the clock and applies the volume itself; never
+    // switch a muted element to the real-time null sink (DESIGN.md 4.6).
+    volume_ = volume;
+    return;
+  }
   if ((!render_muted_audio_ && !volume_ && volume) ||
       (volume && real_sink_needs_start_)) {
     MaybeStartRealSink();
@@ -1392,6 +1401,11 @@ bool AudioRendererImpl::IsBeforeStartTime(const AudioBuffer& buffer) {
 
 void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
   lock_.AssertAcquired();
+  // Decoded audio arrives on the media thread; a Render() running there (the
+  // null sink) cannot wait for it.
+  if (task_runner_->RunsTasksInCurrentSequence() || !capture_weak_this_) {
+    return;
+  }
   // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
   // time.
   constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
@@ -1405,8 +1419,7 @@ void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
          algorithm_->BufferedFrames() < needed) {
     if (!pending_read_) {
       task_runner_->PostTask(
-          FROM_HERE,
-          base::BindOnce(&AudioRendererImpl::AttemptRead, weak_factory_.GetWeakPtr()));
+          FROM_HERE, base::BindOnce(&AudioRendererImpl::AttemptRead, capture_weak_this_));
     }
     capture_frames_cv_.TimedWait(base::Milliseconds(1));
     if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {

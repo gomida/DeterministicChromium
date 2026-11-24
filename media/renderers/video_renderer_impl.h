@@ -250,6 +250,7 @@ class MEDIA_EXPORT VideoRendererImpl
   const bool capture_mode_;
   base::ConditionVariable capture_frames_cv_;
   bool capture_wait_cancelled_ = false;
+  bool capture_waiting_ = false;  // a Render() is waiting for coverage
   int capture_wait_timeouts_ = 0;
   base::WeakPtr<VideoRendererImpl> capture_weak_this_;
 

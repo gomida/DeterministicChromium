@@ -356,6 +356,7 @@ class MEDIA_EXPORT AudioRendererImpl
   const bool capture_mode_;
   base::ConditionVariable capture_frames_cv_;
   bool capture_wait_cancelled_ = false;
+  base::WeakPtr<AudioRendererImpl> capture_weak_this_;
   void WaitForBufferedAudio_Locked(int frames_requested);
 
   // Algorithm for scaling audio.

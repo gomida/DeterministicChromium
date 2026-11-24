@@ -146,7 +146,7 @@ std::optional<SinkError> RawFrameSink::OpenRing() {
   ring_width_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffWidth));
   ring_height_ = static_cast<int>(LoadPlain<uint32_t>(ring_, ring::kOffHeight));
   const uint64_t needed = ring::kHeaderBytes + static_cast<uint64_t>(slot_count_) * slot_bytes_;
-  if (slot_count_ == 0 || slot_bytes_ < ring::kSlotHeaderBytes + video_bytes_ || needed > ring_size_ ||
+  if (slot_count_ == 0 || slot_bytes_ < ring::kSlotHeaderBytes + video_bytes_ + ring_audio_bytes_ || needed > ring_size_ ||
       video_bytes_ != CanonicalBytes(ring_width_, ring_height_)) {
     return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring geometry is inconsistent"};
   }

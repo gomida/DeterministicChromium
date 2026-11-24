@@ -343,6 +343,7 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
         // The renderer installs the capture agent and audio sinks when set.
         switches::kDeterministicCapture,
         switches::kDeterministicCaptureAudio,
+        switches::kDeterministicCaptureSeed,
         switches::kDisablePDFTagging,
     };
     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);

@@ -8,11 +8,13 @@
 
 #include "base/check_deref.h"
 #include "base/command_line.h"
+#include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
 #include "content/public/common/web_identity.h"
 #include "content/public/renderer/render_thread.h"
 #include "headless/lib/common/headless_features.h"
 #include "headless/lib/renderer/capture_agent.h"
+#include "headless/lib/renderer/capture_random.h"
 #include "headless/public/switches.h"
 #include "media/base/video_codecs.h"
 #include "printing/buildflags/buildflags.h"
@@ -96,6 +98,11 @@ namespace headless {
 HeadlessContentRendererClient::HeadlessContentRendererClient() {
   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
           switches::kDeterministicCapture)) {
+    uint64_t seed = 1;
+    base::StringToUint64(base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+                             switches::kDeterministicCaptureSeed),
+                         &seed);
+    InstallDeterministicRandom(seed);
     capture_audio_factory_ = std::make_unique<CaptureAudioDeviceFactory>();
   }
   const auto& command_line =

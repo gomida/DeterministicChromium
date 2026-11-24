@@ -49,6 +49,10 @@ inline constexpr char kDeterministicCapture[] = "deterministic-capture";
 inline constexpr char kDeterministicCaptureAudio[] =
     "deterministic-capture-audio";
 
+// Seed of the renderer's replacement entropy source (crypto.getRandomValues,
+// UUIDs, blob URLs) under --deterministic-capture; default 1.
+inline constexpr char kDeterministicCaptureSeed[] = "deterministic-capture-seed";
+
 // Whether cookies stored as part of user profile are encrypted.
 inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
 

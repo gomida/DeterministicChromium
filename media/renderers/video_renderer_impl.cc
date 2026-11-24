@@ -842,6 +842,8 @@ void VideoRendererImpl::WaitForCoveringFrames_Locked(
   constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
   const base::TimeTicks give_up =
       base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
+  capture_waiting_ = true;
+  absl::Cleanup done = [this] { capture_waiting_ = false; };
   while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
          state_ == kPlaying) {
     if (algorithm_->frames_queued() > 0 &&
@@ -879,7 +881,13 @@ void VideoRendererImpl::AttemptRead_Locked() {
   if (pending_read_ || received_end_of_stream_)
     return;
 
-  if (HaveReachedBufferingCap(max_buffered_frames_))
+  // While a capture-mode Render() waits for frames covering its deadline, the
+  // soft cap must not stop reads (a source faster than 3x the capture rate
+  // needs more than four frames per interval); the absolute cap still holds.
+  const bool capture_needs_more =
+      capture_mode_ && capture_waiting_ &&
+      algorithm_->frames_queued() < static_cast<size_t>(kAbsoluteMaxFrames);
+  if (HaveReachedBufferingCap(max_buffered_frames_) && !capture_needs_more)
     return;
 
   switch (state_) {

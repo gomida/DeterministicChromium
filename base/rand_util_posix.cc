@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "base/rand_util.h"
+#include "base/rand_util_deterministic_capture.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +22,8 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+
+#include <atomic>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -92,7 +95,14 @@ bool GetRandomSyscall(void* output, size_t output_length) {
 #endif  // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) ||
         // BUILDFLAG(IS_ANDROID)
 
+std::atomic<subtle::RandBytesOverrideFunction> g_rand_bytes_override{nullptr};
+
 void RandBytesInternal(span<uint8_t> output, bool avoid_allocation) {
+  if (subtle::RandBytesOverrideFunction override =
+          g_rand_bytes_override.load(std::memory_order_acquire)) {
+    override(output);
+    return;
+  }
   if (!avoid_allocation) {
     // BoringSSL's RAND_bytes always returns 1. Any error aborts the program.
     (void)RAND_bytes(output.data(), output.size());
@@ -147,5 +157,13 @@ int GetUrandomFD() {
   return urandom_fd->fd();
 }
 #endif  // !BUILDFLAG(IS_APPLE)
+
+namespace subtle {
+
+void SetRandBytesOverride(RandBytesOverrideFunction function) {
+  g_rand_bytes_override.store(function, std::memory_order_release);
+}
+
+}  // namespace subtle
 
 }  // namespace base

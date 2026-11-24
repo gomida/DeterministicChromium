@@ -26,6 +26,7 @@
 #include "third_party/blink/renderer/core/frame/use_counter_impl.h"
 
 #include "base/metrics/histogram_functions.h"
+#include "base/command_line.h"
 #include "base/metrics/histogram_macros.h"
 #include "base/strings/strcat.h"
 #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
@@ -330,6 +331,15 @@ bool UseCounterImpl::ReportMeasurement(const UseCounterFeature& feature,
 
   if (feature.type() == mojom::blink::UseCounterFeatureType::kWebFeature)
     NotifyFeatureCounted(static_cast<WebFeature>(feature.value()));
+
+  // DeterministicChromium: the capture agent (a RenderFrameObserver) learns
+  // about API use through this notification; captured pages are usually
+  // file:// documents, which otherwise count only on the renderer side.
+  static const bool capture_mode =
+      base::CommandLine::ForCurrentProcess()->HasSwitch("deterministic-capture");
+  if (capture_mode && context_ != kDefaultContext) {
+    client->DidObserveNewFeatureUsage(feature);
+  }
 
   // Report to browser about observed event only when URL is HTTP/HTTPS or
   // isolated-app://, as other URL schemes are filtered out in

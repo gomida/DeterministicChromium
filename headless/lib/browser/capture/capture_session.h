@@ -111,6 +111,7 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
     std::optional<SinkError> sink_error;
     base::TimeDelta hash;
     base::TimeDelta sink;
+    uint32_t audio_frames_written = 0;
   };
   struct PendingAdvance {
     int64_t frame_index;
@@ -207,6 +208,7 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
   std::string pcm_chain_hash_;
   double media_wait_timeout_ms_ = 10000;
   bool fail_on_media_wait_timeout_ = true;
+  bool fail_on_unsupported_api_ = true;
   std::unique_ptr<RawFrameSink> sink_;
   bool sink_wants_frames_ = false;
   scoped_refptr<base::SequencedTaskRunner> worker_;

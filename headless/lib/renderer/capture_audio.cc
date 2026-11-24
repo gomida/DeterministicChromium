@@ -74,12 +74,24 @@ scoped_refptr<base::SingleThreadTaskRunner> CaptureAudioEngine::task_runner() co
 
 void CaptureAudioEngine::AddSink(CaptureAudioRendererSink* sink) {
   base::AutoLock lock(lock_);
-  sinks_.push_back(sink);
+  for (const auto& existing : sinks_) {
+    if (existing.get() == sink) {
+      return;
+    }
+  }
+  sinks_.push_back(base::WrapRefCounted(sink));
 }
 
 void CaptureAudioEngine::RemoveSink(CaptureAudioRendererSink* sink) {
+  scoped_refptr<CaptureAudioRendererSink> dropped;  // released outside the lock
   base::AutoLock lock(lock_);
-  std::erase(sinks_, sink);
+  for (auto it = sinks_.begin(); it != sinks_.end(); ++it) {
+    if (it->get() == sink) {
+      dropped = std::move(*it);
+      sinks_.erase(it);
+      break;
+    }
+  }
 }
 
 void CaptureAudioEngine::NoteUnsupported(const std::string& api) {
@@ -104,7 +116,7 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
                                              scoped_refptr<base::SequencedTaskRunner> reply_runner) {
   const int64_t need64 = frames_through - rendered_through_;
   const int frames = static_cast<int>(std::clamp<int64_t>(need64, 0, 1 << 24));
-  std::vector<raw_ptr<CaptureAudioRendererSink>> sinks;
+  std::vector<scoped_refptr<CaptureAudioRendererSink>> sinks;
   {
     base::AutoLock lock(lock_);
     sinks = sinks_;
@@ -116,7 +128,7 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
     // Virtual time is paused at T_n while this runs; the sinks report it as
     // the delay timestamp so AudioClock reads capture time.
     const base::TimeTicks now = base::TimeTicks::Now();
-    for (CaptureAudioRendererSink* sink : sinks) {
+    for (const auto& sink : sinks) {
       sink->MixInto(mix.get(), frames, now);
     }
     mix->ToInterleaved<media::Float32SampleTypeTraitsNoClip>(base::span<float>(pcm));
@@ -132,13 +144,20 @@ void CaptureAudioEngine::RenderOnAudioThread(int64_t frames_through,
 CaptureAudioRendererSink::CaptureAudioRendererSink(blink::WebAudioDeviceSourceType source_type)
     : source_type_(source_type), engine_(CaptureAudioEngine::Get()) {}
 
-CaptureAudioRendererSink::~CaptureAudioRendererSink() {
-  engine_->RemoveSink(this);
-}
+CaptureAudioRendererSink::~CaptureAudioRendererSink() = default;
 
 void CaptureAudioRendererSink::Initialize(const media::AudioParameters& params,
                                           RenderCallback* callback) {
-  base::AutoLock lock(lock_);
+  {
+    base::AutoLock lock(lock_);
+    InitializeLocked(params, callback);
+  }
+  engine_->AddSink(this);  // engine lock is never taken under the sink lock
+}
+
+void CaptureAudioRendererSink::InitializeLocked(const media::AudioParameters& params,
+                                                RenderCallback* callback) {
+  lock_.AssertAcquired();
   params_ = params;
   callback_ = callback;
   const CaptureAudioFormat& device = engine_->format();
@@ -172,7 +191,6 @@ void CaptureAudioRendererSink::Initialize(const media::AudioParameters& params,
   fifo_.assign(device.channels, {});
   fifo_read_ = 0;
   initialized_ = true;
-  engine_->AddSink(this);
 }
 
 void CaptureAudioRendererSink::Start() {
@@ -181,15 +199,18 @@ void CaptureAudioRendererSink::Start() {
 }
 
 void CaptureAudioRendererSink::Stop() {
-  base::AutoLock lock(lock_);
-  started_ = false;
-  playing_ = false;
-  callback_ = nullptr;
-  initialized_ = false;
-  for (auto& channel : fifo_) {
-    channel.clear();
+  {
+    base::AutoLock lock(lock_);
+    started_ = false;
+    playing_ = false;
+    callback_ = nullptr;
+    initialized_ = false;
+    for (auto& channel : fifo_) {
+      channel.clear();
+    }
+    fifo_read_ = 0;
   }
-  fifo_read_ = 0;
+  engine_->RemoveSink(this);
 }
 
 void CaptureAudioRendererSink::Pause(PauseReason) {
@@ -211,8 +232,8 @@ void CaptureAudioRendererSink::Flush() {
 }
 
 bool CaptureAudioRendererSink::SetVolume(double volume) {
-  base::AutoLock lock(lock_);
-  volume_ = volume;
+  // Lock-free: the media thread may set it while a mix is rendering.
+  volume_.store(volume, std::memory_order_relaxed);
   return true;
 }
 
@@ -260,8 +281,9 @@ void CaptureAudioRendererSink::RenderOneBuffer_Locked(base::TimeTicks now) {
       render_bus_->ZeroFramesPartial(got, render_bus_->frames() - got);
     }
   }
-  if (volume_ != 1.0) {
-    source->Scale(static_cast<float>(volume_));
+  const double volume = volume_.load(std::memory_order_relaxed);
+  if (volume != 1.0) {
+    source->Scale(static_cast<float>(volume));
   }
   media::AudioBus* out = source;
   if (mixer_) {
@@ -291,8 +313,9 @@ void CaptureAudioRendererSink::MixInto(media::AudioBus* mix, int frames, base::T
     if (got < frames) {
       exact_bus_->ZeroFramesPartial(got, frames - got);
     }
-    if (volume_ != 1.0) {
-      exact_bus_->Scale(static_cast<float>(volume_));
+    const double volume = volume_.load(std::memory_order_relaxed);
+    if (volume != 1.0) {
+      exact_bus_->Scale(static_cast<float>(volume));
     }
     media::AudioBus* out = exact_bus_.get();
     if (mixer_) {

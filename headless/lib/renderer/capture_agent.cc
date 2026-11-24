@@ -20,6 +20,8 @@
 #include "base/threading/platform_thread.h"
 #include "base/time/time_override.h"
 #include "content/public/common/isolated_world_ids.h"
+#include "third_party/blink/public/common/use_counter/use_counter_feature.h"
+#include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom.h"
 #include "gin/converter.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
 #include "third_party/blink/public/platform/media/web_capture_media_registry.h"
@@ -68,6 +70,47 @@ void CaptureAgent::OnDestruct() {
 
 void CaptureAgent::DidCreateNewDocument() {
   reported_marks_.clear();
+  unsupported_reported_.clear();
+}
+
+void CaptureAgent::DidObserveNewFeatureUsage(const blink::UseCounterFeature& feature) {
+  // Use counters for APIs whose results depend on real devices, real time or
+  // other processes (DESIGN.md 4.9). The names are the contract's vocabulary.
+  struct Entry {
+    blink::mojom::WebFeature feature;
+    const char* api;
+  };
+  static constexpr Entry kUnsupported[] = {
+    {blink::mojom::WebFeature::kSharedWorkerStart, "SharedWorker"},
+    {blink::mojom::WebFeature::kEncryptedMediaSecureOrigin, "EncryptedMedia"},
+    {blink::mojom::WebFeature::kServiceWorkerControlledPage, "ServiceWorker"},
+    {blink::mojom::WebFeature::kRTCPeerConnectionConstructorConstraints, "RTCPeerConnection"},
+    {blink::mojom::WebFeature::kRTCPeerConnectionConstructorCompliant, "RTCPeerConnection"},
+    {blink::mojom::WebFeature::kGetUserMediaPrefixed, "getUserMedia"},
+    {blink::mojom::WebFeature::kGetUserMediaLegacy, "getUserMedia"},
+    {blink::mojom::WebFeature::kGetUserMediaPromise, "getUserMedia"},
+    {blink::mojom::WebFeature::kGetDisplayMedia, "getDisplayMedia"},
+    {blink::mojom::WebFeature::kCanvasCaptureStream, "captureStream"},
+    {blink::mojom::WebFeature::kMediaRecorder_MimeType, "MediaRecorder"},
+    {blink::mojom::WebFeature::kMediaRecorder_VideoBitsPerSecond, "MediaRecorder"},
+    {blink::mojom::WebFeature::kMediaRecorder_AudioBitsPerSecond, "MediaRecorder"},
+    {blink::mojom::WebFeature::kWebCodecsAudioDecoder, "WebCodecs"},
+    {blink::mojom::WebFeature::kWebCodecsVideoDecoder, "WebCodecs"},
+    {blink::mojom::WebFeature::kWebCodecsVideoEncoder, "WebCodecs"},
+    {blink::mojom::WebFeature::kWebCodecsVideoTrackReader, "WebCodecs"},
+    {blink::mojom::WebFeature::kHTMLMediaElementSetSinkId, "setSinkId"},
+    {blink::mojom::WebFeature::kWebGPURequestAdapter, "WebGPU"},
+    {blink::mojom::WebFeature::kAudioContextSetSinkId, "setSinkId"},
+  };
+  if (feature.type() != blink::mojom::UseCounterFeatureType::kWebFeature) {
+    return;
+  }
+  for (const Entry& entry : kUnsupported) {
+    if (static_cast<uint32_t>(entry.feature) == feature.value() &&
+        unsupported_reported_.insert(entry.api).second) {
+      unsupported_pending_.push_back(entry.api);
+    }
+  }
 }
 
 void CaptureAgent::BindReceiver(
@@ -190,6 +233,10 @@ void CaptureAgent::OnAudioRendered(std::unique_ptr<Pending> pending,
   for (const std::string& api : CaptureAudioEngine::Get()->TakeUnsupported()) {
     result->warnings.push_back("UnsupportedApiUsed: " + api);
   }
+  for (const std::string& api : unsupported_pending_) {
+    result->warnings.push_back("UnsupportedApiUsed: " + api);
+  }
+  unsupported_pending_.clear();
   FlushMediaEvents(std::move(pending), std::move(result), 0);
 }
 

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string_view>
 #include <utility>
 
 #include "base/functional/bind.h"
@@ -177,6 +178,7 @@ void CaptureSession::Configure(base::DictValue config,
     }
   }
   RawFrameSink::Config sink_config;
+  effective_config_ = config.Clone();  // the sections below add their resolved defaults
   if (const base::DictValue* markers = config.FindDict("markers")) {
     if (const std::string* prefix = markers->FindString("prefix")) {
       marker_prefix_ = *prefix;
@@ -220,6 +222,7 @@ void CaptureSession::Configure(base::DictValue config,
       media_wait_timeout_ms_ = *ms;
     }
     fail_on_media_wait_timeout_ = media->FindBool("failOnWaitTimeout").value_or(true);
+    fail_on_unsupported_api_ = media->FindBool("failOnUnsupportedApi").value_or(true);
   }
   base::DictValue effective_markers;
   effective_markers.Set("prefix", marker_prefix_);
@@ -232,6 +235,7 @@ void CaptureSession::Configure(base::DictValue config,
   base::DictValue effective_media;
   effective_media.Set("waitTimeoutMs", media_wait_timeout_ms_);
   effective_media.Set("failOnWaitTimeout", fail_on_media_wait_timeout_);
+  effective_media.Set("failOnUnsupportedApi", fail_on_unsupported_api_);
   effective_config_.Set("media", std::move(effective_media));
   if (const base::DictValue* sink = config.FindDict("frameSink")) {
     const std::string* type = sink->FindString("type");
@@ -264,7 +268,6 @@ void CaptureSession::Configure(base::DictValue config,
   sink_config.audio_channels = static_cast<uint32_t>(audio_channels_);
   sink_config.audio_format = audio_s16_ ? ring::kAudioFormatS16 : ring::kAudioFormatF32;
   sink_ = std::make_unique<RawFrameSink>(sink_config);
-  effective_config_ = config.Clone();
   effective_config_.Set("protocolVersion", kProtocolVersion);
   effective_config_.Set("pixelFormat", kCanonicalPixelFormat);
   // Opening maps the ring or creates the file; keep it off the UI thread.
@@ -403,7 +406,9 @@ void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
   params->render_audio = true;
   params->audio_frames_through = AudioSamplesThrough(index + 1);
   prepare_pending_ = std::move(pending);
-  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
+  // The renderer may spend the quiescence wait plus one 10 s decode wait each
+  // for video and audio before it answers.
+  prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 25000),
                        base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
   agent_->Prepare(std::move(params),
                   base::BindOnce(&CaptureSession::OnPrepared, weak_factory_.GetWeakPtr(), index));
@@ -450,8 +455,18 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
     m.Set("hasAudio", media->has_audio);
     pending->media.Append(std::move(m));
   }
+  static constexpr std::string_view kUnsupportedPrefix = "UnsupportedApiUsed: ";
   for (const std::string& warning : result->warnings) {
     pending->warnings.Append(warning);
+    if (fail_on_unsupported_api_ && warning.starts_with(kUnsupportedPrefix)) {
+      base::DictValue details;
+      details.Set("api", warning.substr(kUnsupportedPrefix.size()));
+      details.Set("frameIndex", static_cast<double>(frame_index));
+      Error err{"UnsupportedApiUsed", warning, std::move(details)};
+      Fail(err);
+      std::move(pending->callback).Run(err, base::DictValue());
+      return;
+    }
   }
   if (result->audio_frames > 0 || !result->pcm.empty()) {
     const int64_t expected = AudioSamplesThrough(frame_index + 1) - AudioSamplesThrough(frame_index);
@@ -486,8 +501,7 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
     pcm_chain_hash_ = ChainHash(pcm_chain_hash_, pending->pcm_frame_hash);
     pending->audio_frames = result->audio_frames;
     if (pending->capture_audio) {
-      pending->audio = std::move(bytes);
-      audio_sample_frames_ += result->audio_frames;
+      pending->audio = std::move(bytes);  // counted when the slot is written
     }
   }
   if (!result->timed_out_players.empty()) {
@@ -648,6 +662,9 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
                 slot.audio = std::move(audio);
                 slot.audio_frames = audio_frames;
                 out.sink_error = sink->Write(slot);
+                if (!out.sink_error) {
+                  out.audio_frames_written = audio_frames;
+                }
                 out.sink = base::TimeTicks::Now() - t1;
               }
               return out;
@@ -673,6 +690,7 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
 
 void CaptureSession::OnFrameProcessed(Processed processed) {
   --inflight_;
+  audio_sample_frames_ += processed.audio_frames_written;
   hash_ms_.push_back(processed.hash.InMillisecondsF());
   sink_ms_.push_back(processed.sink.InMillisecondsF());
   if (!processed.frame_hash.empty()) {
