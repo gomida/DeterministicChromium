@@ -1,0 +1,126 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+#
+# DeterministicChromium: frame-exact capture of a page into raw frames and PCM.
+# The contract is described in deterministic-capture/DESIGN.md. Only available
+# in headless_shell started with --deterministic-capture.
+
+experimental domain DeterministicCapture
+  depends on Page
+
+  # A feature of the engine and the version of its contract.
+  type Feature extends object
+    properties
+      string name
+      integer version
+
+  # Capabilities of this browser. Available on the browser session and on page
+  # sessions. modeEnabled is false when --deterministic-capture is absent; the
+  # other commands are then refused.
+  command getCapabilities
+    returns
+      string protocolVersion
+      string patchVersion
+      boolean modeEnabled
+      object chromium
+      object build
+      array of string pixelFormats
+      array of string colorSpaces
+      array of string frameSinks
+      object audio
+      array of string hash
+      array of Feature features
+      object limits
+      object gpu
+
+  # Configures the capture for this target before the captured document is
+  # navigated. Enables renderer virtual time through the engine's own session.
+  command configure
+    parameters
+      object config
+    returns
+      object effective
+      number virtualTimeTicksBase
+
+  # Advances exactly one frame: virtual-time grant, thread wake, quiescence,
+  # audio render, BeginFrame, readback. Responds after the BeginFrame; hashes of
+  # earlier frames arrive in `completed`.
+  command advance
+    parameters
+      integer frameIndex
+      optional boolean captureVideo
+      optional boolean captureAudio
+      optional boolean hash
+      optional array of object inputs
+    returns
+      integer frameIndex
+      number virtualTimeMs
+      boolean hasSurface
+      boolean hasDamage
+      boolean reusedReadback
+      integer audioSampleFrames
+      optional string pcmFrameHash
+      array of object markers
+      array of object media
+      object timings
+      array of object completed
+      array of string warnings
+
+  # Advances consecutive frames [fromFrameIndex, toFrameIndex) inside the
+  # browser without readback, for chunk pre-roll.
+  command advanceRange
+    parameters
+      integer fromFrameIndex
+      integer toFrameIndex
+      optional boolean captureAudio
+      optional boolean hash
+    returns
+      array of object frames
+      integer nextFrameIndex
+
+  # Closes the sinks and returns totals. Idempotent.
+  command finish
+    returns
+      string status
+      integer framesWritten
+      optional integer expectedFrames
+      integer reusedFrames
+      integer audioSampleFrames
+      optional string chainHash
+      optional string pcmHash
+      object histograms
+      integer gpuProcessCrashes
+      optional object firstSinkError
+      array of object completed
+
+  # Stops without totals; closes the sinks.
+  command abort
+
+  command getState
+    returns
+      string state
+      integer nextFrameIndex
+      optional object lastError
+
+  event sinkError
+    parameters
+      object error
+
+  event mediaWaiting
+    parameters
+      integer frameIndex
+      array of object players
+
+  event unsupportedApiUsed
+    parameters
+      string api
+      integer frameIndex
+
+  event gpuProcessLost
+    parameters
+      integer frameIndex
+
+  event rangeProgress
+    parameters
+      integer frameIndex

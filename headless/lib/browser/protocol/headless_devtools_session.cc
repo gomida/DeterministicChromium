@@ -10,6 +10,8 @@
 #include "content/public/browser/devtools_agent_host_client.h"
 #include "content/public/browser/devtools_agent_host_client_channel.h"
 #include "headless/lib/browser/protocol/browser_handler.h"
+#include "headless/lib/browser/capture/capture_session.h"
+#include "headless/lib/browser/protocol/deterministic_capture_handler.h"
 #include "headless/lib/browser/protocol/emulation_handler.h"
 #include "headless/lib/browser/protocol/headless_handler.h"
 #include "headless/lib/browser/protocol/page_handler.h"
@@ -27,8 +29,14 @@ HeadlessDevToolsSession::HeadlessDevToolsSession(
   CHECK(client_channel_->GetClient()->IsTrusted())
       << "Connection to headless requires a trusted client";
   content::DevToolsAgentHost* agent_host = channel->GetAgentHost();
-  if (agent_host->GetWebContents() &&
-      agent_host->GetType() == content::DevToolsAgentHost::kTypePage) {
+  const bool is_page = agent_host->GetWebContents() &&
+                       agent_host->GetType() ==
+                           content::DevToolsAgentHost::kTypePage;
+  // DeterministicCapture.getCapabilities is available on every session; the
+  // capture commands need a page session.
+  AddHandler(std::make_unique<DeterministicCaptureHandler>(
+      browser_.get(), is_page ? agent_host->GetWebContents() : nullptr));
+  if (is_page) {
     AddHandler(std::make_unique<HeadlessHandler>(browser_.get(),
                                                  agent_host->GetWebContents()));
     AddHandler(std::make_unique<PageHandler>(agent_host,
@@ -63,6 +71,28 @@ void HeadlessDevToolsSession::HandleCommand(
   // content::DevToolsSession receives this message first, so we may
   // assume it's ok.
   DCHECK(dispatchable.ok());
+  // Once a deterministic capture is configured, only the engine's own client
+  // may change renderer virtual time (DESIGN.md 4.2).
+  if (dispatchable.HasCallId() &&
+      crdtp::SpanEquals(crdtp::SpanFrom("Emulation.setVirtualTimePolicy"),
+                        dispatchable.Method())) {
+    content::WebContents* web_contents =
+        client_channel_->GetAgentHost()->GetWebContents();
+    auto* session =
+        web_contents ? capture::CaptureSession::FromWebContents(web_contents)
+                     : nullptr;
+    if (session && session->OwnsVirtualTime() &&
+        !session->IsOwnerClient(client_channel_->GetClient())) {
+      client_channel_->DispatchProtocolMessageToClient(
+          crdtp::CreateErrorResponse(
+              dispatchable.CallId(),
+              crdtp::DispatchResponse::ServerError(
+                  "VirtualTimeOwned: the DeterministicCapture session owns "
+                  "renderer virtual time"))
+              ->Serialize());
+      return;
+    }
+  }
   dispatcher_.Dispatch(dispatchable);
 }
 

@@ -29,6 +29,10 @@
                 "async": ["beginFrame"]
             },
             {
+                "domain": "DeterministicCapture",
+                "async": ["configure", "advance", "advanceRange", "finish"]
+            },
+            {
                 "domain": "Page",
                 "include": ["printToPDF", "getAnnotatedPageContent"],
                 "async": ["printToPDF", "getAnnotatedPageContent"],

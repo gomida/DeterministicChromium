@@ -24,6 +24,7 @@ include domains/DOM.pdl
 include domains/DOMDebugger.pdl
 include domains/DOMSnapshot.pdl
 include domains/DOMStorage.pdl
+include domains/DeterministicCapture.pdl
 include domains/DeviceAccess.pdl
 include domains/DeviceOrientation.pdl
 include domains/DigitalCredentials.pdl
