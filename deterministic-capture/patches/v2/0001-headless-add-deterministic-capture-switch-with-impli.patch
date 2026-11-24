@@ -1,0 +1,130 @@
+From 71cca5765261663a6ad9a823717f05ed91c11686 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 19:17:43 +0900
+Subject: [PATCH 1/3] headless: add --deterministic-capture switch with implied
+ flags
+
+The switch turns on BeginFrameControl, deterministic mode, muted audio with
+the in-process audio service, no-gesture autoplay, software video decoding,
+and disables site isolation, the back-forward cache, prerendering and paint
+holding; it is forwarded to renderer processes. DESIGN.md 4.1 of the
+deterministic-capture project (dev-doc branch).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ headless/lib/browser/command_line_handler.cc  | 46 +++++++++++++++++++
+ .../headless_content_browser_client.cc        |  2 +
+ headless/public/switches.h                    |  6 +++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/headless/lib/browser/command_line_handler.cc b/headless/lib/browser/command_line_handler.cc
+index a034144f44..d9184f145a 100644
+--- a/headless/lib/browser/command_line_handler.cc
++++ b/headless/lib/browser/command_line_handler.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string_view>
+ 
++#include "base/base_switches.h"
+ #include "base/files/file_util.h"
+ #include "base/logging.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -15,6 +16,7 @@
+ #include "components/headless/screen_info/headless_screen_info.h"
+ #include "components/viz/common/switches.h"
+ #include "content/public/common/content_switches.h"
++#include "media/base/media_switches.h"
+ #include "headless/public/switches.h"
+ #include "net/http/http_util.h"
+ #include "net/proxy_resolution/proxy_config.h"
+@@ -54,6 +56,41 @@ void HandleDeterministicModeSwitch(base::CommandLine& command_line) {
+   AppendSwitchMaybe(command_line, ::switches::kDisableCheckerImaging);
+ }
+ 
++
++void AppendCommaListSwitch(base::CommandLine& command_line,
++                           std::string_view switch_constant,
++                           std::string_view values) {
++  std::string merged = command_line.GetSwitchValueASCII(switch_constant);
++  if (!merged.empty()) {
++    merged += ",";
++  }
++  merged += values;
++  command_line.AppendSwitchASCII(switch_constant, merged);
++}
++
++// --deterministic-capture: everything the DeterministicCapture domain needs
++// from the command line, so the controller passes one switch. Features that
++// read real time or add a second process to the media path are turned off.
++void HandleDeterministicCaptureSwitch(base::CommandLine& command_line) {
++  DCHECK(command_line.HasSwitch(switches::kDeterministicCapture));
++  AppendSwitchMaybe(command_line, switches::kDeterministicMode);
++  HandleDeterministicModeSwitch(command_line);
++  AppendSwitchMaybe(command_line, switches::kBlockNewWebContents);
++  // Audio: fake output device only; the renderer-side capture sinks render on
++  // demand. Autoplay must not wait for a user gesture.
++  AppendSwitchMaybe(command_line, ::switches::kDisableAudioOutput);
++  if (!command_line.HasSwitch(::switches::kAutoplayPolicy)) {
++    command_line.AppendSwitchASCII(::switches::kAutoplayPolicy,
++                                   "no-user-gesture-required");
++  }
++  // Software video decoders are bit-exact for a given build.
++  AppendSwitchMaybe(command_line, ::switches::kDisableAcceleratedVideoDecode);
++  AppendCommaListSwitch(
++      command_line, ::switches::kDisableFeatures,
++      "AudioServiceOutOfProcess,MediaSessionService,IsolateOrigins,"
++      "site-per-process,BackForwardCache,Prerender2,PaintHolding");
++}
++
+ bool HandleRemoteDebuggingPort(base::CommandLine& command_line,
+                                HeadlessBrowser::Options& options) {
+   DCHECK(command_line.HasSwitch(::switches::kRemoteDebuggingPort));
+@@ -196,6 +233,15 @@ base::FilePath EnsureDirectoryExists(const base::FilePath& file_path) {
+ 
+ bool HandleCommandLineSwitches(base::CommandLine& command_line,
+                                HeadlessBrowser::Options& options) {
++  if (command_line.HasSwitch(switches::kDeterministicCapture)) {
++    if (command_line.HasSwitch(::switches::kSitePerProcess)) {
++      LOG(ERROR) << "Deterministic capture is not compatible with --"
++                 << ::switches::kSitePerProcess << " switch.";
++      return false;
++    }
++    HandleDeterministicCaptureSwitch(command_line);
++  }
++
+   if (command_line.HasSwitch(switches::kDeterministicMode)) {
+     if (command_line.HasSwitch(::switches::kSitePerProcess)) {
+       LOG(ERROR) << "Deterministic mode is not compatible with --"
+diff --git a/headless/lib/browser/headless_content_browser_client.cc b/headless/lib/browser/headless_content_browser_client.cc
+index 1db3bd21f4..7c6fa1425f 100644
+--- a/headless/lib/browser/headless_content_browser_client.cc
++++ b/headless/lib/browser/headless_content_browser_client.cc
+@@ -340,6 +340,8 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
+         embedder_support::kOriginTrialDisabledFeatures,
+         embedder_support::kOriginTrialPublicKey,
+         switches::kAllowVideoCodecs,
++        // The renderer installs the capture agent and audio sinks when set.
++        switches::kDeterministicCapture,
+         switches::kDisablePDFTagging,
+     };
+     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);
+diff --git a/headless/public/switches.h b/headless/public/switches.h
+index 1ab422fba4..b81b3fafe7 100644
+--- a/headless/public/switches.h
++++ b/headless/public/switches.h
+@@ -37,6 +37,12 @@ inline constexpr char kCrashDumpsDir[] = "crash-dumps-dir";
+ // (experimental).
+ inline constexpr char kDeterministicMode[] = "deterministic-mode";
+ 
++// Deterministic capture engine (experimental, DeterministicChromium). Implies
++// --deterministic-mode plus the audio, media and process flags the
++// DeterministicCapture DevTools domain requires. See
++// deterministic-capture/DESIGN.md in the project repository.
++inline constexpr char kDeterministicCapture[] = "deterministic-capture";
++
+ // Whether cookies stored as part of user profile are encrypted.
+ inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
+ 
+-- 
+2.53.0
+

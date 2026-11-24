@@ -1,3 +1,55 @@
+From e39a7e0743864adfb68a92f7b7a9880712ff5c05 Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 19:17:44 +0900
+Subject: [PATCH 2/3] headless: DeterministicCapture domain, CaptureSession and
+ shared-memory frame sink
+
+Adds the experimental DeterministicCapture CDP domain (getCapabilities,
+configure, advance, advanceRange, finish, abort, getState; protocol 2.1),
+the per-target CaptureSession that owns renderer virtual time through an
+internal DevTools client and refuses Emulation.setVirtualTimePolicy from
+other sessions (VirtualTimeOwned), frame times computed from the frame index
+with a grant before every frame, pipelined hashes in `completed`, and the
+frame sink: the readback bitmap is the canonical form (premultiplied BGRA,
+rows packed), hashed in place with SHA-256 on a worker sequence and copied
+once into the controller's memfd ring (shm_ring.h; fds 5/6/7) or a file.
+Patches 2-5 of DESIGN.md section 7.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ headless/BUILD.gn                             |  13 +
+ headless/DEPS                                 |   1 +
+ headless/lib/browser/DEPS                     |   3 +
+ .../lib/browser/capture/canonical_hash.cc     | 101 +++
+ headless/lib/browser/capture/canonical_hash.h |  50 ++
+ .../lib/browser/capture/capture_session.cc    | 648 ++++++++++++++++++
+ .../lib/browser/capture/capture_session.h     | 203 ++++++
+ .../lib/browser/capture/raw_frame_sink.cc     | 355 ++++++++++
+ headless/lib/browser/capture/raw_frame_sink.h | 129 ++++
+ headless/lib/browser/capture/shm_ring.h       |  66 ++
+ .../lib/browser/capture/virtual_time_owner.cc | 134 ++++
+ .../lib/browser/capture/virtual_time_owner.h  |  75 ++
+ .../protocol/deterministic_capture_handler.cc | 363 ++++++++++
+ .../protocol/deterministic_capture_handler.h  |  96 +++
+ .../protocol/headless_devtools_session.cc     |  34 +-
+ headless/protocol_config.json                 |   4 +
+ .../blink/public/devtools_protocol/BUILD.gn   |   1 +
+ .../devtools_protocol/browser_protocol.pdl    |   1 +
+ .../domains/DeterministicCapture.pdl          | 126 ++++
+ 19 files changed, 2401 insertions(+), 2 deletions(-)
+ create mode 100644 headless/lib/browser/capture/canonical_hash.cc
+ create mode 100644 headless/lib/browser/capture/canonical_hash.h
+ create mode 100644 headless/lib/browser/capture/capture_session.cc
+ create mode 100644 headless/lib/browser/capture/capture_session.h
+ create mode 100644 headless/lib/browser/capture/raw_frame_sink.cc
+ create mode 100644 headless/lib/browser/capture/raw_frame_sink.h
+ create mode 100644 headless/lib/browser/capture/shm_ring.h
+ create mode 100644 headless/lib/browser/capture/virtual_time_owner.cc
+ create mode 100644 headless/lib/browser/capture/virtual_time_owner.h
+ create mode 100644 headless/lib/browser/protocol/deterministic_capture_handler.cc
+ create mode 100644 headless/lib/browser/protocol/deterministic_capture_handler.h
+ create mode 100644 third_party/blink/public/devtools_protocol/domains/DeterministicCapture.pdl
+
 diff --git a/headless/BUILD.gn b/headless/BUILD.gn
 index c7a1c81aa3..dfc1a56d8f 100644
 --- a/headless/BUILD.gn
@@ -1877,97 +1929,6 @@ index 0000000000..7dfa65c8ac
 +}  // namespace headless::capture
 +
 +#endif  // HEADLESS_LIB_BROWSER_CAPTURE_VIRTUAL_TIME_OWNER_H_
-diff --git a/headless/lib/browser/command_line_handler.cc b/headless/lib/browser/command_line_handler.cc
-index a034144f44..d9184f145a 100644
---- a/headless/lib/browser/command_line_handler.cc
-+++ b/headless/lib/browser/command_line_handler.cc
-@@ -6,6 +6,7 @@
- 
- #include <string_view>
- 
-+#include "base/base_switches.h"
- #include "base/files/file_util.h"
- #include "base/logging.h"
- #include "base/strings/string_number_conversions.h"
-@@ -15,6 +16,7 @@
- #include "components/headless/screen_info/headless_screen_info.h"
- #include "components/viz/common/switches.h"
- #include "content/public/common/content_switches.h"
-+#include "media/base/media_switches.h"
- #include "headless/public/switches.h"
- #include "net/http/http_util.h"
- #include "net/proxy_resolution/proxy_config.h"
-@@ -54,6 +56,41 @@ void HandleDeterministicModeSwitch(base::CommandLine& command_line) {
-   AppendSwitchMaybe(command_line, ::switches::kDisableCheckerImaging);
- }
- 
-+
-+void AppendCommaListSwitch(base::CommandLine& command_line,
-+                           std::string_view switch_constant,
-+                           std::string_view values) {
-+  std::string merged = command_line.GetSwitchValueASCII(switch_constant);
-+  if (!merged.empty()) {
-+    merged += ",";
-+  }
-+  merged += values;
-+  command_line.AppendSwitchASCII(switch_constant, merged);
-+}
-+
-+// --deterministic-capture: everything the DeterministicCapture domain needs
-+// from the command line, so the controller passes one switch. Features that
-+// read real time or add a second process to the media path are turned off.
-+void HandleDeterministicCaptureSwitch(base::CommandLine& command_line) {
-+  DCHECK(command_line.HasSwitch(switches::kDeterministicCapture));
-+  AppendSwitchMaybe(command_line, switches::kDeterministicMode);
-+  HandleDeterministicModeSwitch(command_line);
-+  AppendSwitchMaybe(command_line, switches::kBlockNewWebContents);
-+  // Audio: fake output device only; the renderer-side capture sinks render on
-+  // demand. Autoplay must not wait for a user gesture.
-+  AppendSwitchMaybe(command_line, ::switches::kDisableAudioOutput);
-+  if (!command_line.HasSwitch(::switches::kAutoplayPolicy)) {
-+    command_line.AppendSwitchASCII(::switches::kAutoplayPolicy,
-+                                   "no-user-gesture-required");
-+  }
-+  // Software video decoders are bit-exact for a given build.
-+  AppendSwitchMaybe(command_line, ::switches::kDisableAcceleratedVideoDecode);
-+  AppendCommaListSwitch(
-+      command_line, ::switches::kDisableFeatures,
-+      "AudioServiceOutOfProcess,MediaSessionService,IsolateOrigins,"
-+      "site-per-process,BackForwardCache,Prerender2,PaintHolding");
-+}
-+
- bool HandleRemoteDebuggingPort(base::CommandLine& command_line,
-                                HeadlessBrowser::Options& options) {
-   DCHECK(command_line.HasSwitch(::switches::kRemoteDebuggingPort));
-@@ -196,6 +233,15 @@ base::FilePath EnsureDirectoryExists(const base::FilePath& file_path) {
- 
- bool HandleCommandLineSwitches(base::CommandLine& command_line,
-                                HeadlessBrowser::Options& options) {
-+  if (command_line.HasSwitch(switches::kDeterministicCapture)) {
-+    if (command_line.HasSwitch(::switches::kSitePerProcess)) {
-+      LOG(ERROR) << "Deterministic capture is not compatible with --"
-+                 << ::switches::kSitePerProcess << " switch.";
-+      return false;
-+    }
-+    HandleDeterministicCaptureSwitch(command_line);
-+  }
-+
-   if (command_line.HasSwitch(switches::kDeterministicMode)) {
-     if (command_line.HasSwitch(::switches::kSitePerProcess)) {
-       LOG(ERROR) << "Deterministic mode is not compatible with --"
-diff --git a/headless/lib/browser/headless_content_browser_client.cc b/headless/lib/browser/headless_content_browser_client.cc
-index 1db3bd21f4..7c6fa1425f 100644
---- a/headless/lib/browser/headless_content_browser_client.cc
-+++ b/headless/lib/browser/headless_content_browser_client.cc
-@@ -340,6 +340,8 @@ void HeadlessContentBrowserClient::AppendExtraCommandLineSwitches(
-         embedder_support::kOriginTrialDisabledFeatures,
-         embedder_support::kOriginTrialPublicKey,
-         switches::kAllowVideoCodecs,
-+        // The renderer installs the capture agent and audio sinks when set.
-+        switches::kDeterministicCapture,
-         switches::kDisablePDFTagging,
-     };
-     command_line->CopySwitchesFrom(old_command_line, kForwardSwitches);
 diff --git a/headless/lib/browser/protocol/deterministic_capture_handler.cc b/headless/lib/browser/protocol/deterministic_capture_handler.cc
 new file mode 100644
 index 0000000000..4ecbc2b065
@@ -2513,23 +2474,6 @@ index ed40b42c3b..4d73dd8040 100644
              {
                  "domain": "Page",
                  "include": ["printToPDF", "getAnnotatedPageContent"],
-diff --git a/headless/public/switches.h b/headless/public/switches.h
-index 1ab422fba4..b81b3fafe7 100644
---- a/headless/public/switches.h
-+++ b/headless/public/switches.h
-@@ -37,6 +37,12 @@ inline constexpr char kCrashDumpsDir[] = "crash-dumps-dir";
- // (experimental).
- inline constexpr char kDeterministicMode[] = "deterministic-mode";
- 
-+// Deterministic capture engine (experimental, DeterministicChromium). Implies
-+// --deterministic-mode plus the audio, media and process flags the
-+// DeterministicCapture DevTools domain requires. See
-+// deterministic-capture/DESIGN.md in the project repository.
-+inline constexpr char kDeterministicCapture[] = "deterministic-capture";
-+
- // Whether cookies stored as part of user profile are encrypted.
- inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
- 
 diff --git a/third_party/blink/public/devtools_protocol/BUILD.gn b/third_party/blink/public/devtools_protocol/BUILD.gn
 index 4a061691cb..98a2d63c8c 100644
 --- a/third_party/blink/public/devtools_protocol/BUILD.gn
@@ -2686,68 +2630,6 @@ index 0000000000..d3d3b94f1d
 +  event rangeProgress
 +    parameters
 +      integer frameIndex
-diff --git a/third_party/blink/renderer/core/loader/document_load_timing.cc b/third_party/blink/renderer/core/loader/document_load_timing.cc
-index af6a5cb3ed..314498d449 100644
---- a/third_party/blink/renderer/core/loader/document_load_timing.cc
-+++ b/third_party/blink/renderer/core/loader/document_load_timing.cc
-@@ -25,6 +25,7 @@
- 
- #include "third_party/blink/renderer/core/loader/document_load_timing.h"
- 
-+#include "base/command_line.h"
- #include "base/memory/scoped_refptr.h"
- #include "services/network/public/mojom/timing_allow_origin.mojom-blink.h"
- #include "third_party/blink/renderer/core/frame/local_frame.h"
-@@ -128,6 +129,15 @@ void DocumentLoadTiming::SetNavigationStart(base::TimeTicks navigation_start) {
-   // navigationStart. We must set these to the current time if they haven't
-   // been set yet in order to have a valid reference time in both units.
-   EnsureReferenceTimesSet();
-+  // DeterministicChromium: the embedder's navigationStart is browser-process
-+  // wall time. Under --deterministic-capture the renderer runs on virtual time
-+  // and every document, animation timeline and performance.timeOrigin must
-+  // derive from it, so the time origin is the (frozen) virtual now instead.
-+  // Otherwise animations are sampled at a per-run sub-millisecond offset.
-+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          "deterministic-capture")) {
-+    navigation_start = base::TimeTicks::Now();
-+  }
-   navigation_start_ = navigation_start;
-   TRACE_EVENT_MARK_WITH_TIMESTAMP2(
-       "blink.user_timing", "navigationStart", navigation_start_, "frame",
-diff --git a/third_party/blink/renderer/core/timing/time_clamper.cc b/third_party/blink/renderer/core/timing/time_clamper.cc
-index 9ce8552a9d..155e4d7cbd 100644
---- a/third_party/blink/renderer/core/timing/time_clamper.cc
-+++ b/third_party/blink/renderer/core/timing/time_clamper.cc
-@@ -7,6 +7,7 @@
- #include <cmath>
- 
- #include "base/bit_cast.h"
-+#include "base/command_line.h"
- #include "base/rand_util.h"
- 
- namespace blink {
-@@ -15,7 +16,23 @@ namespace {
- const int64_t kTenLowerDigitsMod = 10000000000;
- }  // namespace
- 
--TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
-+namespace {
-+
-+// DeterministicChromium: the clamping threshold is derived from a per-instance
-+// random secret, so the 100 us rounding of performance.now() and of animation
-+// timeline time differs between runs. Under --deterministic-capture the secret
-+// is a constant; the web-visible resolution is unchanged.
-+uint64_t ClamperSecret() {
-+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
-+          "deterministic-capture")) {
-+    return uint64_t{0x5DC0DE2026111CA9};
-+  }
-+  return base::RandUint64();
-+}
-+
-+}  // namespace
-+
-+TimeClamper::TimeClamper() : secret_(ClamperSecret()) {}
- 
- // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
- base::TimeDelta TimeClamper::ClampTimeResolution(
+-- 
+2.53.0
+

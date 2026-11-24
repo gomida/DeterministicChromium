@@ -60,6 +60,17 @@ utvideo, magicyuv, ffvhuff, rawvideo, PCM and FLAC encoders, h264/hevc NVENC
 (headers vendored, libraries loaded at run time), MP4/MOV/Matroska/WAV muxers,
 the matching demuxers and the file protocol. License: LGPL 2.1.
 
+## Release binaries
+
+GitHub releases carry `dcap-<version>-linux-x64.tar.zst` (the controller and
+encoder, built with `cargo build --release`) and
+`headless_shell-<chromium>-dcap-<version>-linux-x64.tar.zst` (the patched
+browser with its runtime files: pak and snapshot files, `icudtl.dat`,
+`chrome_crashpad_handler`, ANGLE `libEGL.so`/`libGLESv2.so`, SwiftShader and
+the Vulkan loader), with `SHA256SUMS`. The browser archive is built from
+`build/x64-dev.gn`; it runs on the Mesa D3D12 path and SwiftShader. Extract
+both and point `dcap render --browser` at the extracted `headless_shell`.
+
 ## Run
 
 ```bash

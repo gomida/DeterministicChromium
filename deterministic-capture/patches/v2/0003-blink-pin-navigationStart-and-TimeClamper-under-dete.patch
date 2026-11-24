@@ -1,0 +1,86 @@
+From ab28126233e7fd2e1845aef3f8930e2bcfeb309e Mon Sep 17 00:00:00 2001
+From: Sunwoong Joo <gomida@gmail.com>
+Date: Tue, 24 Nov 2026 19:17:44 +0900
+Subject: [PATCH 3/3] blink: pin navigationStart and TimeClamper under
+ --deterministic-capture
+
+navigationStart came from browser wall time and shifted performance.timeOrigin
+and animation timelines by a per-run sub-millisecond offset; it now snaps to
+virtual now. TimeClamper rounded with a per-instance random secret, so the
+same frame sampled an animation at 16.6 or 16.7 ms; the secret is constant in
+capture mode. Both were found by comparing frame hashes across runs.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../core/loader/document_load_timing.cc       | 10 ++++++++++
+ .../renderer/core/timing/time_clamper.cc      | 19 ++++++++++++++++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/blink/renderer/core/loader/document_load_timing.cc b/third_party/blink/renderer/core/loader/document_load_timing.cc
+index af6a5cb3ed..314498d449 100644
+--- a/third_party/blink/renderer/core/loader/document_load_timing.cc
++++ b/third_party/blink/renderer/core/loader/document_load_timing.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "third_party/blink/renderer/core/loader/document_load_timing.h"
+ 
++#include "base/command_line.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "services/network/public/mojom/timing_allow_origin.mojom-blink.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -128,6 +129,15 @@ void DocumentLoadTiming::SetNavigationStart(base::TimeTicks navigation_start) {
+   // navigationStart. We must set these to the current time if they haven't
+   // been set yet in order to have a valid reference time in both units.
+   EnsureReferenceTimesSet();
++  // DeterministicChromium: the embedder's navigationStart is browser-process
++  // wall time. Under --deterministic-capture the renderer runs on virtual time
++  // and every document, animation timeline and performance.timeOrigin must
++  // derive from it, so the time origin is the (frozen) virtual now instead.
++  // Otherwise animations are sampled at a per-run sub-millisecond offset.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "deterministic-capture")) {
++    navigation_start = base::TimeTicks::Now();
++  }
+   navigation_start_ = navigation_start;
+   TRACE_EVENT_MARK_WITH_TIMESTAMP2(
+       "blink.user_timing", "navigationStart", navigation_start_, "frame",
+diff --git a/third_party/blink/renderer/core/timing/time_clamper.cc b/third_party/blink/renderer/core/timing/time_clamper.cc
+index 9ce8552a9d..155e4d7cbd 100644
+--- a/third_party/blink/renderer/core/timing/time_clamper.cc
++++ b/third_party/blink/renderer/core/timing/time_clamper.cc
+@@ -7,6 +7,7 @@
+ #include <cmath>
+ 
+ #include "base/bit_cast.h"
++#include "base/command_line.h"
+ #include "base/rand_util.h"
+ 
+ namespace blink {
+@@ -15,7 +16,23 @@ namespace {
+ const int64_t kTenLowerDigitsMod = 10000000000;
+ }  // namespace
+ 
+-TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
++namespace {
++
++// DeterministicChromium: the clamping threshold is derived from a per-instance
++// random secret, so the 100 us rounding of performance.now() and of animation
++// timeline time differs between runs. Under --deterministic-capture the secret
++// is a constant; the web-visible resolution is unchanged.
++uint64_t ClamperSecret() {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "deterministic-capture")) {
++    return uint64_t{0x5DC0DE2026111CA9};
++  }
++  return base::RandUint64();
++}
++
++}  // namespace
++
++TimeClamper::TimeClamper() : secret_(ClamperSecret()) {}
+ 
+ // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
+ base::TimeDelta TimeClamper::ClampTimeResolution(
+-- 
+2.53.0
+
