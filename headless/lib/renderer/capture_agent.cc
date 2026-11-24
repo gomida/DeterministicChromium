@@ -4,6 +4,8 @@
 
 #include "headless/lib/renderer/capture_agent.h"
 
+#include "headless/lib/renderer/capture_audio.h"
+
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -143,7 +145,7 @@ void CaptureAgent::Quiesce(std::unique_ptr<Pending> pending) {
         result->timed_out_players.push_back(p.player_id);
       }
     }
-    FlushMediaEvents(std::move(pending), std::move(result), 0);
+    RenderAudio(std::move(pending), std::move(result));
     return;
   }
   ++pending->rounds;
@@ -159,6 +161,36 @@ void CaptureAgent::Quiesce(std::unique_ptr<Pending> pending) {
                             base::PlatformThread::Sleep(base::Microseconds(250));
                           }),
                           std::move(next));
+}
+
+void CaptureAgent::RenderAudio(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result) {
+  // Step 4: pull every capture sink through S(n+1) frames on the capture
+  // audio thread and take the interval's mix.
+  if (!pending->params->render_audio) {
+    FlushMediaEvents(std::move(pending), std::move(result), 0);
+    return;
+  }
+  const int64_t through = pending->params->audio_frames_through;
+  CaptureAudioEngine::Get()->RenderThrough(
+      through, base::BindOnce(&CaptureAgent::OnAudioRendered, weak_factory_.GetWeakPtr(),
+                              std::move(pending), std::move(result)));
+}
+
+void CaptureAgent::OnAudioRendered(std::unique_ptr<Pending> pending,
+                                   mojom::PrepareResultPtr result,
+                                   std::vector<float> pcm,
+                                   uint32_t frames,
+                                   int sinks) {
+  const CaptureAudioFormat& format = CaptureAudioEngine::Get()->format();
+  result->pcm = std::move(pcm);
+  result->audio_frames = frames;
+  result->audio_channels = format.channels;
+  result->audio_rate = format.rate;
+  result->audio_sinks = sinks;
+  for (const std::string& api : CaptureAudioEngine::Get()->TakeUnsupported()) {
+    result->warnings.push_back("UnsupportedApiUsed: " + api);
+  }
+  FlushMediaEvents(std::move(pending), std::move(result), 0);
 }
 
 void CaptureAgent::FlushMediaEvents(std::unique_ptr<Pending> pending,

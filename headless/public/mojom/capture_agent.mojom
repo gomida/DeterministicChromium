@@ -17,6 +17,10 @@ struct PrepareParams {
   bool collect_marks;
   // Upper bound for the media quiescence wait.
   double wait_timeout_ms;
+  // Step 4: render every capture audio sink through this many device sample
+  // frames since the capture started (S(n+1)) and return the interval's mix.
+  bool render_audio;
+  int64 audio_frames_through;
 };
 
 struct CaptureMarker {
@@ -46,6 +50,13 @@ struct PrepareResult {
   double audio_ms;
   // Players that were still unstable when wait_timeout_ms expired.
   array<int32> timed_out_players;
+  // Interleaved float PCM of the interval (audio_frames * audio_channels
+  // samples) in the device format; empty when render_audio was false.
+  array<float> pcm;
+  uint32 audio_frames;
+  int32 audio_channels;
+  int32 audio_rate;
+  int32 audio_sinks;
   array<string> warnings;
 };
 

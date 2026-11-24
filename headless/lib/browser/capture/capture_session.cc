@@ -5,6 +5,7 @@
 #include "headless/lib/browser/capture/capture_session.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 #include "base/functional/bind.h"
@@ -16,6 +17,7 @@
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
 #include "headless/lib/browser/capture/canonical_hash.h"
+#include "headless/lib/browser/capture/shm_ring.h"
 #include "headless/lib/browser/headless_web_contents_impl.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
 #include "third_party/skia/include/core/SkBitmap.h"
@@ -108,6 +110,12 @@ base::TimeTicks CaptureSession::FrameTicks(int64_t frame_index) const {
          base::Microseconds(FrameOffsetMicros(frame_index + 1));
 }
 
+int64_t CaptureSession::AudioSamplesThrough(int64_t frame_index) const {
+  // Mirrors dcap's FrameRate::samples_through; the products stay below 2^63
+  // for any practical frame count (1e6 frames * 192000 * 1001 < 2e14).
+  return frame_index * audio_rate_ * frame_rate_.den / frame_rate_.num;
+}
+
 void CaptureSession::Fail(Error error) {
   if (!last_error_) {
     last_error_ = error;
@@ -142,7 +150,7 @@ void CaptureSession::Configure(base::DictValue config,
     return;
   }
   // Feature negotiation: everything this build implements.
-  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare"};
+  static constexpr const char* kImplemented[] = {"pipelinedAdvance", "advanceRange", "shmSink", "canonicalBgra", "markers", "prepare", "audioRender"};
   if (const base::ListValue* required = config.FindList("requiredFeatures")) {
     for (const base::Value& feature : *required) {
       const std::string* name = feature.GetIfString();
@@ -183,6 +191,30 @@ void CaptureSession::Configure(base::DictValue config,
       }
     }
   }
+  if (const base::DictValue* audio = config.FindDict("audio")) {
+    if (const base::DictValue* device = audio->FindDict("deviceFormat")) {
+      audio_rate_ = device->FindInt("rate").value_or(audio_rate_);
+      audio_channels_ = device->FindInt("channels").value_or(audio_channels_);
+    }
+    if (const std::string* fmt = audio->FindString("sampleFormat")) {
+      if (*fmt != "s16" && *fmt != "f32") {
+        std::move(callback).Run(Error{"AudioFormatUnsupported", "audio.sampleFormat must be s16 or f32"}, base::DictValue());
+        return;
+      }
+      audio_s16_ = *fmt == "s16";
+    }
+    if (audio_rate_ < 8000 || audio_rate_ > 192000 || audio_channels_ < 1 || audio_channels_ > 8) {
+      std::move(callback).Run(Error{"AudioFormatUnsupported", "audio.deviceFormat out of range"}, base::DictValue());
+      return;
+    }
+  }
+  base::DictValue effective_audio;
+  base::DictValue effective_device;
+  effective_device.Set("rate", audio_rate_);
+  effective_device.Set("channels", audio_channels_);
+  effective_audio.Set("deviceFormat", std::move(effective_device));
+  effective_audio.Set("sampleFormat", audio_s16_ ? "s16" : "f32");
+  effective_config_.Set("audio", std::move(effective_audio));
   if (const base::DictValue* media = config.FindDict("media")) {
     if (std::optional<double> ms = media->FindDouble("waitTimeoutMs")) {
       media_wait_timeout_ms_ = *ms;
@@ -228,6 +260,9 @@ void CaptureSession::Configure(base::DictValue config,
     sink_config.stall_timeout = stall_timeout_;
   }
   sink_wants_frames_ = sink_config.type != RawFrameSink::Type::kNull;
+  sink_config.audio_rate = static_cast<uint32_t>(audio_rate_);
+  sink_config.audio_channels = static_cast<uint32_t>(audio_channels_);
+  sink_config.audio_format = audio_s16_ ? ring::kAudioFormatS16 : ring::kAudioFormatF32;
   sink_ = std::make_unique<RawFrameSink>(sink_config);
   effective_config_ = config.Clone();
   effective_config_.Set("protocolVersion", kProtocolVersion);
@@ -363,6 +398,10 @@ void CaptureSession::PrepareFrame(std::unique_ptr<PendingAdvance> pending) {
   params->marker_prefix = marker_prefix_;
   params->collect_marks = collect_marks_;
   params->wait_timeout_ms = media_wait_timeout_ms_;
+  // Audio is always rendered so media clocks advance; it is written to the
+  // sink only when captureAudio is set (DESIGN.md 4.3).
+  params->render_audio = true;
+  params->audio_frames_through = AudioSamplesThrough(index + 1);
   prepare_pending_ = std::move(pending);
   prepare_timer_.Start(FROM_HERE, base::Milliseconds(media_wait_timeout_ms_ + 5000),
                        base::BindOnce(&CaptureSession::OnPrepareTimeout, weak_factory_.GetWeakPtr()));
@@ -413,6 +452,43 @@ void CaptureSession::OnPrepared(int64_t frame_index, mojom::PrepareResultPtr res
   }
   for (const std::string& warning : result->warnings) {
     pending->warnings.Append(warning);
+  }
+  if (result->audio_frames > 0 || !result->pcm.empty()) {
+    const int64_t expected = AudioSamplesThrough(frame_index + 1) - AudioSamplesThrough(frame_index);
+    if (static_cast<int64_t>(result->audio_frames) != expected ||
+        result->pcm.size() != static_cast<size_t>(result->audio_frames) * audio_channels_ ||
+        result->audio_channels != audio_channels_ || result->audio_rate != audio_rate_) {
+      base::DictValue details;
+      details.Set("frameIndex", static_cast<double>(frame_index));
+      details.Set("expectedFrames", static_cast<double>(expected));
+      details.Set("frames", static_cast<double>(result->audio_frames));
+      details.Set("rendererRate", result->audio_rate);
+      details.Set("rendererChannels", result->audio_channels);
+      Error err{"AudioFormatUnsupported", "renderer audio does not match the configured device format", std::move(details)};
+      Fail(err);
+      std::move(pending->callback).Run(err, base::DictValue());
+      return;
+    }
+    auto bytes = std::make_shared<std::vector<uint8_t>>();
+    if (audio_s16_) {
+      bytes->resize(result->pcm.size() * 2);
+      for (size_t i = 0; i < result->pcm.size(); ++i) {
+        const float v = std::clamp(result->pcm[i], -1.0f, 1.0f);
+        const int16_t s = static_cast<int16_t>(std::lrintf(v * 32767.0f));
+        (*bytes)[2 * i] = static_cast<uint8_t>(s & 0xff);
+        (*bytes)[2 * i + 1] = static_cast<uint8_t>((s >> 8) & 0xff);
+      }
+    } else {
+      bytes->resize(result->pcm.size() * 4);
+      memcpy(bytes->data(), result->pcm.data(), bytes->size());
+    }
+    pending->pcm_frame_hash = Sha256Hex(base::span<const uint8_t>(*bytes));
+    pcm_chain_hash_ = ChainHash(pcm_chain_hash_, pending->pcm_frame_hash);
+    pending->audio_frames = result->audio_frames;
+    if (pending->capture_audio) {
+      pending->audio = std::move(bytes);
+      audio_sample_frames_ += result->audio_frames;
+    }
   }
   if (!result->timed_out_players.empty()) {
     base::DictValue details;
@@ -548,7 +624,8 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
         FROM_HERE,
         base::BindOnce(
             [](std::shared_ptr<const SkBitmap> frame, int64_t index, int64_t virtual_time_us,
-               bool hash, bool write, RawFrameSink* sink) {
+               bool hash, bool write, std::shared_ptr<const std::vector<uint8_t>> audio,
+               uint32_t audio_frames, RawFrameSink* sink) {
               Processed out{index};
               const base::TimeTicks t0 = base::TimeTicks::Now();
               std::optional<Sha256Digest> digest;
@@ -568,12 +645,15 @@ void CaptureSession::OnFrameFinished(std::unique_ptr<PendingAdvance> pending,
                 slot.virtual_time_us = virtual_time_us;
                 slot.bitmap = std::move(frame);
                 slot.hash = digest;
+                slot.audio = std::move(audio);
+                slot.audio_frames = audio_frames;
                 out.sink_error = sink->Write(slot);
                 out.sink = base::TimeTicks::Now() - t1;
               }
               return out;
             },
-            frame_bitmap, index, virtual_time_us, hash, write, base::Unretained(sink_.get())),
+            frame_bitmap, index, virtual_time_us, hash, write, pending->audio, pending->audio_frames,
+            base::Unretained(sink_.get())),
         base::BindOnce(&CaptureSession::OnFrameProcessed, weak_factory_.GetWeakPtr()));
     if (pending->capture_video) {
       ++frames_written_;
@@ -650,7 +730,10 @@ void CaptureSession::Respond(std::unique_ptr<PendingAdvance> pending,
   r.Set("hasDamage", has_damage);
   r.Set("reusedReadback", reused);
   r.Set("surfaceWarmed", pending->retried_for_surface);
-  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
+  r.Set("audioSampleFrames", static_cast<double>(pending->audio_frames));
+  if (!pending->pcm_frame_hash.empty()) {
+    r.Set("pcmFrameHash", pending->pcm_frame_hash);
+  }
   r.Set("markers", std::move(pending->markers));
   r.Set("media", std::move(pending->media));
   base::DictValue timings;
@@ -756,9 +839,12 @@ void CaptureSession::OnDrained(ResultCallback callback) {
     r.Set("expectedFrames", static_cast<double>(expected_frames_));
   }
   r.Set("reusedFrames", static_cast<double>(reused_frames_));
-  r.Set("audioSampleFrames", 0);  // TODO(patch 7)
+  r.Set("audioSampleFrames", static_cast<double>(audio_sample_frames_));
   if (!chain_hash_.empty()) {
     r.Set("chainHash", chain_hash_);
+  }
+  if (!pcm_chain_hash_.empty()) {
+    r.Set("pcmHash", pcm_chain_hash_);
   }
   base::DictValue histograms;
   histograms.Set("grantMs", Histogram(grant_ms_));

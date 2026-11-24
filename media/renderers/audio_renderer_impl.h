@@ -27,6 +27,7 @@
 #include "base/memory/raw_ptr.h"
 #include "base/memory/weak_ptr.h"
 #include "base/power_monitor/power_observer.h"
+#include "base/synchronization/condition_variable.h"
 #include "base/synchronization/lock.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
@@ -345,6 +346,17 @@ class MEDIA_EXPORT AudioRendererImpl
   // After Initialize() has completed, all variables below must be accessed
   // under |lock_|. ------------------------------------------------------------
   base::Lock lock_;
+
+  // DeterministicChromium (deterministic-capture/DESIGN.md 4.5): in capture
+  // mode Render() waits, with |lock_| released, until the algorithm holds
+  // enough decoded audio for the request or end of stream, so the capture
+  // sink never receives silence that a faster decoder would have filled.
+  // DecodedAudioReady() signals; StopRendering_Locked() and the destructor
+  // cancel before the sink is paused or stopped.
+  const bool capture_mode_;
+  base::ConditionVariable capture_frames_cv_;
+  bool capture_wait_cancelled_ = false;
+  void WaitForBufferedAudio_Locked(int frames_requested);
 
   // Algorithm for scaling audio.
   double playback_rate_;

@@ -51,6 +51,9 @@ class CaptureAgent : public content::RenderFrameObserver,
   void BindReceiver(mojo::PendingAssociatedReceiver<mojom::CaptureAgent> receiver);
   void OnWoken(std::unique_ptr<Pending> pending);
   void Quiesce(std::unique_ptr<Pending> pending);
+  void RenderAudio(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result);
+  void OnAudioRendered(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result,
+                       std::vector<float> pcm, uint32_t frames, int sinks);
   void FlushMediaEvents(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result, int stage);
   void Complete(std::unique_ptr<Pending> pending, mojom::PrepareResultPtr result);
   void CollectMarks(const mojom::PrepareParams& params, mojom::PrepareResult* result);

@@ -26,6 +26,9 @@
 #include "base/trace_event/trace_event.h"
 #include "build/build_config.h"
 #include "media/audio/null_audio_sink.h"
+#include "base/time/time_override.h"
+#include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
+#include "media/base/deterministic_capture.h"
 #include "media/base/audio_buffer.h"
 #include "media/base/audio_buffer_converter.h"
 #include "media/base/audio_bus.h"
@@ -142,9 +145,12 @@ OutputConfig ComputeHardwareOutputConfig(
 
   // If supported by the OS and the initial sample rate is not too low, let
   // the OS level resampler handle resampling for power efficiency.
+  // DeterministicChromium: the capture sink has no OS resampler and reads the
+  // media clock exactly only when the renderer outputs at the device rate.
   if (AudioLatency::IsResamplingPassthroughSupported(
           AudioLatency::Type::kPlayback) &&
-      stream_config.samples_per_second() >= 44100) {
+      stream_config.samples_per_second() >= 44100 &&
+      !IsDeterministicCaptureMode()) {
     sample_rate = stream_config.samples_per_second();
   }
 
@@ -226,6 +232,8 @@ AudioRendererImpl::AudioRendererImpl(
       player_id_(media_player_id),
       client_(nullptr),
       tick_clock_(base::DefaultTickClock::GetInstance()),
+      capture_mode_(IsDeterministicCaptureMode()),
+      capture_frames_cv_(&lock_),
       last_audio_memory_usage_(0),
       last_decoded_sample_rate_(0),
       is_encrypted_(false),
@@ -274,6 +282,11 @@ AudioRendererImpl::~AudioRendererImpl() {
       this);
 
   // If Render() is in progress, this call will wait for Render() to finish.
+  if (capture_mode_) {
+    base::AutoLock auto_lock(lock_);
+    capture_wait_cancelled_ = true;
+    capture_frames_cv_.Broadcast();
+  }
   // After this call, the |sink_| will not call back into |this| anymore.
   sink_->Stop();
   if (null_sink_)
@@ -310,6 +323,7 @@ void AudioRendererImpl::StartRendering_Locked() {
   lock_.AssertAcquired();
 
   sink_playing_ = true;
+  capture_wait_cancelled_ = false;
   was_unmuted_ = was_unmuted_ || volume_ != 0;
   if (state_ == kReinitializingSink) {
     // Do not start the sink yet if the sink is reinitializing.
@@ -358,6 +372,12 @@ void AudioRendererImpl::StopRendering_Locked(
   sink_playing_ = false;
   if (state_ == kReinitializingSink) {
     return;
+  }
+  if (capture_mode_) {
+    // The capture sink's Pause() waits for a Render() in progress, which may
+    // be waiting for decoded audio; release it first.
+    capture_wait_cancelled_ = true;
+    capture_frames_cv_.Broadcast();
   }
 
   base::AutoUnlock auto_unlock(lock_);
@@ -684,6 +704,14 @@ void AudioRendererImpl::OnDeviceInfoReceived(
   }
 #endif  // BUILDFLAG(ENABLE_PLATFORM_AC3_EAC3_AUDIO) && BUILDFLAG(IS_WIN)
 
+  // DeterministicChromium: render at the capture device rate so the capture
+  // sink needs no resampler and the media clock reads exactly the capture
+  // time. Treating the stream as one whose config may change installs the
+  // AudioBufferConverter, which resamples deterministically.
+  if (capture_mode_ && hw_params.IsValid()) {
+    expecting_config_changes_ = true;
+  }
+
   bool use_stream_params =
       !expecting_config_changes_ || !hw_params.IsValid() ||
       hw_params.format() == AudioParameters::AUDIO_FAKE ||
@@ -1006,6 +1034,12 @@ void AudioRendererImpl::DecodedAudioReady(
 
   CHECK(pending_read_);
   pending_read_ = false;
+  // Whatever this read produced, a capture-mode Render() waiting on the
+  // capture audio thread must re-evaluate.
+  absl::Cleanup wake_capture_wait = [this] {
+    if (capture_mode_)
+      capture_frames_cv_.Broadcast();
+  };
 
   if (!result.has_value()) {
     auto status = PIPELINE_ERROR_DECODE;
@@ -1356,6 +1390,35 @@ bool AudioRendererImpl::IsBeforeStartTime(const AudioBuffer& buffer) {
          (buffer.timestamp() + buffer.duration()) < start_timestamp_;
 }
 
+void AudioRendererImpl::WaitForBufferedAudio_Locked(int frames_requested) {
+  lock_.AssertAcquired();
+  // Real time: in a capture renderer base::TimeTicks::Now() is paused virtual
+  // time.
+  constexpr base::TimeDelta kCaptureWaitTimeout = base::Seconds(10);
+  const base::TimeTicks give_up =
+      base::subtle::TimeTicksNowIgnoringOverride() + kCaptureWaitTimeout;
+  // WSOLA needs a window beyond the output frames at rates other than 1.0.
+  const int needed = static_cast<int>(
+      std::ceil(frames_requested * std::max(playback_rate_, 1.0)) + 1);
+  while (!capture_wait_cancelled_ && !received_end_of_stream_ &&
+         state_ == kPlaying && algorithm_ &&
+         algorithm_->BufferedFrames() < needed) {
+    if (!pending_read_) {
+      task_runner_->PostTask(
+          FROM_HERE,
+          base::BindOnce(&AudioRendererImpl::AttemptRead, weak_factory_.GetWeakPtr()));
+    }
+    capture_frames_cv_.TimedWait(base::Milliseconds(1));
+    if (base::subtle::TimeTicksNowIgnoringOverride() >= give_up) {
+      MEDIA_LOG(INFO, media_log_)
+          << "deterministic capture: decoded audio did not cover the request "
+             "within 10 s (buffered "
+          << algorithm_->BufferedFrames() << ", needed " << needed << ")";
+      return;
+    }
+  }
+}
+
 int AudioRendererImpl::Render(base::TimeDelta delay,
                               base::TimeTicks delay_timestamp,
                               const AudioGlitchInfo& glitch_info,
@@ -1435,6 +1498,9 @@ int AudioRendererImpl::Render(base::TimeDelta delay,
                                playback_rate_);
       return 0;
     }
+
+    if (capture_mode_ && !is_passthrough_)
+      WaitForBufferedAudio_Locked(frames_requested);
 
     if (is_passthrough_) {
       if (algorithm_->BufferedFrames() > 0) {

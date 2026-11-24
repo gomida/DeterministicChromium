@@ -7,6 +7,7 @@
 
 #include "content/public/renderer/content_renderer_client.h"
 #include "headless/lib/renderer/allowlist.h"
+#include "headless/lib/renderer/capture_audio.h"
 
 namespace headless {
 
@@ -30,6 +31,8 @@ class HeadlessContentRendererClient : public content::ContentRendererClient {
       blink::URLLoaderThrottleProviderType provider_type) override;
 
   std::optional<Allowlist> video_codecs_allowlist_;
+  // --deterministic-capture: every sink of this renderer is a capture sink.
+  std::unique_ptr<CaptureAudioDeviceFactory> capture_audio_factory_;
 };
 
 }  // namespace headless

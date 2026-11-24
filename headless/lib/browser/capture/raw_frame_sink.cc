@@ -131,6 +131,15 @@ std::optional<SinkError> RawFrameSink::OpenRing() {
   if (LoadPlain<uint32_t>(ring_, ring::kOffPixelFormat) != ring::kPixelFormatBgra8Premul) {
     return SinkError{-1, 0, false, 0, 0, "InvalidParameters: ring pixel format is not bgra8-premul"};
   }
+  const uint32_t ring_audio_format = LoadPlain<uint32_t>(ring_, ring::kOffAudioFormat);
+  if (ring_audio_format != ring::kAudioFormatNone) {
+    if (ring_audio_format != config_.audio_format ||
+        LoadPlain<uint32_t>(ring_, ring::kOffAudioRate) != config_.audio_rate ||
+        LoadPlain<uint32_t>(ring_, ring::kOffAudioChannels) != config_.audio_channels) {
+      return SinkError{-1, 0, false, 0, 0, "AudioFormatUnsupported: ring audio format differs from the capture configuration"};
+    }
+    ring_audio_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffAudioBytes);
+  }
   slot_count_ = LoadPlain<uint32_t>(ring_, ring::kOffSlotCount);
   slot_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffSlotBytes);
   video_bytes_ = LoadPlain<uint64_t>(ring_, ring::kOffVideoBytes);
@@ -190,8 +199,20 @@ std::optional<SinkError> RawFrameSink::WriteRing(const Frame& frame) {
   uint8_t* slot = ring_ + ring::kHeaderBytes + (produced % slot_count_) * slot_bytes_;
   StorePlain<int64_t>(slot, ring::kSlotFrameIndex, frame.frame_index);
   StorePlain<int64_t>(slot, ring::kSlotVirtualTimeUs, frame.virtual_time_us);
-  StorePlain<uint32_t>(slot, ring::kSlotFlags, ring::kFlagVideo);
-  StorePlain<uint32_t>(slot, ring::kSlotAudioFrames, 0);
+  uint32_t flags = ring::kFlagVideo;
+  uint32_t audio_frames = 0;
+  if (frame.audio && frame.audio_frames > 0 && ring_audio_bytes_ > 0) {
+    if (frame.audio->size() > ring_audio_bytes_) {
+      error_ = SinkError{frame.frame_index, 0, false, 0, frames_written_,
+                         "AudioFormatUnsupported: interval PCM exceeds the ring's audio capacity"};
+      return error_;
+    }
+    memcpy(slot + ring::kSlotVideoData + video_bytes_, frame.audio->data(), frame.audio->size());
+    flags |= ring::kFlagAudio;
+    audio_frames = frame.audio_frames;
+  }
+  StorePlain<uint32_t>(slot, ring::kSlotFlags, flags);
+  StorePlain<uint32_t>(slot, ring::kSlotAudioFrames, audio_frames);
   StorePlain<uint64_t>(slot, ring::kSlotVideoBytes, video_bytes_);
   if (frame.hash) {
     memcpy(slot + ring::kSlotHash, frame.hash->data(), frame.hash->size());

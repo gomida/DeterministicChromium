@@ -27,6 +27,7 @@
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
 #include "media/audio/audio_features.h"
+#include "media/base/deterministic_capture.h"
 #include "media/audio/null_audio_sink.h"
 #include "media/base/audio_bus.h"
 #include "media/base/audio_glitch_info.h"
@@ -359,6 +360,13 @@ void RendererWebAudioDeviceImpl::InitializeSink() {
     return;
   }
 
+  // DeterministicChromium: the suspender's silence timer and fake Render()
+  // calls are real-time behaviour; capture sinks render only on demand.
+  if (media::IsDeterministicCaptureMode()) {
+    sink_->Initialize(current_sink_params_, this);
+    is_sink_initialized_ = true;
+    return;
+  }
   switch (sink_descriptor_.Type()) {
     case blink::WebAudioSinkDescriptor::kAudible:
       // Use a task runner instead of the render thread for fake Render() calls

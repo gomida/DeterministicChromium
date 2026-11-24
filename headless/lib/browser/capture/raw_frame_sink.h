@@ -53,6 +53,11 @@ class RawFrameSink : public base::PlatformThread::Delegate {
     std::optional<int64_t> expected_frames;
     int max_queued_frames = 8;
     base::TimeDelta stall_timeout = base::Seconds(60);
+    // Audio the session will hand over with captured frames (0 = none); the
+    // ring must have been created with the same format or without audio.
+    uint32_t audio_rate = 0;
+    uint32_t audio_channels = 0;
+    uint32_t audio_format = 0;  // ring::kAudioFormat*
   };
 
   struct Frame {
@@ -60,6 +65,9 @@ class RawFrameSink : public base::PlatformThread::Delegate {
     int64_t virtual_time_us = 0;
     std::shared_ptr<const SkBitmap> bitmap;
     std::optional<Sha256Digest> hash;
+    // Interleaved PCM of the interval in the configured format, if captured.
+    std::shared_ptr<const std::vector<uint8_t>> audio;
+    uint32_t audio_frames = 0;
   };
 
   explicit RawFrameSink(Config config);
@@ -84,6 +92,8 @@ class RawFrameSink : public base::PlatformThread::Delegate {
   // Ring geometry for validation by the session (0 when not a ring).
   int ring_width() const { return ring_width_; }
   int ring_height() const { return ring_height_; }
+  // Whether the ring carries audio (format matched the configuration).
+  bool ring_has_audio() const { return ring_audio_bytes_ > 0; }
 
  private:
   struct Pending {
@@ -111,6 +121,7 @@ class RawFrameSink : public base::PlatformThread::Delegate {
   uint32_t slot_count_ = 0;
   uint64_t slot_bytes_ = 0;
   uint64_t video_bytes_ = 0;
+  uint64_t ring_audio_bytes_ = 0;
   int ring_width_ = 0;
   int ring_height_ = 0;
   bool closed_ = false;

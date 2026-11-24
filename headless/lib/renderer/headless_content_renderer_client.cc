@@ -94,6 +94,10 @@ class HeadlessContentRendererUrlLoaderThrottleProvider
 namespace headless {
 
 HeadlessContentRendererClient::HeadlessContentRendererClient() {
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+          switches::kDeterministicCapture)) {
+    capture_audio_factory_ = std::make_unique<CaptureAudioDeviceFactory>();
+  }
   const auto& command_line =
       CHECK_DEREF(base::CommandLine::ForCurrentProcess());
   if (command_line.HasSwitch(switches::kAllowVideoCodecs)) {

@@ -128,6 +128,11 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
     double wake_ms = 0;
     double quiesce_ms = 0;
     double audio_ms = 0;
+    // Audio of the interval (DESIGN.md 4.6): bytes in the configured sample
+    // format, their hash, and the frame count the renderer delivered.
+    std::shared_ptr<const std::vector<uint8_t>> audio;
+    uint32_t audio_frames = 0;
+    std::string pcm_frame_hash;
     // Set when the surface did not exist before this frame's BeginFrame and a
     // second BeginFrame at the same frame time was issued to obtain readback
     // (only ever the first frame; DESIGN.md 4.3 step 8).
@@ -139,6 +144,8 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
 
   base::TimeTicks FrameTicks(int64_t frame_index) const;
   int64_t FrameOffsetMicros(int64_t frame_index) const;
+  // Device sample frames belonging to frames [0, frame_index): floor(i*rate*den/num).
+  int64_t AudioSamplesThrough(int64_t frame_index) const;
   void Fail(Error error);
   std::optional<Error> CheckState(const char* command) const;
 
@@ -192,6 +199,12 @@ class CaptureSession : public content::WebContentsUserData<CaptureSession> {
   base::OneShotTimer prepare_timer_;
   std::string marker_prefix_ = "dcap:";
   bool collect_marks_ = true;
+  // Audio device format and sample format of the PCM handed to the sink.
+  int audio_rate_ = 48000;
+  int audio_channels_ = 2;
+  bool audio_s16_ = true;
+  int64_t audio_sample_frames_ = 0;  // captured (written) so far
+  std::string pcm_chain_hash_;
   double media_wait_timeout_ms_ = 10000;
   bool fail_on_media_wait_timeout_ = true;
   std::unique_ptr<RawFrameSink> sink_;

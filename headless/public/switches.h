@@ -43,6 +43,12 @@ inline constexpr char kDeterministicMode[] = "deterministic-mode";
 // deterministic-capture/DESIGN.md in the project repository.
 inline constexpr char kDeterministicCapture[] = "deterministic-capture";
 
+// Device format of the renderer-side capture audio sinks, as
+// "RATE,CHANNELS,FRAMES_PER_BUFFER" (default 48000,2,128). Set by the
+// controller from the capture spec so every renderer of a run agrees.
+inline constexpr char kDeterministicCaptureAudio[] =
+    "deterministic-capture-audio";
+
 // Whether cookies stored as part of user profile are encrypted.
 inline constexpr char kDisableCookieEncryption[] = "disable-cookie-encryption";
 

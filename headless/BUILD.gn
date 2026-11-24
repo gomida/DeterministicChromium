@@ -244,6 +244,8 @@ source_set("headless_renderer") {
     "lib/renderer/allowlist.h",
     "lib/renderer/capture_agent.cc",
     "lib/renderer/capture_agent.h",
+    "lib/renderer/capture_audio.cc",
+    "lib/renderer/capture_audio.h",
     "lib/renderer/headless_content_renderer_client.cc",
     "lib/renderer/headless_content_renderer_client.h",
   ]
@@ -252,6 +254,7 @@ source_set("headless_renderer") {
     ":capture_agent_mojom",
     "//content/public/common",
     "//gin",
+    "//media",
     "//mojo/public/cpp/bindings",
     "//printing/buildflags",
     "//third_party/blink/public:blink",
