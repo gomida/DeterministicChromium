@@ -1,0 +1,30 @@
+[package]
+name = "dcap"
+version = "2.1.0"
+edition = "2021"
+description = "Deterministic web-to-video capture controller and encoder for DeterministicChromium"
+license = "BSD-3-Clause"
+publish = false
+
+[[bin]]
+name = "dcap"
+path = "src/main.rs"
+
+[[bin]]
+name = "dcap-fake-engine"
+path = "src/bin/fake_engine.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,5 @@
+nv-codec-headers (FFmpeg version of the NVIDIA Video Codec SDK headers)
+Source: https://github.com/FFmpeg/nv-codec-headers (branch master, API 13.1)
+License: MIT (see the header files)
+Only include/ and the pkg-config template are vendored; the upstream Makefile
+is not run. ffmpeg/build.sh writes the .pc file into its own prefix.
